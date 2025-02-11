@@ -22,7 +22,7 @@ num_files = len(file_list)
 
 def main():
 
-    container = inf.configure(model_name, confluency_est, conf_threshold)
+    container = inf.configure(model_name, confluency_est, conf_threshold, save_dir = save_dir)
     for i in np.arange(num_files):
         phs_file = tifffile.TiffFile(file_list[i])
         interval = [0, len(phs_file.pages)-1]

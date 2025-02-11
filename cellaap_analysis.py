@@ -91,7 +91,7 @@ class analysis:
             self.paths["instance"] = Path([name for name in cellaap_dir.glob('*.tif') if "instance" in name.name][0])
             self.paths["semantic"] = Path([name for name in cellaap_dir.glob('*.tif') if "semantic" in name.name][0])
             # Keep the name stub to infer other file names
-            self.name_stub = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(self.paths["semantic"].name)).group()
+            self.name_stub = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", str(self.paths["semantic"].name)).group() + '_'
             self.expt_name = self.paths["instance"].name.split(f"{self.name_stub}")[0]
             self.defaults = analysis_pars(cell_type=cell_type)
         except:
@@ -253,7 +253,7 @@ class analysis:
                 self.tracked.loc[index, "mitotic"] = 0
         
         if save_flag:
-            self.tracked.to_excel(self.cellaap_dir / Path(self.expt_name+self.name_stub+"_tracks.xlsx"))
+            self.tracked.to_excel(self.cellaap_dir / Path(self.expt_name+self.name_stub+"tracks.xlsx"))
 
         return self.tracked
     
@@ -370,7 +370,7 @@ class analysis:
 
 
         if save_flag:
-            with pd.ExcelWriter(self.cellaap_dir / Path(self.expt_name+self.name_stub+'_analysis.xlsx')) as writer:  
+            with pd.ExcelWriter(self.cellaap_dir / Path(self.expt_name+self.name_stub+'analysis.xlsx')) as writer:  
                 self.tracked.to_excel(writer, sheet_name='cell_data')
                 # There are no scalars - so turn into list; transform
                 pd.DataFrame([self.paths]).T.to_excel(writer,   sheet_name='file_data')
@@ -485,7 +485,7 @@ class analysis:
 
 
         if save_flag:
-            with pd.ExcelWriter(self.cellaap_dir / Path(self.expt_name+self.name_stub+"_summary.xlsx")) as writer: 
+            with pd.ExcelWriter(self.cellaap_dir / Path(self.expt_name+self.name_stub+"summary.xlsx")) as writer: 
                 self.summaryDF.to_excel(writer,sheet_name = "Summary", index=False)
                 pd.DataFrame([self.paths]).T.to_excel(writer, sheet_name='file_data')
                 pd.DataFrame([self.defaults.__dict__]).T.to_excel(writer,sheet_name='parameters')
