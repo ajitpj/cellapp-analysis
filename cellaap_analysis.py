@@ -490,11 +490,12 @@ class analysis:
                                                                                 ("x", "y")]).max())
                 
                 for channel in channels:
-                    signal, bkg_corr, int_corr, signal_std, bkg_std, int_std = calculate_signal(
+                    signal, bkg_corr, int_corr, area, signal_std, bkg_std, int_std, area_std = calculate_signal(
                                                                 semantic, 
                                                                 self.tracked[self.tracked.particle==id][f'{channel}'].to_numpy(), 
                                                                 self.tracked[self.tracked.particle==id][f'{channel}_bkg_corr'].to_numpy(), 
                                                                 self.tracked[self.tracked.particle==id][f'{channel}_int_corr'].to_numpy(),
+                                                                self.tracked[self.tracked.particle==id].area.to_numpy(),
                                                                 self.defaults.semantic_footprint
                                                                 )
                     signal_storage[f'{channel}'].append(signal)
@@ -503,6 +504,8 @@ class analysis:
                     signal_storage[f'{channel}_bkg_corr_std'].append(bkg_std)
                     signal_storage[f'{channel}_int_corr'].append(int_corr)
                     signal_storage[f'{channel}_int_corr_std'].append(int_std)
+                    signal_storage[f'{channel}_area_mean'].append(area)
+                    signal_storage[f'{channel}_area_std'].append(area_std)
                 
         # Quality metrics
         n_obs, bins = np.histogram(peaks_per_track, np.arange(0,15))
@@ -537,42 +540,3 @@ class analysis:
 
         return self.summaryDF
     
-    
-    def compile_summaries(self, wells: list) -> pd.DataFrame:
-        '''
-        Collects and concatenates the summary xslx spreadsheets from the designated well_position list.
-        
-        Inputs:
-        well : list with entries of the form r"[A-Z][dd]+_+[a-z][d+]"
-        Output: 
-        data_summary  : dataframe with the data concatenated; well - column designating well_pos
-        '''
-        if wells:
-            if not hasattr(self, 'inf_folder_list'):
-                # Assemble the folder list when function called for the first time
-                self.inf_folder_list = [f for f in self.root_folder.glob('*_inference')]
-            
-            df_list = []
-            experiment = self.root_folder.parent
-
-            pattern = re.compile(r'_(\w\d+)_(\w\d+)_')
-
-            for well in wells:
-                wp_string = '_'+well+'_'
-                for f in self.inf_folder_list:
-                    if wp_string in f.name:
-                        xls_file_name = [file for file in f.glob('*_summary.xlsx')]
-                        if xls_file_name:
-                            df = pd.read_excel(xls_file_name[0]) #assumes only one
-                            df["well"] = well #assign well-position identifier
-                            position = pattern.findall(xls_file_name[0].name)[0][1]
-                            df["position"] = position
-                            df["experiment"] = experiment
-                            df_list.append(df)
-                            print(f"{well}_{position} loaded")
-                        else:
-                            print(f"No summary file found for {well}")
-
-            data_summary = pd.concat(df_list)
-
-        return data_summary
