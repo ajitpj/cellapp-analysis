@@ -145,6 +145,7 @@ wellmap = create_wellmap_dict(df, wellid_col_name='well_ids')
 ```
 
 Notes:
+
 - The function preserves the first-seen order of wells and removes duplicates.
 - It raises `KeyError` if required columns are missing.
 
@@ -155,6 +156,7 @@ and filter summary spreadsheets for every well group. This produces one
 concatenated `pandas.DataFrame` suitable for downstream analysis and plotting.
 
 Inputs:
+
 - `wellmap_dict`: mapping produced by `create_wellmap_dict`
 - `analysis_object`: your analysis/session object (the same object used
   elsewhere in the package; it must provide the `root_folder` used by
@@ -176,6 +178,8 @@ whole_df = import_whole_expt_data(wellmap, analysis_object=exp_analysis,
 ```
 
 Notes:
+
 - Empty well lists are skipped and exceptions during a group's import are
   printed but do not stop processing of other groups.
+
 - If no data is found the function returns an empty DataFrame.
