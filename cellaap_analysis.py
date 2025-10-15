@@ -277,7 +277,7 @@ class analysis:
         for id in list(set(self.tracked.particle)):
             index  = self.tracked[self.tracked.particle==id].index
 
-            if np.isin(100, self.tracked[self.tracked.particle==id].semantic):
+            if np.isin(101, self.tracked[self.tracked.particle==id].semantic):
                 self.tracked.loc[index, "mitotic"] = 1
             else:
                 self.tracked.loc[index, "mitotic"] = 0
