@@ -17,6 +17,7 @@ from os import listdir
 from os.path import isfile, join
 import re
 from itertools import zip_longest
+from typing import Literal
 
 class analysis:
     
@@ -123,6 +124,7 @@ class analysis:
                         self.paths["Cy5"] = Path(name)
                 
         # Only read instance and semantic stacks
+        self.stacks["phase"]    = imread(self.paths["phase"]) #For mitotic/dead discrimination
         self.stacks["semantic"] = imread(self.paths["semantic"])
         self.stacks["instance"] = imread(self.paths["instance"])
         
@@ -258,10 +260,11 @@ class analysis:
             semantic_label.append(self.stacks["semantic"][self.tracked.loc[i,"frame"],
                                                       self.tracked.loc[i,"x"],  
                                                       self.tracked.loc[i,"y"]])
+
         self.tracked["semantic"] = semantic_label
 
         # remove 0's and 2's, and fill gaps in the semantic vector.
-        self.tracked.loc[self.tracked.semantic < 100, "semantic"] = 1
+        self.tracked.loc[self.tracked.semantic != 101, "semantic"] = 1
 
         self.tracked.loc[:, "semantic"] = medfilt(self.tracked.semantic,
                                                   self.defaults.semantic_gap_closing)
@@ -271,6 +274,28 @@ class analysis:
         semantic_smoothed = closing(semantic_smoothed, 
                                     self.defaults.semantic_footprint)
         self.tracked["semantic_smoothed"] = semantic_smoothed
+
+        
+        ###########################################################################
+        # Jan 8, 2026 - mitotic/dead discrimination
+        # Use the smoothed semantic trace to compile an array of mitotic phase ROIs
+        
+        #Step 1 - assemble rois from the phase image only for cells labeled as mitotic
+        frame_indices, mitotic_roi = create_mitotic_roi(self.stacks["phase"], 
+                                                        self.defaults.phase_roi_size, 
+                                                        self.tracked)
+        print(f"Found {mitotic_roi.shape[0]} to label...")
+        #Step 2 - Generate labels using UMAP and Hdbscan. This will take ~ 5 min.
+        label_df = cluster_label_phs(mitotic_roi, frame_indices,
+                                     self.defaults.umap_model, 
+                                     self.defaults.hdb_model)
+        #Step 3 - Add the dead_flag to the tracking dataframe
+        self.tracked["dead_flag"] = 0
+        mask = (label_df["cluster_label"] == 2) & (label_df["label_prob"]>0.25)
+        frame_idxs = label_df.loc[mask, "frame_index"]
+        self.tracked.loc[self.tracked.index.isin(frame_idxs), "dead_flag"] = 1
+        ###########################################################################
+
         
         # classify the cells as dividing or non-dividing
         # observed division = 1; no division = 0
@@ -449,6 +474,7 @@ class analysis:
         track_length     = []
         channels         = []
         max_displacement = []
+        dead_cell_score  = [] # keep track of "dead" flags
 
         # Check which channels have been measured. If none, return only "mitotic duration"
         # Need to find a better way to code this.
@@ -471,6 +497,7 @@ class analysis:
         for index, id in enumerate(idlist):
             
             semantic = self.tracked[self.tracked.particle==id].semantic_smoothed.to_numpy()
+            dead_flag = self.tracked[self.tracked.particle==id].dead_flag.to_numpy()
 
             # To include cells that were in mitosis at the end of the movie
             _, props = find_peaks(np.append(semantic,np.zeros(3)), 
@@ -483,11 +510,13 @@ class analysis:
             if props["widths"].size == 1:
                 mitosis.append(props["widths"][0])
                 mito_start.append(props['left_bases'][0])
+                dead_cell_score.append(np.sum(semantic*dead_flag))
                 cell_area.append(self.tracked[self.tracked.particle==id].area.mean())
                 particle.append(id)
                 track_length.append(semantic.shape[0])
-                max_displacement.append(calculate_displacement(self.tracked.loc[self.tracked.particle==id,
-                                                                                ("x", "y")]).max())
+                coords = self.tracked.loc[self.tracked.particle==id, ['x', 'y']]
+                disp_vector = calculate_displacement(coords)
+                max_displacement.append(np.max(disp_vector))
                 
                 for channel in channels:
                     signal, bkg_corr, int_corr, area, signal_std, bkg_std, int_std, area_std = calculate_signal(
@@ -504,8 +533,8 @@ class analysis:
                     signal_storage[f'{channel}_bkg_corr_std'].append(bkg_std)
                     signal_storage[f'{channel}_int_corr'].append(int_corr)
                     signal_storage[f'{channel}_int_corr_std'].append(int_std)
-                    signal_storage[f'{channel}_area_mean'].append(area)
-                    signal_storage[f'{channel}_area_std'].append(area_std)
+                    # signal_storage[f'{channel}_area_mean'].append(area)
+                    # signal_storage[f'{channel}_area_std'].append(area_std)
                 
         # Quality metrics
         n_obs, bins = np.histogram(peaks_per_track, np.arange(0,15))
@@ -523,6 +552,7 @@ class analysis:
                         "mito_start"       : mito_start,
                         "cell_area"        : cell_area,
                         "mitosis"          : mitosis,
+                        "dead_cell_score"  : dead_cell_score
                         }
         
         summary_storage = other_storage | signal_storage
