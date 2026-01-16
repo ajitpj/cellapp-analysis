@@ -264,7 +264,7 @@ class analysis:
         self.tracked["semantic"] = semantic_label
 
         # remove 0's and 2's, and fill gaps in the semantic vector.
-        self.tracked.loc[self.tracked.semantic != 101, "semantic"] = 1
+        self.tracked.loc[self.tracked.semantic != self.defaults.mitotic_mask_value, "semantic"] = 1
 
         self.tracked.loc[:, "semantic"] = medfilt(self.tracked.semantic,
                                                   self.defaults.semantic_gap_closing)
@@ -302,7 +302,7 @@ class analysis:
         for id in list(set(self.tracked.particle)):
             index  = self.tracked[self.tracked.particle==id].index
 
-            if np.isin(101, self.tracked[self.tracked.particle==id].semantic):
+            if np.isin(self.defaults.mitotic_mask_value, self.tracked[self.tracked.particle==id].semantic):
                 self.tracked.loc[index, "mitotic"] = 1
             else:
                 self.tracked.loc[index, "mitotic"] = 0

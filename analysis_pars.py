@@ -17,6 +17,9 @@ class analysis_pars:
         except:
             raise ValueError(f"Choose one of {self.cell_types}")
         
+        # Mask value for mitotic cells
+        self.mitotic_mask_value = 101
+
         # Parameters for pre-processing inferred cell segmentations
         self.erode_footprint = disk(3)
         self.max_cell_size = 4000

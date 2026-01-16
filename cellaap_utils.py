@@ -9,8 +9,7 @@ from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 import seaborn as sns
 import re
-from pathlib import Path
-from joblib import load
+# from pathlib import Path
 import umap
 from scipy.stats import zscore
 import hdbscan
@@ -478,7 +477,6 @@ def import_whole_expt_data(wellmap_dict: dict, analysis_object, expt_length: int
                 continue
             # construct an experiment name for logging / code column
             expt_name = f'{key[0]}_{key[1]}_{key[2]}'
-            print(expt_name)
             temp_df = import_filter_data_for_wells(analysis_object, expt_name, expt_length, delta_t, wells)
             # print(temp_df.shape)
             whole_expt_data = pd.concat([whole_expt_data, temp_df], ignore_index=True)
@@ -540,17 +538,16 @@ def cluster_label_phs(phs_roi_arr: npt.NDArray, frame_indices: list, umap_model:
     
     '''
     if umap_model is None or hdb_model is None:
-        pass
-    else:
+        raise FileExistsError(f"no models specified")
 
-        # Transform the phs_roi_arr
-        roi_arr_scaled = np.array(zscore(phs_roi_arr, axis=0))
-        print(f"Transforming ROI data; this will take about 5 minutes")
-        embedding = umap_model.transform(roi_arr_scaled.reshape(roi_arr_scaled.shape[0], -1))
-        labels, strengths = hdbscan.approximate_predict(hdb_model, embedding)
-        cluster_labels = pd.DataFrame({"frame_index"   : frame_indices,
-                                       "cluster_label" : labels,
-                                       "label_prob"    : strengths})
+    # Transform the phs_roi_arr
+    roi_arr_scaled = np.array(zscore(phs_roi_arr, axis=0))
+    print(f"Transforming ROI data; this will take about 5 minutes")
+    embedding = umap_model.transform(roi_arr_scaled.reshape(roi_arr_scaled.shape[0], -1)) # type: ignore
+    labels, strengths = hdbscan.approximate_predict(hdb_model, embedding) # type: ignore
+    cluster_labels = pd.DataFrame({"frame_index"   : frame_indices,
+                                    "cluster_label" : labels,
+                                    "label_prob"    : strengths})
     # 
 
     return cluster_labels
