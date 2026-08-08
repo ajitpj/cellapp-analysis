@@ -34,6 +34,14 @@ class analysis_pars:
         self.semantic_gap_closing = 3 # number of frames
         self.semantic_footprint = np.ones(self.semantic_gap_closing)
 
+        # Constrained track decoding (interphase -> mitotic -> post-mitotic -> dead)
+        self.decode_flip_prob      = 0.1 # per-frame semantic mislabel probability
+        self.decode_dead_sem_prob  = 0.7 # dead cell still carries the mitotic label
+        self.decode_switch_penalty = 2.5 # -log prior per state transition; larger
+                                         # values suppress short spurious episodes
+        self.decode_dead_weight    = 0.3 # tempering on classifier evidence; death
+                                         # must be supported by a run of frames
+
         # trackpy parameters
         self.max_pixel_movement = 20
         self.tracking_memory    = 1

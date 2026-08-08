@@ -13,6 +13,7 @@ from scipy.signal import find_peaks, medfilt
 from analysis_pars import analysis_pars
 from cellaap_utils import *
 from dead_classifier import classify_dead
+from track_decode import decode_track, track_events
 from skimage.util import img_as_uint
 from os import listdir
 from os.path import isfile, join
@@ -471,6 +472,10 @@ class analysis:
         channels         = []
         max_displacement = []
         dead_cell_score  = [] # keep track of "dead" flags
+        death_label      = [] # none / dead_in_mitosis / dead_post_mitosis / dead_no_mitosis
+        death_frame      = [] # movie frame of death (NaN if the cell never dies)
+        mitosis_decoded    = [] # mitotic duration from the constrained decode
+        mito_start_decoded = [] # mitotic entry frame from the constrained decode
 
         # Check which channels have been measured. If none, return only "mitotic duration"
         # Need to find a better way to code this.
@@ -507,6 +512,33 @@ class analysis:
                 mitosis.append(props["widths"][0])
                 mito_start.append(props['left_bases'][0])
                 dead_cell_score.append(np.sum(semantic*dead_flag))
+
+                # Constrained Viterbi decode: enforce a single mitotic episode
+                # and absorbing death, then label how/when the cell died.
+                track_rows = self.tracked[self.tracked.particle==id]
+                mitotic_obs = (track_rows.semantic == self.defaults.mitotic_mask_value).to_numpy()
+                if "dead_proba" in track_rows.columns:
+                    dead_evidence = track_rows.dead_proba.to_numpy()
+                else:  # older analysis files: fall back to the binary flag
+                    dead_evidence = np.where(mitotic_obs, dead_flag.astype(float), np.nan)
+                states = decode_track(mitotic_obs, dead_evidence,
+                                      self.defaults.decode_flip_prob,
+                                      self.defaults.decode_dead_sem_prob,
+                                      self.defaults.decode_switch_penalty,
+                                      self.defaults.decode_dead_weight)
+                events = track_events(states, track_rows.frame.to_numpy())
+                death_label.append(events['death_label'])
+                death_frame.append(events['death_frame'] if events['death_frame']
+                                   is not None else np.nan)
+                # Decoded mitotic episode, reported alongside the smoothing-based
+                # mitosis/mito_start so the two can be compared before switching.
+                # NOTE ON UNITS: mito_start above is a row index within the track
+                # (find_peaks operates on the track's own array), whereas
+                # mito_start_decoded and death_frame are movie frame numbers.
+                # The two agree once the track's first frame is added to mito_start.
+                mitosis_decoded.append((states == 1).sum())
+                mito_start_decoded.append(events['mito_start'] if events['mito_start']
+                                          is not None else np.nan)
                 cell_area.append(self.tracked[self.tracked.particle==id].area.mean())
                 particle.append(id)
                 track_length.append(semantic.shape[0])
@@ -548,7 +580,11 @@ class analysis:
                         "mito_start"       : mito_start,
                         "cell_area"        : cell_area,
                         "mitosis"          : mitosis,
-                        "dead_cell_score"  : dead_cell_score
+                        "dead_cell_score"  : dead_cell_score,
+                        "death_label"      : death_label,
+                        "death_frame"      : death_frame,
+                        "mitosis_decoded"  : mitosis_decoded,
+                        "mito_start_decoded" : mito_start_decoded
                         }
         
         summary_storage = other_storage | signal_storage
