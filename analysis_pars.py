@@ -42,20 +42,13 @@ class analysis_pars:
 
         self.track_mode = "vanilla"
 
-        if cell_type.lower() == "ht1080":
-            self.max_pixel_movement = 30
-            self.max_cell_size = 9000
-            self.track_mode = "predictive"
-
-        if cell_type.lower() == "u2os":
-            self.max_pixel_movement = 30
-            self.max_cell_size = 9500
-            self.track_mode = "predictive"
-
-        if cell_type.lower() == "rpe1":
-            self.max_pixel_movement = 30
-            self.max_cell_size = 9500
-            self.track_mode = "predictive"
+        _cell_type_overrides = {
+            "ht1080": {"max_pixel_movement": 30, "max_cell_size": 9000, "track_mode": "predictive"},
+            "u2os":   {"max_pixel_movement": 30, "max_cell_size": 9500, "track_mode": "predictive"},
+            "rpe1":   {"max_pixel_movement": 30, "max_cell_size": 9500, "track_mode": "predictive"},
+        }
+        for attr, val in _cell_type_overrides.get(cell_type.lower(), {}).items():
+            setattr(self, attr, val)
 
         #### Dead cell discrimination models
         self.umap_model = joblib.load("./models/deadcell_umap.joblib")

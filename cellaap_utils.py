@@ -565,10 +565,68 @@ def _display_dead_cells(phase_stack: npt.NDArray, updated_df: pd.DataFrame) -> n
     '''
     phase_display = np.zeros_like(phase_stack)
     for i, row in updated_df.iterrows():
-        if row.live_flag == 0:
+        if row.dead_flag == 1:
             x = int(row['x'])*2
             y = int(row['y'])*2
             frame = int(row['frame'])
             phase_display[frame, x-40:x+40, y-40:y+40] = phase_display[frame, x-40:x+40,y-40:y+40] + 1000
 
     return phase_display
+
+
+def export_to_excel_by_col(df, output_path, by_column="code", root_folder=None, wellmap_path=None):
+    """
+    Export a dataframe to Excel with separate sheets for each code value and a summary sheet.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        The dataframe to export
+    output_path : str or Path
+        Path where the Excel file will be saved
+    code_column : str, default="code"
+        Column name to group by for sheet names
+    root_folder : str or Path, optional
+        Path to root folder to include in summary
+    wellmap_path : str or Path, optional
+        Path to wellmap file to include in summary
+    """
+    # Create summary data
+    summary_data = []
+    summary_data.append({"Field": "Root Folder", "Value": str(root_folder) if root_folder else "Not provided"})
+    summary_data.append({"Field": "Wellmap Path", "Value": str(wellmap_path) if wellmap_path else "Not provided"})
+    
+    summary_df = pd.DataFrame(summary_data)
+    
+    # Build code summary table
+    code_summary = []
+    for code_value in sorted(df[by_column].unique()):
+        code_df = df[df[by_column] == code_value]
+        unique_wells = ", ".join(sorted(code_df["well"].unique().astype(str)))
+        unique_positions = ", ".join(sorted(code_df["position"].unique().astype(str)))
+        code_summary.append({
+            "Code": str(code_value),
+            "Unique Wells": unique_wells,
+            "Unique Positions": unique_positions
+        })
+    
+    code_summary_df = pd.DataFrame(code_summary)
+    
+    # Write to Excel
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="Summary", index=False)
+        code_summary_df.to_excel(writer, sheet_name="Code Summary", index=False)
+        
+        # Create sheets for each code
+        for code_value in sorted(df[by_column].unique()):
+            sheet_df = df[df[by_column] == code_value]
+            code_value = str(code_value).replace("/", " ")  # Replace slashes to avoid Excel sheet name issues
+            if len(code_value) > 31:
+                print(f"Warning: Code value '{code_value}' exceeds Excel sheet name limit. Truncating to 31 characters.")
+                code_value = code_value[:31]
+            sheet_df.to_excel(writer, sheet_name=code_value, index=False)
+    
+    print(f"Excel file saved to {output_path}")
+    print(f"Created {len(df[by_column].unique()) + 2} sheets (1 metadata + 1 code summary + {len(df[by_column].unique())} data sheets)")
+
+    return
