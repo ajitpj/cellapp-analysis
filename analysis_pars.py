@@ -1,10 +1,10 @@
 import os
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from skimage.morphology import disk
 import trackpy
 import joblib
-import umap, hdbscan
 
 class analysis_pars:
 
@@ -24,7 +24,6 @@ class analysis_pars:
         self.erode_footprint = disk(3)
         self.max_cell_size = 4000
         self.min_cell_size = 250
-        self.phase_roi_size = 40 # Half dimension of the phase ROI used for mitotic/dead discrimination
 
         # Median filter size for smoothing semantic label trace
         self.min_mitotic_duration = 30 # minutes
@@ -50,6 +49,7 @@ class analysis_pars:
         for attr, val in _cell_type_overrides.get(cell_type.lower(), {}).items():
             setattr(self, attr, val)
 
-        #### Dead cell discrimination models
-        self.umap_model = joblib.load("./models/deadcell_umap.joblib")
-        self.hdb_model  = joblib.load("./models/deadcell_hdbscan.joblib")
+        #### Dead cell discrimination model
+        # HistGradientBoosting on handcrafted features; 1 = live mitotic, 0 = dead-like
+        self.dead_classifier = joblib.load(
+            Path(__file__).parent / "models" / "dead_classifier_hgb.joblib")["model"]

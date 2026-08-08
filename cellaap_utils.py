@@ -10,9 +10,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import re
 # from pathlib import Path
-import umap
-from scipy.stats import zscore
-import hdbscan
 
 def projection(im_array: np.ndarray, projection_type: str):
     """
@@ -488,69 +485,6 @@ def import_whole_expt_data(wellmap_dict: dict, analysis_object, expt_length: int
 
     return whole_expt_data
 
-
-####Jan 8, 2026 - Mitotic/dead discrimination
-def create_mitotic_roi(phs_stack: npt.NDArray, roi_size: int, tracking_df: pd.DataFrame) ->  tuple[list, npt.NDArray]:
-    '''
-    Docstring for create_mitotic_roi
-    Inputs:
-    :param phs_stack: Phase image stack
-    :type phs_stack: npt.ArrayLike
-    :param tracking_df: Dataframe assembled from tracking
-    :type tracking_df: pd.DataFrame
-    
-    Returns: 
-    :param phs_roi_arr: 
-    :type phs_roi_arr: ArrayLike
-    '''
-
-    num_mitotic = tracking_df[tracking_df["semantic_smoothed"] == 1].shape[0]
-    phs_roi_arr = np.zeros((num_mitotic, 2*roi_size, 2*roi_size), dtype=np.int16)
-    counter = 0
-    phs_img_dim = phs_stack.shape
-    frame_indices = []
-    for index, row in tracking_df[tracking_df["semantic_smoothed"] == 1].iterrows():
-        x = int(row['x'])*2
-        y = int(row['y'])*2
-        frame = int(row['frame'])
-        if (y - roi_size >= 0) and (y + roi_size <= phs_img_dim[2]) and (x - roi_size >= 0) and (x + roi_size <= phs_img_dim[1]):
-            phs_roi_arr[counter, :, :] = phs_stack[frame, x - roi_size:x + roi_size, y - roi_size:y + roi_size, ]
-            frame_indices.append(index)
-            counter += 1
-        else:
-            continue
-    
-    # Remove empty slices
-    mask = ~(np.all(phs_roi_arr == 0, axis=(1,2)))
-    phs_roi_arr = phs_roi_arr[mask, :, :]
-
-    return frame_indices, phs_roi_arr
-
-
-def cluster_label_phs(phs_roi_arr: npt.NDArray, frame_indices: list, umap_model: None, hdb_model: None) -> pd.DataFrame:
-    '''
-    Docstring for cluster_label_phs
-    
-    :param phs_roi_arr: Description
-    :type phs_roi_arr: npt.ArrayLike
-    :param frame_indices: Description
-    :type frame_indices: list
-    
-    '''
-    if umap_model is None or hdb_model is None:
-        raise FileExistsError(f"no models specified")
-
-    # Transform the phs_roi_arr
-    roi_arr_scaled = np.array(zscore(phs_roi_arr, axis=0))
-    print(f"Transforming ROI data; this will take about 5 minutes")
-    embedding = umap_model.transform(roi_arr_scaled.reshape(roi_arr_scaled.shape[0], -1)) # type: ignore
-    labels, strengths = hdbscan.approximate_predict(hdb_model, embedding) # type: ignore
-    cluster_labels = pd.DataFrame({"frame_index"   : frame_indices,
-                                    "cluster_label" : labels,
-                                    "label_prob"    : strengths})
-    # 
-
-    return cluster_labels
 
 def _display_dead_cells(phase_stack: npt.NDArray, updated_df: pd.DataFrame) -> npt.NDArray:
     '''

@@ -12,6 +12,7 @@ import scipy.ndimage as ndi
 from scipy.signal import find_peaks, medfilt
 from analysis_pars import analysis_pars
 from cellaap_utils import *
+from dead_classifier import classify_dead
 from skimage.util import img_as_uint
 from os import listdir
 from os.path import isfile, join
@@ -277,23 +278,18 @@ class analysis:
 
         
         ###########################################################################
-        # Jan 8, 2026 - mitotic/dead discrimination
-        # Use the smoothed semantic trace to compile an array of mitotic phase ROIs
-        
-        #Step 1 - assemble rois from the phase image only for cells labeled as mitotic
-        frame_indices, mitotic_roi = create_mitotic_roi(self.stacks["phase"], 
-                                                        self.defaults.phase_roi_size, 
-                                                        self.tracked)
-        print(f"Found {mitotic_roi.shape[0]} to label...")
-        #Step 2 - Generate labels using UMAP and Hdbscan. This will take ~ 5 min.
-        label_df = cluster_label_phs(mitotic_roi, frame_indices,
-                                     self.defaults.umap_model, 
-                                     self.defaults.hdb_model)
-        #Step 3 - Add the dead_flag to the tracking dataframe
+        # Mitotic/dead discrimination
+        # Each detection labeled mitotic by the semantic segmentation is classified
+        # as live mitotic or dead-like from its instance-masked phase crop.
+        print(f"Classifying {int(self.tracked.semantic_smoothed.sum())} mitotic-labeled detections...")
+        label_df = classify_dead(self.stacks["phase"],
+                                 self.stacks["instance"],
+                                 self.tracked,
+                                 self.defaults.dead_classifier)
         self.tracked["dead_flag"] = 0
-        mask = (label_df["cluster_label"] == 2) & (label_df["label_prob"]>0.25)
-        frame_idxs = label_df.loc[mask, "frame_index"]
-        self.tracked.loc[self.tracked.index.isin(frame_idxs), "dead_flag"] = 1
+        self.tracked["dead_proba"] = np.nan
+        self.tracked.loc[label_df.index, "dead_flag"] = label_df.dead_flag
+        self.tracked.loc[label_df.index, "dead_proba"] = label_df.dead_proba
         ###########################################################################
 
         
