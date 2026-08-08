@@ -265,15 +265,29 @@ class analysis:
 
         self.tracked["semantic"] = semantic_label
 
+        # Different cellaap versions write different mitotic mask values (101 in
+        # this pipeline, 100 in some older inference folders). If the configured
+        # value is absent the analysis silently finds no mitosis anywhere, so say
+        # so loudly rather than returning an empty result.
+        observed = set(np.unique(semantic_label).tolist())
+        if self.defaults.mitotic_mask_value not in observed:
+            raise ValueError(
+                f"mitotic_mask_value={self.defaults.mitotic_mask_value} does not "
+                f"occur in the semantic segmentation, which contains {sorted(observed)}. "
+                f"Set analysis_pars.mitotic_mask_value to the mitotic value for "
+                f"this dataset, otherwise no mitotic events will be detected.")
+
         # remove 0's and 2's, and fill gaps in the semantic vector.
         self.tracked.loc[self.tracked.semantic != self.defaults.mitotic_mask_value, "semantic"] = 1
 
         self.tracked.loc[:, "semantic"] = medfilt(self.tracked.semantic,
                                                   self.defaults.semantic_gap_closing)
 
-        # Turn into Boolean
-        semantic_smoothed = (self.tracked.semantic - 1)//99
-        semantic_smoothed = closing(semantic_smoothed, 
+        # Turn into Boolean. Compare against the mask value directly; the former
+        # (semantic - 1)//99 only happened to work for values of 100 or 101.
+        semantic_smoothed = (self.tracked.semantic
+                             == self.defaults.mitotic_mask_value).astype(int)
+        semantic_smoothed = closing(semantic_smoothed,
                                     self.defaults.semantic_footprint)
         self.tracked["semantic_smoothed"] = semantic_smoothed
 
