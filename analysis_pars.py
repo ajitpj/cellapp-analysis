@@ -40,7 +40,13 @@ class analysis_pars:
         self.decode_switch_penalty = 2.5 # -log prior per state transition; larger
                                          # values suppress short spurious episodes
         self.decode_dead_weight    = 0.3 # tempering on classifier evidence; death
-                                         # must be supported by a run of frames
+                                         # must be supported by a run of frames.
+                                         # Set when the classifier was badly
+                                         # overconfident (calibration error 0.09).
+                                         # The hand-labeled model is calibrated
+                                         # (0.05), so this can likely be raised
+                                         # toward 1.0 - needs checking against
+                                         # real tracks before changing.
 
         # trackpy parameters
         self.max_pixel_movement = 20
@@ -57,7 +63,8 @@ class analysis_pars:
         for attr, val in _cell_type_overrides.get(cell_type.lower(), {}).items():
             setattr(self, attr, val)
 
-        #### Dead cell discrimination model
-        # HistGradientBoosting on handcrafted features; 1 = live mitotic, 0 = dead-like
+        #### Mitotic vs dead discrimination model
+        # Platt-calibrated random forest on ResNet18 embedding + handcrafted
+        # features, trained on 345 hand labels. Class 1 = mitotic, 0 = dead.
         self.dead_classifier = joblib.load(
-            Path(__file__).parent / "models" / "dead_classifier_hgb.joblib")["model"]
+            Path(__file__).parent / "models" / "dead_classifier_handlabeled.joblib")["model"]
