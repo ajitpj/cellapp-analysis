@@ -124,7 +124,8 @@ def prepare_crop(phase_frame: npt.NDArray, instance_frame: npt.NDArray,
 
 
 def classify_dead(phase_stack: npt.NDArray, instance_stack: npt.NDArray,
-                  tracking_df: pd.DataFrame, model) -> pd.DataFrame:
+                  tracking_df: pd.DataFrame, model,
+                  phase_offset: int = 0) -> pd.DataFrame:
     '''
     Classify every detection labeled mitotic by the semantic segmentation.
 
@@ -134,19 +135,33 @@ def classify_dead(phase_stack: npt.NDArray, instance_stack: npt.NDArray,
     tracking_df    : needs semantic_smoothed, frame, x, y, label, area
                      (x = row, y = col, analysis scale)
     model          : fitted classifier with predict_proba; class 1 = mitotic
+    phase_offset   : analysis frame f corresponds to phase page f + phase_offset.
+                     Some acquisitions keep leading phase frames that were not
+                     segmented (e.g. a 361-frame phase stack against a 341-frame
+                     segmentation needs phase_offset=20).
 
     Returns a dataframe indexed like tracking_df (only the mitotic-labeled rows
     that could be cropped) with dead_flag (1 = dead) and dead_proba.
     '''
-    T = len(phase_stack)
+    # A frame-count mismatch silently pulls crops from the wrong time point,
+    # which is invisible in the output, so refuse rather than guess.
+    n_phase, n_inst = len(phase_stack), len(instance_stack)
+    if n_phase - phase_offset != n_inst:
+        raise ValueError(
+            f"phase stack has {n_phase} frames, instance stack has {n_inst}, "
+            f"and phase_offset={phase_offset} does not reconcile them. "
+            f"Analysis frame f must map to phase page f + phase_offset; pass "
+            f"phase_offset={n_phase - n_inst} if the extra phase frames are "
+            f"leading frames that were not segmented.")
+
     rows = tracking_df[tracking_df["semantic_smoothed"] == 1]
 
     imgs, feats, kept = [], [], []
     for index, row in rows.iterrows():
         frame = int(row['frame'])
-        if frame >= T:
+        if frame < 0 or frame >= n_inst:
             continue
-        got = prepare_crop(phase_stack[frame], instance_stack[frame],
+        got = prepare_crop(phase_stack[frame + phase_offset], instance_stack[frame],
                            int(row['x']), int(row['y']), row['label'])
         if got is None:
             continue
