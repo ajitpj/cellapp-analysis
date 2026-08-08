@@ -49,22 +49,25 @@ for pid, g in df.groupby('particle'):
     _, props = find_peaks(np.append(g.semantic_smoothed.to_numpy(), np.zeros(3)),
                           width=MIN_DUR)
     decoded[pid] = (g, states, ev)
+    path = ''.join('IMPD'[s] for s in states)
     rows.append(dict(pid=pid, n=len(g),
                      raw_flips=int(np.abs(np.diff(mit_obs.astype(int))).sum()),
                      old_peaks=props['widths'].size,
                      old_dur=props['widths'][0] if props['widths'].size == 1 else np.nan,
                      new_dur=int((states == 1).sum()),
-                     label=ev['death_label'], death_frame=ev['death_frame']))
+                     exits=int((states == 2).any()),
+                     path=''.join(c for i, c in enumerate(path) if i == 0 or c != path[i-1]),
+                     label=ev['fate_label'], death_frame=ev['death_frame']))
 S = pd.DataFrame(rows)
 
-print('=== decoded death labels (all tracks with a 101 detection) ===')
+print('=== decoded fate labels (all tracks with a 101 detection) ===')
 print(S.label.value_counts().to_string())
 print(f"\ntracks total: {len(S)}")
 print(f"old method: {(S.old_peaks > 1).sum()} tracks give >1 mitotic episode "
       f"(discarded by summarize_data); {(S.old_peaks == 0).sum()} give none")
 resc = S[(S.old_peaks > 1) & (S.new_dur >= MIN_DUR)]
 print(f"of those, decode recovers a single episode for {len(resc)} "
-      f"({resc.label.eq('none').sum()} without death)")
+      f"({resc.label.eq('mitotic_survived').sum()} without death)")
 both = S[(S.old_peaks == 1) & (S.new_dur >= MIN_DUR)]
 print(f"tracks scored by both methods: {len(both)}; median duration "
       f"old {both.old_dur.median():.1f} vs decoded {both.new_dur.median():.1f} frames")
@@ -78,12 +81,12 @@ def take(sel, title):
             picks.append((pid, title))
             return
 
-take(S[(S.old_peaks == 1) & (S.label == 'none') & (S.raw_flips <= 2)
-       & (S.n > 60)].sort_values('new_dur', ascending=False),
-     'clean track: both methods agree')
-take(S[(S.old_peaks > 1) & (S.label == 'none') & (S.new_dur >= 4)]
+take(S[(S.path == 'IMP') & (S.new_dur.between(4, 12)) & (S.raw_flips <= 3)
+       & (S.n > 60)].sort_values('n', ascending=False),
+     'interphase -> mitosis -> survives (no death): both methods agree')
+take(S[(S.path == 'IMP') & (S.old_peaks > 1) & (S.new_dur >= 4)]
      .sort_values('raw_flips', ascending=False),
-     'flickering semantic: old finds several episodes, decode finds one')
+     'survives mitosis, but flickering semantic makes the old method see several episodes')
 take(S[(S.label == 'dead_in_mitosis') & (S.n > 40)].sort_values('new_dur', ascending=False),
      'death during mitosis')
 take(S[(S.label == 'dead_post_mitosis') & (S.n > 50)].sort_values('new_dur', ascending=False),
@@ -110,7 +113,7 @@ for ax, (pid, title) in zip(np.atleast_1d(axes), picks):
     ax.set_ylim(-0.08, 1.15)
     ax.set_ylabel(f'particle {pid}', fontsize=9)
     ax.set_title(f'{title}   |   old: {row.old_peaks} episode(s)   '
-                 f'decoded: {row.new_dur} mitotic frames, {ev["death_label"]}',
+                 f'decoded: {row.new_dur} mitotic frames, {ev["fate_label"]}',
                  fontsize=9, loc='left')
 axes[-1].set_xlabel('frame')
 handles = [Patch(fc=c, label=f'decoded {n}') for c, n in zip(state_colors, STATE_NAMES)]

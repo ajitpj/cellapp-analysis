@@ -100,8 +100,13 @@ def track_events(states: npt.NDArray, frames: npt.NDArray) -> dict:
     Returns dict with:
     mito_start, mito_end : movie frames bounding the mitotic episode (or None)
     death_frame          : movie frame of the first dead-classified state
-    death_label          : none | dead_in_mitosis | dead_post_mitosis |
-                           dead_no_mitosis
+    fate_label           : one of
+        no_mitosis        - never mitotic and never dead-like
+        mitotic_survived  - entered mitosis and did not become dead-like
+                            (whether or not it exited before the movie ended)
+        dead_in_mitosis   - became dead-like while still mitotic
+        dead_post_mitosis - exited mitosis, then became dead-like
+        dead_no_mitosis   - became dead-like without a true mitotic episode
     '''
     frames = np.asarray(frames)
     m = np.flatnonzero(states == 1)
@@ -109,12 +114,14 @@ def track_events(states: npt.NDArray, frames: npt.NDArray) -> dict:
     events = {'mito_start': int(frames[m[0]]) if m.size else None,
               'mito_end': int(frames[m[-1]]) if m.size else None,
               'death_frame': int(frames[d[0]]) if d.size else None,
-              'death_label': 'none'}
+              'fate_label': 'no_mitosis'}
     if d.size:
         if not m.size:
-            events['death_label'] = 'dead_no_mitosis'
+            events['fate_label'] = 'dead_no_mitosis'
         elif np.any(states == 2):
-            events['death_label'] = 'dead_post_mitosis'
+            events['fate_label'] = 'dead_post_mitosis'
         else:
-            events['death_label'] = 'dead_in_mitosis'
+            events['fate_label'] = 'dead_in_mitosis'
+    elif m.size:
+        events['fate_label'] = 'mitotic_survived'
     return events

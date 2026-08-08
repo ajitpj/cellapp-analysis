@@ -472,7 +472,8 @@ class analysis:
         channels         = []
         max_displacement = []
         dead_cell_score  = [] # keep track of "dead" flags
-        death_label      = [] # none / dead_in_mitosis / dead_post_mitosis / dead_no_mitosis
+        fate_label       = [] # no_mitosis / mitotic_survived / dead_in_mitosis /
+                              # dead_post_mitosis / dead_no_mitosis
         death_frame      = [] # movie frame of death (NaN if the cell never dies)
         mitosis_decoded    = [] # mitotic duration from the constrained decode
         mito_start_decoded = [] # mitotic entry frame from the constrained decode
@@ -527,7 +528,7 @@ class analysis:
                                       self.defaults.decode_switch_penalty,
                                       self.defaults.decode_dead_weight)
                 events = track_events(states, track_rows.frame.to_numpy())
-                death_label.append(events['death_label'])
+                fate_label.append(events['fate_label'])
                 death_frame.append(events['death_frame'] if events['death_frame']
                                    is not None else np.nan)
                 # Decoded mitotic episode, reported alongside the smoothing-based
@@ -581,7 +582,7 @@ class analysis:
                         "cell_area"        : cell_area,
                         "mitosis"          : mitosis,
                         "dead_cell_score"  : dead_cell_score,
-                        "death_label"      : death_label,
+                        "fate_label"       : fate_label,
                         "death_frame"      : death_frame,
                         "mitosis_decoded"  : mitosis_decoded,
                         "mito_start_decoded" : mito_start_decoded
