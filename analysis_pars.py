@@ -17,7 +17,11 @@ class analysis_pars:
         except:
             raise ValueError(f"Choose one of {self.cell_types}")
         
-        # Mask value for mitotic cells
+        # Mask value for mitotic cells. Different cellaap versions write
+        # different ones; mitotic_semantic_values lists every value that means
+        # mitotic, and mitotic_mask_value is the one this dataset actually
+        # uses (resolved against the segmentation in cellaap_analysis).
+        self.mitotic_semantic_values = (100, 101)
         self.mitotic_mask_value = 101
 
         # Parameters for pre-processing inferred cell segmentations
@@ -64,7 +68,15 @@ class analysis_pars:
             setattr(self, attr, val)
 
         #### Mitotic vs dead discrimination model
-        # Platt-calibrated random forest on ResNet18 embedding + handcrafted
-        # features, trained on 345 hand labels. Class 1 = mitotic, 0 = dead.
-        self.dead_classifier = joblib.load(
-            Path(__file__).parent / "models" / "dead_classifier_handlabeled.joblib")["model"]
+        # ResNet18-512 -> PCA(32) -> logistic regression, trained on 826 hand
+        # labels pooled from the BUB1 (345) and CycB-oe 20576 (481) datasets
+        # over 15 microscope positions. Class 1 = mitotic, 0 = dead.
+        # Leave-one-position-out balanced accuracy 0.878, AUC 0.945, ECE 0.018.
+        #
+        # Keep the whole bundle: it declares which feature blocks the estimator
+        # consumes (this model takes the 512-d embedding alone, the previous
+        # one took embedding + 16 handcrafted), and classify_dead builds the
+        # design matrix from that declaration.
+        self.dead_classifier_bundle = joblib.load(
+            Path(__file__).parent / "models" / "dead_classifier_pooled.joblib")
+        self.dead_classifier = self.dead_classifier_bundle["model"]

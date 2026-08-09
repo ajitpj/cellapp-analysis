@@ -1,13 +1,14 @@
 '''
 Augment previously generated cellaap *_analysis.xlsx files with the
-mitotic/dead label from the hand-labeled classifier
-(models/dead_classifier_handlabeled.joblib).
+mitotic/dead label from the pooled classifier
+(models/dead_classifier_pooled.joblib).
 
 For every *_inference folder under the root folder that contains an
-*_analysis.xlsx, the script classifies each detection labeled mitotic by the
-semantic segmentation (semantic_smoothed == 1) from its instance-masked phase
-crop and rewrites the cell table with updated dead_flag (1 = dead)
-and new dead_proba columns. All other sheets are preserved.
+*_analysis.xlsx, the script classifies each detection whose semantic label is
+mitotic (100 or 101) from its instance-masked phase crop and rewrites the cell
+table with updated dead_flag (1 = dead) and mitotic_proba / dead_proba
+columns. Rows that are not mitotic keep NaN probabilities. All other sheets
+are preserved.
 
 Usage:
   python augment_dead_label.py <root_folder>                 # all positions
@@ -25,9 +26,9 @@ import numpy as np
 import pandas as pd
 import tifffile
 
-from dead_classifier import classify_dead
+from dead_classifier import MITOTIC_SEMANTIC_VALUES, classify_dead, mitotic_rows
 
-MODEL_PATH = Path(__file__).parent / "models" / "dead_classifier_handlabeled.joblib"
+MODEL_PATH = Path(__file__).parent / "models" / "dead_classifier_pooled.joblib"
 
 
 def augment_file(inference_dir: Path, model, suffix: str = "",
@@ -58,15 +59,19 @@ def augment_file(inference_dir: Path, model, suffix: str = "",
     sheets = pd.read_excel(xlsx, sheet_name=None, index_col=0)
     key = "cell_data" if "cell_data" in sheets else list(sheets)[0]
     cell_data = sheets[key]
-    required = {"semantic_smoothed", "frame", "x", "y", "label", "area"}
+    required = {"semantic", "frame", "x", "y", "label", "area"}
     if not required.issubset(cell_data.columns):
         print(f"{xlsx.name}: missing columns {required - set(cell_data.columns)}, skipping")
+        return
+
+    n_mitotic = len(mitotic_rows(cell_data, MITOTIC_SEMANTIC_VALUES))
+    if n_mitotic == 0:
+        print(f"{xlsx.name}: no semantic label in {MITOTIC_SEMANTIC_VALUES}, skipping")
         return
 
     phase = tifffile.imread(phase_hits[0])
     instance = tifffile.imread(instance_hits[0])
 
-    n_mitotic = int(cell_data.semantic_smoothed.sum())
     print(f"{xlsx.name}: classifying {n_mitotic} mitotic-labeled detections...")
     try:
         label_df = classify_dead(phase, instance, cell_data, model,
@@ -75,10 +80,13 @@ def augment_file(inference_dir: Path, model, suffix: str = "",
         print(f"{xlsx.name}: SKIPPED - {e}")
         return
 
-    cell_data["dead_flag"] = 0
+    # non-mitotic rows keep NaN: the model was never asked about them
+    cell_data["mitotic_proba"] = np.nan
     cell_data["dead_proba"] = np.nan
-    cell_data.loc[label_df.index, "dead_flag"] = label_df.dead_flag
+    cell_data["dead_flag"] = 0
+    cell_data.loc[label_df.index, "mitotic_proba"] = label_df.mitotic_proba
     cell_data.loc[label_df.index, "dead_proba"] = label_df.dead_proba
+    cell_data.loc[label_df.index, "dead_flag"] = label_df.dead_flag
     sheets[key] = cell_data
 
     out = xlsx if not suffix else xlsx.with_name(
@@ -109,7 +117,8 @@ def main():
     if not args.root_folder.is_dir():
         raise SystemExit(f"{args.root_folder} is not a directory")
 
-    model = joblib.load(MODEL_PATH)["model"]
+    # pass the whole bundle: it declares which feature blocks the model takes
+    model = joblib.load(MODEL_PATH)
     folders = sorted(p for p in args.root_folder.iterdir()
                      if p.is_dir() and "_inference" in p.name)
     if args.wells:

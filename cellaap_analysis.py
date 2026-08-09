@@ -266,16 +266,25 @@ class analysis:
         self.tracked["semantic"] = semantic_label
 
         # Different cellaap versions write different mitotic mask values (101 in
-        # this pipeline, 100 in some older inference folders). If the configured
-        # value is absent the analysis silently finds no mitosis anywhere, so say
-        # so loudly rather than returning an empty result.
+        # this pipeline, 100 in others). If the configured value is absent the
+        # analysis silently finds no mitosis anywhere, so resolve it against
+        # what the segmentation actually contains, and fail loudly when that is
+        # ambiguous rather than returning an empty result.
         observed = set(np.unique(semantic_label).tolist())
         if self.defaults.mitotic_mask_value not in observed:
-            raise ValueError(
-                f"mitotic_mask_value={self.defaults.mitotic_mask_value} does not "
-                f"occur in the semantic segmentation, which contains {sorted(observed)}. "
-                f"Set analysis_pars.mitotic_mask_value to the mitotic value for "
-                f"this dataset, otherwise no mitotic events will be detected.")
+            present = [v for v in self.defaults.mitotic_semantic_values
+                       if v in observed]
+            if len(present) == 1:
+                print(f"mitotic_mask_value={self.defaults.mitotic_mask_value} is "
+                      f"absent from this segmentation; using {present[0]} instead "
+                      f"(observed values {sorted(observed)}).")
+                self.defaults.mitotic_mask_value = present[0]
+            else:
+                raise ValueError(
+                    f"mitotic_mask_value={self.defaults.mitotic_mask_value} does not "
+                    f"occur in the semantic segmentation, which contains {sorted(observed)}. "
+                    f"Set analysis_pars.mitotic_mask_value to the mitotic value for "
+                    f"this dataset, otherwise no mitotic events will be detected.")
 
         # remove 0's and 2's, and fill gaps in the semantic vector.
         self.tracked.loc[self.tracked.semantic != self.defaults.mitotic_mask_value, "semantic"] = 1
@@ -294,17 +303,24 @@ class analysis:
         
         ###########################################################################
         # Mitotic/dead discrimination
-        # Each detection labeled mitotic by the semantic segmentation is classified
-        # as live mitotic or dead-like from its instance-masked phase crop.
-        print(f"Classifying {int(self.tracked.semantic_smoothed.sum())} mitotic-labeled detections...")
+        # Only detections whose semantic label is mitotic (100 or 101) are
+        # classified, from the instance-masked phase crop. Every other row keeps
+        # NaN probabilities: the model was never asked about it, and a 0 there
+        # would read as a confident "not dead".
+        n_to_classify = int(self.tracked.semantic.isin(
+            self.defaults.mitotic_semantic_values).sum())
+        print(f"Classifying {n_to_classify} mitotic-labeled detections...")
         label_df = classify_dead(self.stacks["phase"],
                                  self.stacks["instance"],
                                  self.tracked,
-                                 self.defaults.dead_classifier)
-        self.tracked["dead_flag"] = 0
+                                 self.defaults.dead_classifier_bundle,
+                                 mitotic_values=self.defaults.mitotic_semantic_values)
+        self.tracked["mitotic_proba"] = np.nan
         self.tracked["dead_proba"] = np.nan
-        self.tracked.loc[label_df.index, "dead_flag"] = label_df.dead_flag
+        self.tracked["dead_flag"] = 0
+        self.tracked.loc[label_df.index, "mitotic_proba"] = label_df.mitotic_proba
         self.tracked.loc[label_df.index, "dead_proba"] = label_df.dead_proba
+        self.tracked.loc[label_df.index, "dead_flag"] = label_df.dead_flag
         ###########################################################################
 
         
