@@ -1,6 +1,19 @@
 '''
 Mitotic vs dead discrimination for cells carrying the mitotic semantic label.
 
+ONLY mitotic-labeled detections may be scored. The model is binary within the
+rounded-cell population - class 1 "mitotic" against class 0 "dead" - so on a
+flat interphase cell class 0 means nothing more than "not rounded". Measured
+on 20260624_CycB oe_A12_s2: frames BEFORE mitotic entry, from cells that go on
+to divide and are therefore alive by construction, score mean P(dead) = 0.785
+with 82.5% over threshold, against 0.869/90.2% for post-mitotic frames and
+0.294/27.4% for mitotic ones. Extending scoring past the mitotic label to
+catch post-mitotic death was tried and reverted for exactly this reason: it
+moved dead_post_mitosis 1 -> 37 and mitotic_survived 114 -> 27, almost all
+artifact. Post-mitotic death is instead recovered in summarize_data, where a
+dying cell that re-rounds carries the mitotic label again and so stays inside
+this model's competence - see summarize_multi_peak_tracks.
+
 Each detection is reduced to an instance-masked phase crop, from which two
 feature blocks are computed and concatenated in this order:
 
@@ -115,19 +128,44 @@ def unpack_model(model):
     return model, DEFAULT_FEATURE_SET
 
 
-def _feature_matrix(masked_imgs: npt.NDArray, handcrafted: npt.NDArray,
+'''Which feature blocks each known layout consumes: (embedding, handcrafted).'''
+_BLOCKS = {
+    'resnet18 + handcrafted': (True, True),
+    'resnet18 (512-d)':       (True, False),
+    'handcrafted, all 16':    (False, True),
+}
+
+
+def feature_blocks(feature_set: str) -> tuple:
+    '''(needs_embedding, needs_handcrafted) for a declared feature set.
+
+    Callers use this to skip work the model will not look at. The handcrafted
+    block costs a GLCM per crop, which dominates runtime over a whole stack,
+    and the current model does not use it.
+    '''
+    try:
+        return _BLOCKS[feature_set]
+    except KeyError:
+        raise ValueError(
+            f"unknown feature_set {feature_set!r}; the model bundle must "
+            f"declare one of {sorted(_BLOCKS)}") from None
+
+
+def _feature_matrix(masked_imgs: npt.NDArray, handcrafted,
                     feature_set: str) -> npt.NDArray:
-    '''Assemble the design matrix the trained model expects.'''
-    if feature_set == 'resnet18 + handcrafted':
+    '''Assemble the design matrix the trained model expects.
+
+    handcrafted may be None when feature_blocks() says it is not needed.
+    '''
+    use_emb, use_hand = feature_blocks(feature_set)
+    if use_hand and handcrafted is None:
+        raise ValueError(f"feature_set {feature_set!r} needs the handcrafted "
+                         f"block but none was computed")
+    if use_emb and use_hand:
         return np.column_stack([_embed(masked_imgs), handcrafted])
-    if feature_set == 'resnet18 (512-d)':
+    if use_emb:
         return _embed(masked_imgs)
-    if feature_set == 'handcrafted, all 16':
-        return handcrafted
-    raise ValueError(
-        f"unknown feature_set {feature_set!r}; the model bundle must declare "
-        f"one of 'resnet18 + handcrafted', 'resnet18 (512-d)', "
-        f"'handcrafted, all 16'")
+    return np.asarray(handcrafted)
 
 
 def prepare_crop(phase_frame: npt.NDArray, instance_frame: npt.NDArray,
@@ -181,12 +219,60 @@ def mitotic_rows(tracking_df: pd.DataFrame,
     raise KeyError("tracking_df needs a 'semantic' (or 'semantic_smoothed') column")
 
 
+def rows_to_classify(tracking_df: pd.DataFrame,
+                     mitotic_values=MITOTIC_SEMANTIC_VALUES,
+                     post_peak_frames: int = 0) -> pd.DataFrame:
+    '''Mitotic-labeled rows, plus post_peak_frames frames after each episode.
+
+    The tail is what makes post-mitotic death visible: a cell dying as it
+    leaves mitosis drops the mitotic label while still rounded, so the frames
+    carrying the death sit just past the episode - close enough that the cell
+    still looks like something this model was trained on.
+
+    Keep the tail short. Scored far enough past the peak the cell is flat
+    again, and a flat cell reads as "dead" to this model whether or not it is:
+    on A12_s2, alive pre-mitotic frames scored mean P(dead) = 0.785. The tail
+    length is analysis_pars.post_peak_frames.
+
+    Episodes are runs of the raw mitotic label, for the same reason
+    mitotic_rows gates on it rather than on semantic_smoothed. Tables with no
+    particle/frame columns fall back to the mitotic rows alone.
+    '''
+    mitotic = mitotic_rows(tracking_df, mitotic_values)
+    if post_peak_frames <= 0 or not {'particle', 'frame'}.issubset(tracking_df.columns):
+        return mitotic
+
+    keep = pd.Series(False, index=tracking_df.index)
+    keep.loc[mitotic.index] = True
+    is_mitotic = keep.to_numpy().copy()
+    for _, g in tracking_df.groupby('particle', sort=False):
+        rows = tracking_df.index.get_indexer(g.index)
+        gm = is_mitotic[rows]
+        if not gm.any():
+            continue
+        frames = g['frame'].to_numpy()
+        # ends of each run of mitotic frames within this track
+        padded = np.concatenate(([False], gm, [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        for start, stop in zip(edges[::2], edges[1::2]):
+            last = frames[stop - 1]
+            tail = (frames > last) & (frames <= last + post_peak_frames)
+            if tail.any():
+                keep.iloc[rows[tail]] = True
+    return tracking_df[keep]
+
+
 def classify_dead(phase_stack: npt.NDArray, instance_stack: npt.NDArray,
                   tracking_df: pd.DataFrame, model,
                   phase_offset: int = 0,
-                  mitotic_values=MITOTIC_SEMANTIC_VALUES) -> pd.DataFrame:
+                  mitotic_values=MITOTIC_SEMANTIC_VALUES,
+                  post_peak_frames: int = 0,
+                  chunk_size: int = 2048) -> pd.DataFrame:
     '''
-    Classify every detection labeled mitotic by the semantic segmentation.
+    Classify the mitotic-labeled detections, plus a short post-episode tail.
+
+    Do not widen this beyond the tail - see the module docstring. Far from the
+    rounded-cell population the model's class 0 means "not mitotic", not "dead".
 
     Inputs:
     phase_stack    : full-resolution phase stack (T, 2048, 2048)
@@ -200,9 +286,14 @@ def classify_dead(phase_stack: npt.NDArray, instance_stack: npt.NDArray,
                      segmented (e.g. a 361-frame phase stack against a 341-frame
                      segmentation needs phase_offset=20).
     mitotic_values : semantic values treated as mitotic (default 100 and 101).
+    post_peak_frames : frames scored after each mitotic episode, so a death on
+                     mitotic exit is still seen. See rows_to_classify.
+    chunk_size     : crops buffered before a predict pass, to cap peak memory.
+                     A long movie yields tens of thousands of mitotic crops,
+                     and 96x96 float32 adds up (~37 MB per 1000).
 
-    Returns a dataframe indexed like tracking_df, holding only the
-    mitotic-labeled rows that could be cropped, with columns
+    Returns a dataframe indexed like tracking_df, holding only the scored
+    rows that could be cropped, with columns
     mitotic_proba, dead_proba (= 1 - mitotic_proba) and dead_flag (1 = dead).
     Rows outside that set are left unclassified by the caller rather than
     being assigned a probability the model was never asked for.
@@ -220,9 +311,35 @@ def classify_dead(phase_stack: npt.NDArray, instance_stack: npt.NDArray,
             f"phase_offset={n_phase - n_inst} if the extra phase frames are "
             f"leading frames that were not segmented.")
 
-    rows = mitotic_rows(tracking_df, mitotic_values)
+    rows = rows_to_classify(tracking_df, mitotic_values, post_peak_frames)
+    _, needs_handcrafted = feature_blocks(feature_set)
 
-    imgs, feats, kept = [], [], []
+    # Scored in chunks rather than all at once. Holding every crop as 96x96
+    # float32 costs ~37 MB per 1000, and np.stack then doubles it; a 450-frame
+    # movie has tens of thousands of mitotic detections. A chunk is ~75 MB,
+    # and only the probabilities are kept.
+    kept, probas = [], []
+    imgs, feats, idx = [], [], []
+
+    def _score_chunk():
+        '''Embed and predict the buffered crops, then release them.'''
+        if not imgs:
+            return
+        X = _feature_matrix(np.stack(imgs),
+                            np.stack(feats) if needs_handcrafted else None,
+                            feature_set)
+        # A width mismatch produces confident nonsense rather than an obvious
+        # failure, so check it against what the estimator was fitted on.
+        expected = getattr(estimator, 'n_features_in_', None)
+        if expected is not None and X.shape[1] != expected:
+            raise ValueError(
+                f"model expects {expected} features but feature_set "
+                f"{feature_set!r} produced {X.shape[1]}. The bundle's feature_set "
+                f"does not match the estimator it was saved with.")
+        probas.append(estimator.predict_proba(X)[:, 1])
+        kept.extend(idx)
+        imgs.clear(), feats.clear(), idx.clear()
+
     for index, row in rows.iterrows():
         frame = int(row['frame'])
         if frame < 0 or frame >= n_inst:
@@ -233,24 +350,19 @@ def classify_dead(phase_stack: npt.NDArray, instance_stack: npt.NDArray,
             continue
         im, mask = got
         imgs.append(im)
-        feats.append(np.append(_crop_features(im, mask), row['area']))
-        kept.append(index)
+        # the GLCM in _crop_features dominates runtime over a whole stack;
+        # skip it entirely when the model does not consume that block
+        if needs_handcrafted:
+            feats.append(np.append(_crop_features(im, mask), row['area']))
+        idx.append(index)
+        if len(imgs) >= chunk_size:
+            _score_chunk()
+    _score_chunk()
 
-    if not feats:
+    if not kept:
         return pd.DataFrame(columns=["mitotic_proba", "dead_proba", "dead_flag"])
 
-    X = _feature_matrix(np.stack(imgs), np.stack(feats), feature_set)
-
-    # A width mismatch produces confident nonsense rather than an obvious
-    # failure, so check it against what the estimator was fitted on.
-    expected = getattr(estimator, 'n_features_in_', None)
-    if expected is not None and X.shape[1] != expected:
-        raise ValueError(
-            f"model expects {expected} features but feature_set "
-            f"{feature_set!r} produced {X.shape[1]}. The bundle's feature_set "
-            f"does not match the estimator it was saved with.")
-
-    p_mitotic = estimator.predict_proba(X)[:, 1]
+    p_mitotic = np.concatenate(probas)
     # The two probabilities are complementary by construction (binary model);
     # both are reported so downstream code never has to remember which way
     # round the class encoding runs.

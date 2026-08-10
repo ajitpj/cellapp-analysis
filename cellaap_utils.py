@@ -414,6 +414,13 @@ def import_filter_data_for_wells(analysis_object, expt_label: str, expt_length: 
     -----
     The actual file I/O and summary assembly is performed by
     `compile_summaries`; this function only post-processes that result.
+
+    Both filters read `mito_start` as an absolute movie frame, which is what
+    `summarize_data` now writes: a row survives only if mitotic entry was
+    actually observed (frame > 0) and the whole episode finished inside the
+    movie. Summary files written before that change stored a within-track row
+    index there, and against those the second filter is too permissive for
+    tracks that begin late in the movie.
     """
     well_data = compile_summaries(analysis_object, well_list)
     well_data = well_data[well_data["mito_start"]>0]
@@ -484,28 +491,6 @@ def import_whole_expt_data(wellmap_dict: dict, analysis_object, expt_length: int
             print(f'Failed to load {wellmap_dict}', key, type(e).__name__, e)
 
     return whole_expt_data
-
-
-def _display_dead_cells(phase_stack: npt.NDArray, updated_df: pd.DataFrame) -> npt.NDArray:
-    '''
-    Docstring for display_dead_cells
-    
-    :param phase_stack: Description
-    :type phase_stack: npt.NDArray
-    :param updated_df: Description
-    :type updated_df: pd.DataFrame
-    :return: Description
-    :rtype: NDArray[Any]
-    '''
-    phase_display = np.zeros_like(phase_stack)
-    for i, row in updated_df.iterrows():
-        if row.dead_flag == 1:
-            x = int(row['x'])*2
-            y = int(row['y'])*2
-            frame = int(row['frame'])
-            phase_display[frame, x-40:x+40, y-40:y+40] = phase_display[frame, x-40:x+40,y-40:y+40] + 1000
-
-    return phase_display
 
 
 def export_to_excel_by_col(df, output_path, by_column="code", root_folder=None, wellmap_path=None):

@@ -57,9 +57,78 @@ Be careful when using the "predictive" tracking mode. It's very powerful, but ca
 **Step 3:** Use the **measure_signal** function to measure the fluorescence from the specified channel. The channel string must match the channel name in the file names. The "id = -1" will make the function measure data for all cells that went through a complete mitosis during the time lapse. Optionally, one can provide a list with cell numbers (development only). Thus, cells that remained in interphase throughout the experiment are not measured. Their tracks are still reported.
 
 **Step 4:** Use the **summarize_data** function to create the summary Excel file that lists the average signals measured for all channels, duraion of mitosis, and the correction factors to account for background and excitation intensity variation. Before computing the summary measurements, **any gaps in the semantic label vector are filling by "closing" with a footprint (semantic_footprint) with width equal to the minimum mitotic duration (min_mitotic_duration = 3). Only gaps < 3 frames are filled.**
-Any cell that shows multiple peaks in the semantic label vector (after median filtering) is also not summarized.
+### How a cell is summarized
 
-**Important**: When cells are moving around, it is quite common to lose track of a mitotic cell right after it divides. This leads to a significant number of tracks that end in mitosis. These need not be discarded, especially given that cellapp labels anaphase cells as mitotic making it unlikely that a track ending in mitosis is somehow erroneous. The find_peaks function from scipy ignores peaks that persist till the end. Thus, tracks that end in mitosis are ignored by the find_peaks function. To avoid this, I am adding fantom semantic values at the end of each track (set to 0 - i.e. non-mitotic) before the values are input into the find_peaks function. This recovers the mitotic duration from these tracks.
+Two rules, per track. No smoothing-vs-classifier precedence, no state decode —
+those were replaced by this scheme.
+
+**Mitotic episodes** are the runs of mitotic semantic label at least
+`min_mitotic_duration_in_frames` long, read straight off the trace. The first
+episode is the mitosis that gets reported; `n_peaks` says how many there were.
+A later episode is usually the same cell re-rounding, most often to die.
+
+**Death** is called when `P(dead)` exceeds `death_proba_threshold` (0.8) for
+`death_run_frames` (5) consecutive frames, and is dated to the first frame of
+that run. Unscored frames (`NaN`) break a run — the model was never asked about
+them, so they cannot manufacture a death.
+
+Death is irreversible, so a run the cell **recovers** from is discarded —
+`death_run_frames` consecutive scored frames back under `1 - threshold` after
+the run means it was a transient burst, not a death. The classifier can read a
+cell as dead for a few frames while it rounds up and then correct itself:
+E10_s7 particle 87 died on the first frame of its mitosis at P(dead) > 0.85,
+was back at 0.01 five frames later, and ran a second mitosis 300 frames on at
+P(dead) = 0.00. Without the guard it reported `mitosis = 0`.
+
+Where the death frame falls relative to the first episode gives `fate_label`:
+
+| where the death run starts | `fate_label` | reported |
+|---|---|---|
+| never | `mitotic_survived` | mitotic duration + signal |
+| < `min_mitotic_duration_in_frames` after entry | — **excluded** | the cell never had a mitosis; it rounded up because it was dying |
+| inside the first episode | `dead_in_mitosis` | death frame, `time_to_death`, signal over the pre-death mitotic frames |
+| after the first episode | `dead_post_mitosis` | full mitotic duration + signal, plus death frame |
+
+Excluding the interphase deaths is what keeps every remaining row meaningful:
+each one carries both a mitotic duration and a fluorescence measurement, rather
+than a row of `NaN` for a cell that had no mitosis to measure.
+
+**Summary columns.** `mito_start` and `death_frame` are absolute movie frames
+and compare directly; everything else counted in frames is a duration.
+
+| column | meaning |
+|---|---|
+| `mito_start` | frame of mitotic entry (first episode) |
+| `mitosis` | length of the first episode, as observed, never truncated at death |
+| `time_to_death` | frames from mitotic entry to the death call; `NaN` if the cell survives |
+| `death_frame` | frame of the death call; `NaN` if the cell survives |
+| `fate_label` | see the table above |
+| `n_peaks` | mitotic episodes in the track |
+| `n_sem_mitotic` | frames the segmentation called mitotic |
+| `n_scored` | frames the classifier actually scored |
+| `<channel>` | mean signal over the mitotic window, up to the death call |
+
+### What never reaches the summary
+
+Three filters act before or during summarization, and they are separate
+mechanisms — worth checking in this order when a cell you expect is missing:
+
+| filter | where | control |
+|---|---|---|
+| track shorter than 10 frames | `tp.filter_stubs` in `track_centroids` | `min_track_length` |
+| mitotic detection near the frame edge | `summarize_data` | `border_margin`, `exclude_border_tracks` |
+| no mitotic run ≥ 3 frames | `summarize_data` | `min_mitotic_duration_in_frames` |
+| interphase death (see above) | `summarize_data` | `min_mitotic_duration_in_frames` |
+
+The first is the one that surprises: a cell that rounds up, dies and loses its
+track inside 10 frames is discarded at tracking and cannot be recovered
+downstream — it never appears in `*_analysis.xlsx` at all. On E10_s7 the border
+and short-episode filters removed 51 and 53 of 497 mitotic tracks; the 53 had a
+median of 2 mitotic-labeled frames, i.e. sub-threshold roundings.
+
+A track that is still mitotic when the movie ends is *not* filtered — episodes
+are runs read directly off the label trace, so an episode running to the last
+frame is measured like any other.
 
 ```python
 exp_analysis.files(Path(to_inference_folder), cell_type = "HeLa")
@@ -83,12 +152,26 @@ the cell table:
 | `dead_proba` | P(dead-like) = 1 - `mitotic_proba` |
 | `dead_flag` | 1 when `dead_proba` > 0.5 |
 
-**The probabilities are computed only where the semantic label is mitotic**
-(100 or 101 - `analysis_pars.mitotic_semantic_values`). Every other row keeps
-`NaN`, which is not the same as a low `dead_proba`: the model was never asked
-about those cells. Gating uses the raw semantic label rather than
+**The probabilities are computed where the semantic label is mitotic** (100 or
+101 - `analysis_pars.mitotic_semantic_values`) **plus
+`analysis_pars.post_peak_frames` frames after each episode**. Every other row
+keeps `NaN`, which is not the same as a low `dead_proba`: the model was never
+asked about those cells. Gating uses the raw semantic label rather than
 `semantic_smoothed`, since smoothing both adds frames the segmentation never
 called mitotic and drops frames it did.
+
+The tail is what makes post-mitotic death visible: a cell dying on mitotic exit
+drops the mitotic label while still rounded, so the frames carrying the death
+sit just past the episode.
+
+**Nothing before mitotic entry is ever scored, and the tail must stay short.**
+The model is binary *within the rounded-cell population* — class 1 mitotic
+against class 0 dead — so on a flat cell class 0 means only "not rounded", not
+"dying". Measured on A12_s2: frames before mitotic entry, from cells that go on
+to divide and are therefore alive, score mean P(dead) = 0.785 with 82.5% over
+0.5, against 0.294/27.4% for mitotic frames. Scoring every frame to the end of
+the track was tried on that basis and reverted — it moved `dead_post_mitosis`
+1 → 37 and `mitotic_survived` 114 → 27, almost entirely artifact.
 
 The two probabilities are complementary by construction - this is one binary
 model, not two independent scores. Both are reported so downstream code never
@@ -113,7 +196,11 @@ width mismatch raises rather than silently producing confident nonsense.
 To re-score analysis files produced before this model, run
 `python augment_dead_label.py <root_folder>`.
 
-**Quality metrics** - The *summarize_data* function calculate wo simple quality metrics: the number of peaks per cell track and fluctuations in cell area (standard deviation). These are stored in the *self.quality* dictionary. The number of peaks per cell track is summarized as a histogram in the excel spreadsheet in the sheet labeled "Quality". Cell area standard deviation is reported as a column vector.
+**Quality metrics** — `summarize_data` records two, in `self.quality` and in the
+spreadsheet's "quality" sheet: a histogram of mitotic episodes per track, and
+per-track cell-area standard deviation. Both flag tracking or segmentation
+problems; a track with several episodes is usually a cell that divided and then
+re-rounded, often to die.
 
 3.**Plotting mode**: One can create multiple objects corresponding, e.g., to multiple repeats of an experiment.
 
@@ -226,3 +313,48 @@ Notes:
   printed but do not stop processing of other groups.
 
 - If no data is found the function returns an empty DataFrame.
+
+## Curating particles: `particle_browser.py`
+
+A napari browser over the particles a `*_summary.xlsx` lists, for reviewing the
+pipeline's calls and dropping the bad ones.
+
+```bash
+conda run -n img-env python particle_browser.py "/path/to/root_folder"
+```
+
+The folder argument is optional and can also be set from the two folder buttons
+in the panel: the inference folder is where the `*_inference` directories live,
+the image folder is where the `*.tif` stacks live. They are the same by default
+and unticking the checkbox separates them; both are searched one level deep as
+a fallback, so pointing at a parent works.
+
+- **Well -> Site -> Particle.** Particles come from the `Summary` sheet; the
+  pooled workbook pair is preferred when a position has both. Stacks and
+  inference folders pair on the `well_site` key (`A12_s2`), never the file
+  stem, since the acquisition and analysis dates can differ.
+- **ROI.** A 100x100 crop follows the tracked centroid through every channel
+  found for that position, phase at the bottom and fluorescence additive on
+  top. `x`/`y` are doubled (half-res segmentation grid -> raw stacks) and
+  `frame` indexes the stacks directly. Border ROIs are zero-padded so the cell
+  stays centred.
+- **Traces.** `semantic`, a selectable fluorescence column and `dead_proba`
+  overlaid on a shared 0-1 axis, with each one's true range in the legend;
+  fluorescence is scaled on its 1st-99th percentiles so one bright frame cannot
+  flatten it. `mito_start` and `death_frame` are marked. The cursor follows the
+  napari frame slider, and clicking the plot jumps the viewer to that frame.
+  Workbooks predating the dead classifier simply plot two traces.
+- **Exclude / Export.** Exclusions are per position and persisted immediately,
+  so scoring survives a restart. Export prompts for a name and writes
+  `<name>_summary.xlsx` + `<name>_analysis.xlsx`: the summary keeps every
+  original sheet with `Summary` filtered and an added `excluded` sheet, the
+  analysis keeps the rows of the surviving particles. If other positions also
+  have exclusions it offers to export those too, suffixing each pair with its
+  well_site.
+
+Reading a 30 MB analysis workbook takes ~55 s, so each is memoised as parquet
+(keyed by size and mtime) and revisits cost ~0.1 s. ROI reads memory-map the
+stacks and pull only the crop -- ~14 s per channel for a 450-frame track over
+SMB -- and the last 8 particles stay in memory. Both the cache and the
+exclusion list live in `~/.cache/particle_browser/`, outside the repo, since
+they are machine-local and regenerable.

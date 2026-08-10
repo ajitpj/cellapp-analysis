@@ -1,9 +1,6 @@
-import os
 from pathlib import Path
-import pandas as pd
 import numpy as np
 from skimage.morphology import disk
-import trackpy
 import joblib
 
 class analysis_pars:
@@ -38,19 +35,27 @@ class analysis_pars:
         self.semantic_gap_closing = 3 # number of frames
         self.semantic_footprint = np.ones(self.semantic_gap_closing)
 
-        # Constrained track decoding (interphase -> mitotic -> post-mitotic -> dead)
-        self.decode_flip_prob      = 0.1 # per-frame semantic mislabel probability
-        self.decode_dead_sem_prob  = 0.7 # dead cell still carries the mitotic label
-        self.decode_switch_penalty = 2.5 # -log prior per state transition; larger
-                                         # values suppress short spurious episodes
-        self.decode_dead_weight    = 0.3 # tempering on classifier evidence; death
-                                         # must be supported by a run of frames.
-                                         # Set when the classifier was badly
-                                         # overconfident (calibration error 0.09).
-                                         # The hand-labeled model is calibrated
-                                         # (0.05), so this can likely be raised
-                                         # toward 1.0 - needs checking against
-                                         # real tracks before changing.
+        # How far past each mitotic episode the dead/mitotic classifier is run.
+        # A cell that dies on exiting mitosis loses the mitotic semantic label
+        # while it is still rounded, so the frames that carry the death are
+        # just past the peak. Scoring the whole rest of the track instead does
+        # not work - by then the cell is flat, which this model reads as "dead"
+        # whether or not it is (see the dead_classifier docstring).
+        self.post_peak_frames = 10
+
+        # Death call. A cell is dead from the first frame of the first run of
+        # death_run_frames consecutive frames with P(dead) above the
+        # threshold. High threshold plus a required run keeps isolated
+        # confident frames - classifier flicker - from ending a mitosis.
+        self.death_proba_threshold = 0.8
+        self.death_run_frames = 5
+
+        # Border exclusion. The classifier needs a full CROP_SIZE (96 px, full
+        # resolution) box around the centroid, so a cell within half of that of
+        # the edge can never be scored and its mitotic frames carry no evidence
+        # either way. Margin is in analysis-scale pixels, i.e. 96 / 2 / 2.
+        self.border_margin = 24
+        self.exclude_border_tracks = True
 
         # trackpy parameters
         self.max_pixel_movement = 20

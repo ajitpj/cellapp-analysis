@@ -1,25 +1,16 @@
-import os, tifffile
-from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+import os, re, tifffile, warnings
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from skimage.io import imread # type: ignore
 from skimage.morphology import erosion, closing
-from skimage.filters.rank import minimum
-from skimage.measure import regionprops_table, block_reduce
-import napari # type: ignore
+from skimage.measure import regionprops_table
 import numpy as np
 import pandas as pd
 import trackpy as tp
 import scipy.ndimage as ndi
-from scipy.signal import find_peaks, medfilt
+from scipy.signal import medfilt
 from analysis_pars import analysis_pars
 from cellaap_utils import *
-from dead_classifier import classify_dead
-from track_decode import decode_track, track_events
-from skimage.util import img_as_uint
-from os import listdir
-from os.path import isfile, join
-import re
-from itertools import zip_longest
-from typing import Literal
+from dead_classifier import classify_dead, rows_to_classify
 
 class analysis:
     
@@ -135,7 +126,13 @@ class analysis:
         # Saving the number of planes for track filtering (summarize_data)
         self.max_timepoints = instance_shape[0]
 
-        instance_zoomed = np.zeros((instance_shape[0], instance_shape[1]*2, instance_shape[2]*2))
+        # int16 to match the erosion below, which already casts to int16. The
+        # default float64 costs 8 bytes per pixel of a 4x-upsampled stack -
+        # 15 GB for a 450-frame 1024x1024 segmentation, enough to swap the
+        # machine - and buys nothing, since these are integer instance labels
+        # only ever used in the equality test in measure_signal.
+        instance_zoomed = np.zeros((instance_shape[0], instance_shape[1]*2, instance_shape[2]*2),
+                                   dtype=np.int16)
         print(f"Computing zoomed and eroded instance mask...")
         for i in np.arange(instance_shape[0]):
             pre_zoom = erosion(self.stacks["instance"][i,:,:].astype(np.int16),
@@ -303,24 +300,40 @@ class analysis:
         
         ###########################################################################
         # Mitotic/dead discrimination
-        # Only detections whose semantic label is mitotic (100 or 101) are
-        # classified, from the instance-masked phase crop. Every other row keeps
-        # NaN probabilities: the model was never asked about it, and a 0 there
-        # would read as a confident "not dead".
-        n_to_classify = int(self.tracked.semantic.isin(
-            self.defaults.mitotic_semantic_values).sum())
-        print(f"Classifying {n_to_classify} mitotic-labeled detections...")
+        # Detections whose semantic label is mitotic, plus post_peak_frames
+        # after each episode, are classified from the instance-masked phase
+        # crop. The tail catches a cell dying as it leaves mitosis, while it is
+        # still rounded. Every other row keeps NaN probabilities: the model was
+        # never asked about it, and a 0 there would read as a confident "not
+        # dead". Do not widen the tail much - far from mitosis the cell is flat
+        # and this model reads flat as dead (see the dead_classifier docstring).
+        # remembered for the border test in summarize_data, which may run later
+        # from a saved analysis file with no stack in memory
+        self.frame_shape = tuple(self.stacks["instance"].shape[-2:])
+
+        n_to_classify = len(rows_to_classify(
+            self.tracked, self.defaults.mitotic_semantic_values,
+            self.defaults.post_peak_frames))
+        print(f"Classifying {n_to_classify} detections (mitotic + "
+              f"{self.defaults.post_peak_frames} frames after each episode)...")
         label_df = classify_dead(self.stacks["phase"],
                                  self.stacks["instance"],
                                  self.tracked,
                                  self.defaults.dead_classifier_bundle,
-                                 mitotic_values=self.defaults.mitotic_semantic_values)
+                                 mitotic_values=self.defaults.mitotic_semantic_values,
+                                 post_peak_frames=self.defaults.post_peak_frames)
         self.tracked["mitotic_proba"] = np.nan
         self.tracked["dead_proba"] = np.nan
         self.tracked["dead_flag"] = 0
         self.tracked.loc[label_df.index, "mitotic_proba"] = label_df.mitotic_proba
         self.tracked.loc[label_df.index, "dead_proba"] = label_df.dead_proba
         self.tracked.loc[label_df.index, "dead_flag"] = label_df.dead_flag
+
+        # The classifier is the only consumer of the full-resolution phase
+        # stack, and at 2048x2048x450 it is ~3.8 GB that would otherwise sit
+        # alongside the channel stack measure_signal loads next. Drop it here;
+        # measure_signal and _display_tracks both re-read from self.paths.
+        self.stacks.pop("phase", None)
         ###########################################################################
 
         
@@ -338,50 +351,6 @@ class analysis:
             self.tracked.to_excel(self.cellaap_dir / Path(self.expt_name+self.name_stub+"_tracks.xlsx"))
 
         return self.tracked
-    
-    def _display_tracks(self, img_stack = None):
-        '''
-        Opens a napari viewer displaying the phase stack overlayed with
-        semantic segmentation and tracking data.
-        If a string corresponding to an existing phase path is provided, 
-        then the function infers the names of the inference folder, inference
-        stack and the _analysis.xlsx file to create the overlays.
-        Function assumes that all files exist and are appropriately named.
-        '''
-        if "viewer" not in self.__dict__.keys():
-            self.viewer = napari.Viewer()
-        
-        if img_stack is not None:
-            # Create Path object for the file
-            self.paths["phase"] = self.root_folder / Path(img_stack)
-            # Create Path for the inference folder
-            inf_folders = self.root_folder.glob("*_inference")
-            self.name_stub = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})", 
-                                       str(self.paths["phase"].name)).group()
-            for folder in self.root_folder.glob("*_inference"):
-                if self.name_stub+"_" in folder.name:
-                    self.cellaap_dir = folder
-                    semantic_file = [name for name in folder.glob("*semantic.tif")][0]
-                    excel_file = [name for name in folder.glob("*analysis.xlsx")][0]
-                    print(f"found {semantic_file} and {excel_file}")
-                    self.paths["semantic"] = semantic_file
-                    self.stacks["semantic"] = imread(semantic_file)
-                    self.tracked = pd.read_excel(excel_file)
-
-        self.stacks["phase"] = imread(self.paths["phase"])
-        shape = self.stacks["phase"].shape
-        binned_shape = (shape[0], shape[1]//2, shape[2]//2)
-        phase_binned = np.zeros(binned_shape, dtype=int)
-        for i in np.arange(phase_binned.shape[0]):
-            phase_binned[i,:,:]=block_reduce(self.stacks["phase"][i,:,:,],
-                                             block_size=(2,2), func=np.max)
-
-        self.viewer.add_image(phase_binned)
-        self.viewer.add_labels(self.stacks["semantic"])
-        self.viewer.add_tracks(self.tracked[["particle","frame","x","y"]].to_numpy())
-
-        return self.viewer
-
     
     def measure_signal(self, channel: str, save_flag: False, id = -1,):
         '''
@@ -473,20 +442,160 @@ class analysis:
         return self.tracked
     
     
+    def _analysis_frame_shape(self):
+        '''(rows, cols) of the analysis-scale frame, for the border test.
+
+        Taken from the instance stack when the object was built by the normal
+        pipeline. When summarize_data is driven from a saved analysis file
+        there is no stack in memory, so fall back to a caller-set frame_shape,
+        and finally to the largest bounding box in the table - across hundreds
+        of frames some cell always touches the edge, so that maximum is the
+        frame size to within a pixel or two.
+        '''
+        shape = getattr(self, 'frame_shape', None)
+        if shape is None:
+            stacks = getattr(self, 'stacks', None)
+            if stacks is not None and stacks.get('instance') is not None:
+                shape = tuple(stacks['instance'].shape[-2:])
+        if shape is None:
+            cols = self.tracked.columns
+            if {'bbox-2', 'bbox-3'}.issubset(cols):
+                shape = (int(self.tracked['bbox-2'].max()),
+                         int(self.tracked['bbox-3'].max()))
+                print(f'frame shape not available; inferred {shape} from bounding '
+                      f'boxes for the border test')
+            else:
+                raise ValueError('cannot determine frame shape for the border '
+                                 'test; set self.frame_shape = (rows, cols)')
+        return shape
+
+    @staticmethod
+    def _runs(flags):
+        '''(start, stop) half-open row ranges of each True run in a 1-D mask.'''
+        flags = np.asarray(flags, dtype=bool)
+        padded = np.concatenate(([False], flags, [False]))
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        return list(zip(edges[::2], edges[1::2]))
+
+    def _episodes(self, sem):
+        '''Mitotic episodes of a track, as half-open row ranges.
+
+        A run of mitotic-labeled frames shorter than min_mitotic_duration_in_frames
+        is segmentation noise, not a mitosis. Runs are read directly off the
+        trace rather than through find_peaks, which reports peak *bases* - the
+        frame before the episode - and needed an off-by-one correction.
+        '''
+        return [(s, e) for s, e in self._runs(sem)
+                if e - s >= self.defaults.min_mitotic_duration_in_frames]
+
+    def _death_row(self, dead_proba):
+        '''Row of the first frame at which the cell is called dead, or None.
+
+        The rule: P(dead) above death_proba_threshold for death_run_frames
+        consecutive frames, and the death is dated to the first frame of that
+        run. Unscored frames (NaN) are not evidence of death and break a run -
+        the model was never asked about them.
+
+        Death is irreversible, so a run the cell visibly recovers from was a
+        transient burst, not a death, and is skipped: the classifier can read a
+        cell as dead for a few frames as it rounds up, then correct itself.
+        "Recovers" means death_run_frames consecutive scored frames back under
+        1 - death_proba_threshold after the run. Without this, particle 87 of
+        E10_s7 died on the first frame of its mitosis at P(dead) > 0.85, was
+        back at 0.01 five frames later, ran a second mitosis 300 frames on at
+        P(dead) = 0.00, and still reported mitosis = 0.
+        '''
+        p = np.asarray(dead_proba, dtype=float)
+        over = np.where(np.isnan(p), False, p > self.defaults.death_proba_threshold)
+        alive = np.where(np.isnan(p), False,
+                         p < 1.0 - self.defaults.death_proba_threshold)
+        need = max(int(self.defaults.death_run_frames), 1)
+        for s, e in self._runs(over):
+            if e - s < need:
+                continue
+            if any(b - a >= need for a, b in self._runs(alive[e:])):
+                continue                      # recovered: not a death
+            return int(s)
+        return None
+
     def summarize_data(self, save_flag: True):
         '''
         Summarizes data stored in the tracked dataframe; operates on all measured channels.
-        Filtering - Two strict filters are applies. Cell is summarized only if:
-                    * If the cell is labeled as mitotic in frame 0 or frame -1
-                    * If the label trace has only one peak
-        Inputs - 
+
+        Two rules do the work, both per track:
+
+        * the mitotic episodes are the runs of mitotic semantic label at least
+          min_mitotic_duration_in_frames long. The FIRST episode is the mitosis
+          that gets reported; n_peaks says how many there were.
+        * the cell is dead from the first frame of the first run of
+          death_run_frames consecutive frames with P(dead) above
+          death_proba_threshold, discarding runs the cell visibly recovers
+          from - death is irreversible (_death_row). Where that frame falls
+          relative to the first episode gives the fate:
+
+          no qualifying run        -> mitotic_survived
+          before the cell has been -> interphase death. The cell never had a
+          mitotic for                 mitosis - it rounded up because it was
+          min_mitotic_duration_       dying - so there is no mitotic duration
+          in_frames                   and no mitotic signal to report, and the
+                                      track is left OUT of the summary.
+          inside the first episode -> dead_in_mitosis. Reports the frame of
+                                      death, the time in mitosis before it
+                                      (time_to_death), and signal averaged over
+                                      those pre-death mitotic frames.
+          after the first episode  -> dead_post_mitosis. The mitosis completed,
+                                      so the full mitotic duration and its
+                                      signal are reported, plus the frame of
+                                      death.
+
+        Death is only visible where the classifier ran: the mitotic frames plus
+        defaults.post_peak_frames AFTER each episode. Nothing before mitotic
+        entry is ever scored - this model was built to separate mitotic from
+        dead cells, both rounded, and has no meaning on an interphase cell.
+        The tail is what catches a cell dying on mitotic exit, and is
+        deliberately short for the same reason.
+
+        A cell is summarized only if it has at least one episode and (default)
+        none of its mitotic-labeled detections sit within defaults.border_margin
+        of the frame edge, where the classifier cannot see the whole cell.
+
+        Columns: mito_start and death_frame are absolute movie frames, and
+        directly comparable. mitosis is a count of frames - the length of the
+        first episode as observed, never truncated, so a cell that rounds up
+        and dies still reports how long it was seen rounded. time_to_death is
+        the frames from mitotic entry to the death call (NaN if the cell never
+        dies). Fluorescence is averaged over the episode up to the death call
+        only, so it is NaN for a cell dead from its first mitotic frame.
+
+        Note what never reaches this function: tracks shorter than
+        defaults.min_track_length are removed by trackpy in track_centroids,
+        so a cell that rounds up, dies and loses its track inside that window
+        is gone before any of this runs.
+
+        Inputs -
         save_flag : whether to export the data as an xlsx file
 
-        Outputs - 
+        Outputs -
         None
         '''
         # Select only those tracks where mitosis was observed
         idlist    = list(set(self.tracked[self.tracked.mitotic==1].particle))
+
+        # Border test: any mitotic-labeled detection closer than the margin
+        # means the classifier could not score the cell there.
+        margin = self.defaults.border_margin
+        rows, cols = self._analysis_frame_shape()
+        near_border_ids = set()
+        if margin:
+            mit_rows = self.tracked[self.tracked.semantic_smoothed == 1]
+            near = ((mit_rows.x < margin) | (mit_rows.x > rows - margin) |
+                    (mit_rows.y < margin) | (mit_rows.y > cols - margin))
+            near_border_ids = set(mit_rows.loc[near, 'particle'].unique())
+        if self.defaults.exclude_border_tracks and near_border_ids:
+            dropped = len(near_border_ids & set(idlist))
+            idlist = [i for i in idlist if i not in near_border_ids]
+            print(f'excluded {dropped} tracks with mitotic detections within '
+                  f'{margin} px of the frame edge ({rows}x{cols})')
         
         # A list to store the number of peaks
         # Multiple peaks will reveal either tracking errors or segmentation issues
@@ -495,6 +604,7 @@ class analysis:
         cell_area_std  = np.zeros_like(peaks_per_track)
 
         mitosis          = []
+        time_to_death    = [] # frames from mitotic entry to the death call
         mito_start       = []
         cell_area        = []
         particle         = []
@@ -502,11 +612,12 @@ class analysis:
         channels         = []
         max_displacement = []
         dead_cell_score  = [] # keep track of "dead" flags
-        fate_label       = [] # no_mitosis / mitotic_survived / dead_in_mitosis /
-                              # dead_post_mitosis / dead_no_mitosis
+        fate_label       = [] # mitotic_survived / dead_in_mitosis / dead_post_mitosis
         death_frame      = [] # movie frame of death (NaN if the cell never dies)
-        mitosis_decoded    = [] # mitotic duration from the constrained decode
-        mito_start_decoded = [] # mitotic entry frame from the constrained decode
+        n_peaks          = [] # mitotic episodes in the track
+        n_sem_mitotic    = [] # frames the segmentation called mitotic
+        n_scored         = [] # frames the classifier actually scored
+        n_interphase_death = 0 # died without ever having a mitosis; excluded
 
         # Check which channels have been measured. If none, return only "mitotic duration"
         # Need to find a better way to code this.
@@ -527,61 +638,83 @@ class analysis:
             signal_storage[f'{channel}_int_corr_std'] = []
 
         for index, id in enumerate(idlist):
-            
-            semantic = self.tracked[self.tracked.particle==id].semantic_smoothed.to_numpy()
-            dead_flag = self.tracked[self.tracked.particle==id].dead_flag.to_numpy()
 
-            # To include cells that were in mitosis at the end of the movie
-            _, props = find_peaks(np.append(semantic,np.zeros(3)), 
-                                  width=self.defaults.min_mitotic_duration_in_frames)
-            peaks_per_track[index] = props["widths"].size
-            cell_area_std[index]   = self.tracked[self.tracked.particle==id].area.std()
+            track_rows = self.tracked[self.tracked.particle==id]
+            frames    = track_rows.frame.to_numpy()
+            sem_raw   = (track_rows.semantic_smoothed == 1).to_numpy()
+            dead_flag = track_rows.dead_flag.to_numpy()
+            proba     = track_rows.dead_proba.to_numpy(dtype=float)
 
-            # Only select tracks that have one peak in the semantic trace
-            # This will bias the analysis to smaller mitotic durations
-            if props["widths"].size == 1:
-                mitosis.append(props["widths"][0])
-                mito_start.append(props['left_bases'][0])
-                dead_cell_score.append(np.sum(semantic*dead_flag))
+            episodes = self._episodes(sem_raw)
+            peaks_per_track[index] = len(episodes)
+            cell_area_std[index]   = track_rows.area.std()
+            if not episodes:
+                continue
 
-                # Constrained Viterbi decode: enforce a single mitotic episode
-                # and absorbing death, then label how/when the cell died.
-                track_rows = self.tracked[self.tracked.particle==id]
-                mitotic_obs = (track_rows.semantic == self.defaults.mitotic_mask_value).to_numpy()
-                if "dead_proba" in track_rows.columns:
-                    dead_evidence = track_rows.dead_proba.to_numpy()
-                else:  # older analysis files: fall back to the binary flag
-                    dead_evidence = np.where(mitotic_obs, dead_flag.astype(float), np.nan)
-                states = decode_track(mitotic_obs, dead_evidence,
-                                      self.defaults.decode_flip_prob,
-                                      self.defaults.decode_dead_sem_prob,
-                                      self.defaults.decode_switch_penalty,
-                                      self.defaults.decode_dead_weight)
-                events = track_events(states, track_rows.frame.to_numpy())
-                fate_label.append(events['fate_label'])
-                death_frame.append(events['death_frame'] if events['death_frame']
-                                   is not None else np.nan)
-                # Decoded mitotic episode, reported alongside the smoothing-based
-                # mitosis/mito_start so the two can be compared before switching.
-                # NOTE ON UNITS: mito_start above is a row index within the track
-                # (find_peaks operates on the track's own array), whereas
-                # mito_start_decoded and death_frame are movie frame numbers.
-                # The two agree once the track's first frame is added to mito_start.
-                mitosis_decoded.append((states == 1).sum())
-                mito_start_decoded.append(events['mito_start'] if events['mito_start']
-                                          is not None else np.nan)
-                cell_area.append(self.tracked[self.tracked.particle==id].area.mean())
-                particle.append(id)
-                track_length.append(semantic.shape[0])
-                coords = self.tracked.loc[self.tracked.particle==id, ['x', 'y']]
-                disp_vector = calculate_displacement(coords)
-                max_displacement.append(np.max(disp_vector))
-                
+            # The first episode is the mitosis being reported; any later one is
+            # a re-rounding, most often the cell dying after it divided.
+            first_start, first_stop = episodes[0]
+            death = self._death_row(proba)
+
+            if death is None:
+                fate = 'mitotic_survived'
+            elif death - first_start < self.defaults.min_mitotic_duration_in_frames:
+                # The cell was called dead before it had been mitotic for the
+                # minimum duration, so it never had a mitosis - it rounded up
+                # because it was dying. That is an interphase death, not a
+                # mitotic event: no mitotic duration and no mitotic signal to
+                # report, so the track is left out of the summary rather than
+                # carried as a row of NaNs. Same threshold that decides what
+                # counts as an episode in the first place.
+                n_interphase_death += 1
+                continue
+            elif death < first_stop:
+                fate = 'dead_in_mitosis'
+            else:
+                fate = 'dead_post_mitosis'
+
+            # Fluorescence window: the first episode, ending at death if the
+            # cell died during it, so no signal is measured from a cell already
+            # called dead. A cell dead from its first mitotic frame leaves this
+            # empty and its channel means are NaN - there was no live mitotic
+            # frame to measure.
+            window = np.zeros(len(frames), dtype=int)
+            window[first_start:first_stop] = 1
+            if death is not None:
+                window[death:] = 0
+
+            # Duration is the observed episode, NOT truncated at death: a cell
+            # that rounds up and dies was still seen rounded for that long, and
+            # zeroing it made those rows unusable. time_to_death carries the
+            # truncated quantity - frames from mitotic entry to the death call,
+            # which for a post-mitotic death runs past the end of the episode.
+            mitosis.append(int(first_stop - first_start))
+            time_to_death.append(int(death - first_start) if death is not None
+                                 else np.nan)
+            mito_start.append(int(frames[first_start]))
+            death_frame.append(int(frames[death]) if death is not None else np.nan)
+            fate_label.append(fate)
+            n_peaks.append(len(episodes))
+            dead_cell_score.append(np.sum(sem_raw*dead_flag))
+            n_sem_mitotic.append(int(sem_raw.sum()))
+            n_scored.append(int(np.isfinite(proba).sum()))
+            cell_area.append(track_rows.area.mean())
+            particle.append(id)
+            track_length.append(len(frames))
+            coords = self.tracked.loc[self.tracked.particle==id, ['x', 'y']]
+            disp_vector = calculate_displacement(coords)
+            max_displacement.append(np.max(disp_vector))
+
+            # A cell that dies on the first frame of its mitosis has an empty
+            # averaging window, so the channel means are legitimately NaN;
+            # numpy's empty-slice warnings would otherwise flood the log.
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
                 for channel in channels:
                     signal, bkg_corr, int_corr, area, signal_std, bkg_std, int_std, area_std = calculate_signal(
-                                                                semantic, 
-                                                                self.tracked[self.tracked.particle==id][f'{channel}'].to_numpy(), 
-                                                                self.tracked[self.tracked.particle==id][f'{channel}_bkg_corr'].to_numpy(), 
+                                                                window,
+                                                                self.tracked[self.tracked.particle==id][f'{channel}'].to_numpy(),
+                                                                self.tracked[self.tracked.particle==id][f'{channel}_bkg_corr'].to_numpy(),
                                                                 self.tracked[self.tracked.particle==id][f'{channel}_int_corr'].to_numpy(),
                                                                 self.tracked[self.tracked.particle==id].area.to_numpy(),
                                                                 self.defaults.semantic_footprint
@@ -594,7 +727,17 @@ class analysis:
                     signal_storage[f'{channel}_int_corr_std'].append(int_std)
                     # signal_storage[f'{channel}_area_mean'].append(area)
                     # signal_storage[f'{channel}_area_std'].append(area_std)
-                
+
+
+        n_dead = sum(1 for f in fate_label if f != 'mitotic_survived')
+        print(f'summarized {len(particle)} tracks; {n_dead} died during or '
+              f'after mitosis (P(dead) > {self.defaults.death_proba_threshold} '
+              f'for {self.defaults.death_run_frames} consecutive frames)')
+        if n_interphase_death:
+            print(f'excluded {n_interphase_death} tracks dead within '
+                  f'{self.defaults.min_mitotic_duration_in_frames} frames of '
+                  f'mitotic entry (interphase death - no mitosis to measure)')
+
         # Quality metrics
         n_obs, bins = np.histogram(peaks_per_track, np.arange(0,15))
         peaks_per_track_df = pd.DataFrame({"n_peaks"     : bins[:-1],
@@ -611,11 +754,13 @@ class analysis:
                         "mito_start"       : mito_start,
                         "cell_area"        : cell_area,
                         "mitosis"          : mitosis,
+                        "time_to_death"    : time_to_death,
                         "dead_cell_score"  : dead_cell_score,
                         "fate_label"       : fate_label,
                         "death_frame"      : death_frame,
-                        "mitosis_decoded"  : mitosis_decoded,
-                        "mito_start_decoded" : mito_start_decoded
+                        "n_peaks"          : n_peaks,
+                        "n_sem_mitotic"    : n_sem_mitotic,
+                        "n_scored"         : n_scored
                         }
         
         summary_storage = other_storage | signal_storage

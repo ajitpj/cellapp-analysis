@@ -4,17 +4,18 @@ mitotic/dead label from the pooled classifier
 (models/dead_classifier_pooled.joblib).
 
 For every *_inference folder under the root folder that contains an
-*_analysis.xlsx, the script classifies each detection whose semantic label is
-mitotic (100 or 101) from its instance-masked phase crop and rewrites the cell
-table with updated dead_flag (1 = dead) and mitotic_proba / dead_proba
-columns. Rows that are not mitotic keep NaN probabilities. All other sheets
-are preserved.
+*_analysis.xlsx, the script classifies each detection the pipeline would score
+- those whose semantic label is mitotic (100 or 101), plus post_peak_frames
+after each episode - from its instance-masked phase crop, and rewrites the cell
+table with updated dead_flag (1 = dead) and mitotic_proba / dead_proba columns.
+Unscored rows keep NaN probabilities. All other sheets are preserved.
 
 Usage:
   python augment_dead_label.py <root_folder>                 # all positions
   python augment_dead_label.py <root_folder> --wells A03 B03 # well filter
   python augment_dead_label.py <root_folder> --suffix _dead  # write copies
   python augment_dead_label.py <root_folder> --phase-offset 20
+  python augment_dead_label.py <root_folder> --post-peak-frames 0  # mitotic only
                                      (default augments the files in place)
 '''
 import argparse
@@ -26,13 +27,15 @@ import numpy as np
 import pandas as pd
 import tifffile
 
-from dead_classifier import MITOTIC_SEMANTIC_VALUES, classify_dead, mitotic_rows
+from analysis_pars import analysis_pars
+from dead_classifier import (MITOTIC_SEMANTIC_VALUES, classify_dead,
+                             rows_to_classify)
 
 MODEL_PATH = Path(__file__).parent / "models" / "dead_classifier_pooled.joblib"
 
 
 def augment_file(inference_dir: Path, model, suffix: str = "",
-                 phase_offset: int = 0) -> None:
+                 phase_offset: int = 0, post_peak_frames: int = 0) -> None:
     xlsx = sorted(inference_dir.glob("*_analysis.xlsx"))
     if not xlsx:
         print(f"{inference_dir.name}: no analysis file, skipping")
@@ -64,18 +67,21 @@ def augment_file(inference_dir: Path, model, suffix: str = "",
         print(f"{xlsx.name}: missing columns {required - set(cell_data.columns)}, skipping")
         return
 
-    n_mitotic = len(mitotic_rows(cell_data, MITOTIC_SEMANTIC_VALUES))
+    # same scored set as the pipeline: mitotic frames plus a short tail after
+    # each episode, so summarize_data can see a death on mitotic exit
+    n_mitotic = len(rows_to_classify(cell_data, MITOTIC_SEMANTIC_VALUES,
+                                     post_peak_frames))
     if n_mitotic == 0:
         print(f"{xlsx.name}: no semantic label in {MITOTIC_SEMANTIC_VALUES}, skipping")
         return
-
     phase = tifffile.imread(phase_hits[0])
     instance = tifffile.imread(instance_hits[0])
 
-    print(f"{xlsx.name}: classifying {n_mitotic} mitotic-labeled detections...")
+    print(f"{xlsx.name}: classifying {n_mitotic} detections...")
     try:
         label_df = classify_dead(phase, instance, cell_data, model,
-                                 phase_offset=phase_offset)
+                                 phase_offset=phase_offset,
+                                 post_peak_frames=post_peak_frames)
     except ValueError as e:      # frame-count mismatch: never guess an offset
         print(f"{xlsx.name}: SKIPPED - {e}")
         return
@@ -112,6 +118,10 @@ def main():
                     help="analysis frame f maps to phase page f+OFFSET; use when "
                          "the phase stack keeps leading unsegmented frames "
                          "(e.g. 361 phase frames vs 341 segmented -> 20)")
+    ap.add_argument("--post-peak-frames", type=int,
+                    default=analysis_pars().post_peak_frames,
+                    help="frames scored after each mitotic episode, so a death "
+                         "on mitotic exit is seen (default from analysis_pars)")
     args = ap.parse_args()
 
     if not args.root_folder.is_dir():
@@ -127,7 +137,8 @@ def main():
     print(f"{len(folders)} inference folders to process")
     for folder in folders:
         augment_file(folder, model, suffix=args.suffix,
-                     phase_offset=args.phase_offset)
+                     phase_offset=args.phase_offset,
+                     post_peak_frames=args.post_peak_frames)
 
 
 if __name__ == "__main__":
