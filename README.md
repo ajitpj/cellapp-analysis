@@ -338,23 +338,42 @@ a fallback, so pointing at a parent works.
   top. `x`/`y` are doubled (half-res segmentation grid -> raw stacks) and
   `frame` indexes the stacks directly. Border ROIs are zero-padded so the cell
   stays centred.
-- **Traces.** `semantic`, a selectable fluorescence column and `dead_proba`
-  overlaid on a shared 0-1 axis, with each one's true range in the legend;
-  fluorescence is scaled on its 1st-99th percentiles so one bright frame cannot
-  flatten it. `mito_start` and `death_frame` are marked. The cursor follows the
-  napari frame slider, and clicking the plot jumps the viewer to that frame.
-  Workbooks predating the dead classifier simply plot two traces.
+- **Traces.** `semantic`, fluorescence and `dead_proba` overlaid on a shared
+  0-1 axis, with each one's true range in the legend; fluorescence is scaled on
+  its 1st-99th percentiles so one bright frame cannot flatten it.
+  `mito_start` and `death_frame` are marked. The cursor follows the napari
+  frame slider, and clicking the plot jumps the viewer to that frame.
+  - **Pick one fluorescence column or tick `plot all`** to overlay every one
+    the analysis table carries, each in its own colour. A column whose range is
+    under 1% of its own magnitude - a correction factor that never really moves
+    - is drawn dotted and marked `~flat`, so rescaling cannot dress up noise as
+    signal.
+  - **Legacy workbooks are handled by omission.** A column that is absent, or
+    present but all-NaN, is left off the plot rather than drawn as a flat line
+    at zero, and the status line names what was dropped. Pre-classifier
+    analysis files therefore show semantic plus fluorescence only, with no
+    `dead_proba` trace and no `death_frame` marker.
+- **Annotation.** A free-text box per particle. Edits are held as you type and
+  saved when you leave the box or move on, so switching particles mid-word
+  loses nothing; annotated particles are marked `[note]` in the list. Notes go
+  out with the data as a `user_annotation` column, and are read back in when a
+  previously exported summary is re-opened, so curation resumes where it
+  stopped.
 - **Exclude / Export.** Exclusions are per position and persisted immediately,
   so scoring survives a restart. Export prompts for a name and writes
   `<name>_summary.xlsx` + `<name>_analysis.xlsx`: the summary keeps every
-  original sheet with `Summary` filtered and an added `excluded` sheet, the
-  analysis keeps the rows of the surviving particles. If other positions also
-  have exclusions it offers to export those too, suffixing each pair with its
-  well_site.
+  original sheet with `Summary` filtered and `user_annotation` added, plus an
+  `excluded` sheet listing dropped particles with their notes; the analysis
+  keeps the rows of the surviving particles, gaining `user_annotation` only if
+  something was annotated. If other positions were also curated it offers to
+  export those too, suffixing each pair with its well_site.
 
 Reading a 30 MB analysis workbook takes ~55 s, so each is memoised as parquet
 (keyed by size and mtime) and revisits cost ~0.1 s. ROI reads memory-map the
 stacks and pull only the crop -- ~14 s per channel for a 450-frame track over
-SMB -- and the last 8 particles stay in memory. Both the cache and the
-exclusion list live in `~/.cache/particle_browser/`, outside the repo, since
-they are machine-local and regenerable.
+SMB -- so they are cached in memory by total size (1.5 GB, about 80 full-length
+two-channel particles) rather than by count, since track lengths vary hugely;
+a revisit is then instant. `ROI_CACHE_BYTES` at the top of the file is the dial.
+Both the parquet cache and the curation state live in
+`~/.cache/particle_browser/`, outside the repo, since they are machine-local
+and regenerable.

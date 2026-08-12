@@ -9,9 +9,11 @@ Stacks and inference folders are paired on the well_site key (`A12_s2`) rather
 than the file stem, because the two can carry different dates.
 
 Selecting a particle pulls a 100x100 ROI that follows its tracked centroid
-through every channel, and plots `semantic`, a fluorescence column and
-`dead_proba` on a shared 0-1 axis. Particles can be excluded and the surviving
-ones written back out as a new summary/analysis pair.
+through every channel, and plots `semantic`, one or all of the fluorescence
+columns, and `dead_proba` on a shared 0-1 axis. Columns a legacy workbook does
+not carry are left off the plot rather than drawn as zeros. Particles can be
+excluded and annotated, and the surviving ones written back out as a new
+summary/analysis pair carrying the annotations.
 
 Coordinates: the analysis table's `x`/`y` are centroid row/column on the
 half-resolution segmentation grid, so they are doubled for the raw stacks; the
@@ -34,7 +36,13 @@ import tifffile
 ROI = 100
 COORD_SCALE = 2  # analysis x/y are half-resolution; raw stacks are full
 PHASE_OFFSET = 0  # `frame` indexes the raw stacks directly
-ROI_CACHE_SIZE = 8
+
+# ROI stacks are held by total size rather than by count, since a track can be
+# anything from a handful of frames to the whole movie. 1.5 GB is roughly 80
+# two-channel 450-frame particles - enough to re-visit a whole position without
+# touching the share again, and small enough beside a workstation's RAM.
+ROI_CACHE_BYTES = 1_500_000_000
+ROI_CACHE_MIN = 4  # never evict below this, however large the entries are
 
 DEFAULT_ROOT = Path(
     "/Volumes/SharedHITSX/cdb-Joglekar-Lab-GL/Anish_Virdi/CycB_dynamics/"
@@ -43,7 +51,7 @@ DEFAULT_ROOT = Path(
 
 # Machine-local and fully regenerable, so it lives outside the repo.
 _STATE = Path.home() / ".cache" / "particle_browser"
-EXCLUSIONS_FILE = _STATE / "exclusions.json"
+STATE_FILE = _STATE / "exclusions.json"
 TABLE_CACHE = _STATE / "tables"
 
 # `_A12_s2_` in a stack name, an inference folder name or a workbook name.
@@ -52,13 +60,18 @@ WELL_SITE = re.compile(r"_([A-H]\d{1,2}_s\d{1,2})(?=[_.])")
 # derived maps (`..._GFP_background_map.tif`) are not mistaken for channels.
 CHANNEL = re.compile(r"_[A-H]\d{1,2}_s\d{1,2}_([A-Za-z0-9 ]+)\.tif$")
 
-PLOT_COLORS = {"semantic": "tab:orange", "fluorescence": "tab:green",
-               "dead_proba": "tab:red"}
+SEMANTIC_COLOR = "tab:orange"
+DEAD_COLOR = "tab:red"
+# Cycled when several fluorescence traces are drawn at once. Orange and red are
+# reserved for semantic and dead_proba.
+FLUOR_COLORS = ("tab:green", "tab:blue", "tab:purple", "tab:olive",
+                "tab:cyan", "tab:brown", "tab:pink")
 # Preference order for the fluorescence trace; the first one present wins.
 FLUOR_PREF = ("GFP", "GFP_bkg_corr", "GFP_int_corr")
 # Summary columns worth showing next to the selected particle, when present.
 INFO_COLS = ("track_length", "mito_start", "mitosis", "dead_cell_score",
              "fate_label", "death_frame", "n_true_mitotic")
+ANNOTATION_COL = "user_annotation"
 
 
 # ---------------------------------------------------------------- data access
@@ -166,6 +179,7 @@ class Store:
         self._summaries: dict = {}
         self._analyses: dict = {}
         self.excluded: dict = defaultdict(set)
+        self.notes: dict = defaultdict(dict)
 
     # -- discovery -----------------------------------------------------
     def rescan(self, inference_root: Path, image_root: Path) -> None:
@@ -173,7 +187,7 @@ class Store:
         self.inference_root, self.image_root = Path(inference_root), Path(image_root)
         self._summaries.clear()
         self._analyses.clear()
-        self.load_exclusions()
+        self.load_state()
 
     def wells(self) -> list:
         return sorted({p.well for p in self.positions.values()})
@@ -187,9 +201,22 @@ class Store:
     def summary(self, well_site: str) -> pd.DataFrame:
         if well_site not in self._summaries:
             pos = self.positions[well_site]
-            self._summaries[well_site] = _cached_table(
-                pos.summary_path, sheet_name="Summary")
+            df = _cached_table(pos.summary_path, sheet_name="Summary")
+            self._summaries[well_site] = df
+            self._seed_notes(well_site, df)
         return self._summaries[well_site]
+
+    def _seed_notes(self, well_site: str, summary: pd.DataFrame) -> None:
+        """Adopt annotations already in the workbook, so re-curating an
+        exported file picks up where the last pass left off. Notes held in the
+        local state file win, since they are the more recent edit."""
+        if ANNOTATION_COL not in summary.columns:
+            return
+        held = self.notes[well_site]
+        for particle, note in zip(summary["particle"], summary[ANNOTATION_COL]):
+            text = "" if pd.isna(note) else str(note).strip()
+            if text and int(particle) not in held:
+                held[int(particle)] = text
 
     def analysis(self, well_site: str) -> pd.DataFrame:
         if well_site not in self._analyses:
@@ -210,34 +237,44 @@ class Store:
         a = self.analysis(well_site)
         return a[a["particle"] == particle].sort_values("frame")
 
-    # -- exclusions ----------------------------------------------------
-    def _exclusion_key(self) -> str:
+    # -- curation state ------------------------------------------------
+    def _state_key(self) -> str:
         return str(self.inference_root)
 
-    def load_exclusions(self) -> None:
-        self.excluded = defaultdict(set)
-        if not EXCLUSIONS_FILE.exists():
+    def load_state(self) -> None:
+        """Read this root's exclusions and annotations from the state file."""
+        self.excluded, self.notes = defaultdict(set), defaultdict(dict)
+        if not STATE_FILE.exists():
             return
         try:
-            blob = json.loads(EXCLUSIONS_FILE.read_text())
+            blob = json.loads(STATE_FILE.read_text())
         except (json.JSONDecodeError, OSError):
             return
-        for ws, particles in blob.get(self._exclusion_key(), {}).items():
+        mine = blob.get(self._state_key(), {})
+        # Files written before annotations existed map well_site straight to a
+        # list of excluded particles.
+        if mine and all(isinstance(v, list) for v in mine.values()):
+            mine = {"excluded": mine, "notes": {}}
+        for ws, particles in mine.get("excluded", {}).items():
             self.excluded[ws] = {int(p) for p in particles}
+        for ws, notes in mine.get("notes", {}).items():
+            self.notes[ws] = {int(p): str(t) for p, t in notes.items() if t}
 
-    def save_exclusions(self) -> None:
+    def save_state(self) -> None:
         blob = {}
-        if EXCLUSIONS_FILE.exists():
+        if STATE_FILE.exists():
             try:
-                blob = json.loads(EXCLUSIONS_FILE.read_text())
+                blob = json.loads(STATE_FILE.read_text())
             except (json.JSONDecodeError, OSError):
                 blob = {}
-        blob[self._exclusion_key()] = {
-            ws: sorted(int(p) for p in ps)
-            for ws, ps in self.excluded.items() if ps
+        blob[self._state_key()] = {
+            "excluded": {ws: sorted(int(p) for p in ps)
+                         for ws, ps in self.excluded.items() if ps},
+            "notes": {ws: {str(p): t for p, t in sorted(notes.items()) if t}
+                      for ws, notes in self.notes.items() if any(notes.values())},
         }
-        EXCLUSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        EXCLUSIONS_FILE.write_text(json.dumps(blob, indent=1))
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(blob, indent=1))
 
     def is_excluded(self, well_site: str, particle: int) -> bool:
         return int(particle) in self.excluded[well_site]
@@ -249,8 +286,20 @@ class Store:
             s.discard(particle)
         else:
             s.add(particle)
-        self.save_exclusions()
+        self.save_state()
         return particle in s
+
+    def note(self, well_site: str, particle: int) -> str:
+        return self.notes[well_site].get(int(particle), "")
+
+    def set_note(self, well_site: str, particle: int, text: str) -> None:
+        """In-memory only; callers persist with save_state at a natural pause
+        so that a note is not written to disk on every keystroke."""
+        text = text.strip()
+        if text:
+            self.notes[well_site][int(particle)] = text
+        else:
+            self.notes[well_site].pop(int(particle), None)
 
     def kept(self, well_site: str) -> list:
         return [p for p in self.particles(well_site)
@@ -311,13 +360,23 @@ def channel_order(stacks) -> list:
 class RoiCache:
     """LRU of per-particle ROI stacks, keyed by (well_site, particle).
 
-    Each entry is a few MB (2 channels x 100x100 x <=450 frames, uint16) but
-    costs seconds to re-read over SMB, and users revisit particles constantly.
+    Bounded by total bytes rather than by entry count: a track can be 20 frames
+    or the whole 450-frame movie, so a count-based bound either wastes memory
+    or evicts far too eagerly. Re-reading one particle costs ~14 s per channel
+    over SMB and users revisit constantly, so the budget is deliberately
+    generous -- it is the difference between an interactive browser and a
+    slideshow.
     """
 
-    def __init__(self, maxsize: int = ROI_CACHE_SIZE):
-        self.maxsize = maxsize
+    def __init__(self, budget: int = ROI_CACHE_BYTES, minsize: int = ROI_CACHE_MIN):
+        self.budget = budget
+        self.minsize = minsize
         self._d: OrderedDict = OrderedDict()
+        self._bytes = 0
+
+    @staticmethod
+    def _size(movies: dict) -> int:
+        return sum(int(m.nbytes) for m in movies.values())
 
     def load(self, pos: Position, particle: int, track: pd.DataFrame):
         key = (pos.well_site, int(particle))
@@ -328,16 +387,23 @@ class RoiCache:
         for ch in channel_order(pos.stacks):
             movies[ch], frames = roi_movie(pos.stacks[ch], track)
         self._d[key] = (movies, frames)
+        self._bytes += self._size(movies)
         self._d.move_to_end(key)
-        while len(self._d) > self.maxsize:
-            self._d.popitem(last=False)
+        while len(self._d) > self.minsize and self._bytes > self.budget:
+            _, (old, _) = self._d.popitem(last=False)
+            self._bytes -= self._size(old)
         return movies, frames
 
     def has(self, pos: Position, particle: int) -> bool:
         return (pos.well_site, int(particle)) in self._d
 
+    def stats(self) -> str:
+        return (f"{len(self._d)} ROI cached, "
+                f"{self._bytes / 1e6:.0f}/{self.budget / 1e6:.0f} MB")
+
     def clear(self) -> None:
         self._d.clear()
+        self._bytes = 0
 
 
 # ----------------------------------------------------------------- trace prep
@@ -394,14 +460,30 @@ def _sheet(writer, name: str, df: pd.DataFrame) -> None:
 
 
 def _write_workbook(src: Path, out: Path, replace: dict, extra: dict) -> None:
-    """Copy a workbook, swapping in replacement sheets and appending extras."""
+    """Copy a workbook, swapping in replacement sheets and appending extras.
+
+    An extra whose name is already in the source overwrites it rather than
+    being dropped, so re-curating a previous export refreshes its `excluded`
+    sheet instead of carrying the stale one forward.
+    """
     sheets = pd.read_excel(src, sheet_name=None)
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         for name, df in sheets.items():
-            _sheet(writer, name, replace.get(name, df))
+            if name in extra:
+                extra[name].to_excel(writer, sheet_name=name, index=False)
+            else:
+                _sheet(writer, name, replace.get(name, df))
         for name, df in extra.items():
             if name not in sheets:
                 df.to_excel(writer, sheet_name=name, index=False)
+
+
+def _annotate(df: pd.DataFrame, notes: dict) -> pd.DataFrame:
+    """Attach the user annotation of each row's particle as a column."""
+    out = df.copy()
+    out[ANNOTATION_COL] = (out["particle"].map(lambda p: notes.get(int(p), ""))
+                           .fillna(""))
+    return out
 
 
 def export_position(store: Store, well_site: str, summary_out: Path,
@@ -410,13 +492,19 @@ def export_position(store: Store, well_site: str, summary_out: Path,
     pos = store.positions[well_site]
     keep = set(store.kept(well_site))
     dropped = sorted(store.excluded[well_site])
+    notes = store.notes[well_site]
 
     summary = store.summary(well_site)
-    kept_summary = summary[summary["particle"].isin(keep)]
+    kept_summary = _annotate(summary[summary["particle"].isin(keep)], notes)
     analysis = store.analysis(well_site)
     kept_analysis = analysis[analysis["particle"].isin(keep)]
+    # Only widen the per-frame table when there is something to carry; an empty
+    # column across 50k rows is pure noise for downstream readers.
+    if any(notes.get(int(p)) for p in keep):
+        kept_analysis = _annotate(kept_analysis, notes)
 
-    note = pd.DataFrame({"excluded_particle": dropped})
+    note = pd.DataFrame({"excluded_particle": dropped,
+                         ANNOTATION_COL: [notes.get(int(p), "") for p in dropped]})
     _write_workbook(pos.summary_path, summary_out,
                     {"Summary": kept_summary}, {"excluded": note})
 
@@ -455,7 +543,8 @@ def build(root: Path):
 
     store = Store()
     roi_cache = RoiCache()
-    state = {"loading": False, "frames": None, "particle": None}
+    state = {"loading": False, "frames": None, "particle": None,
+             "note_owner": None}
 
     viewer = napari.Viewer(title="Particle browser")
     panel = QWidget()
@@ -496,10 +585,21 @@ def build(root: Path):
     layout.addLayout(nav)
 
     fluor_box = QComboBox()
+    fluor_all = QCheckBox("plot all")
+    fluor_all.setToolTip("Overlay every fluorescence column found in the "
+                         "analysis table instead of just the selected one")
     frow = QHBoxLayout()
     frow.addWidget(QLabel("Fluorescence"))
     frow.addWidget(fluor_box, 1)
+    frow.addWidget(fluor_all)
     layout.addLayout(frow)
+
+    annot_box = QLineEdit()
+    annot_box.setPlaceholderText("free-text note for this particle")
+    arow = QHBoxLayout()
+    arow.addWidget(QLabel("Annotation"))
+    arow.addWidget(annot_box, 1)
+    layout.addLayout(arow)
 
     info = QLabel("")
     info.setWordWrap(True)
@@ -531,8 +631,13 @@ def build(root: Path):
             bits.append(str(row["fate_label"]))
         elif row is not None and "track_length" in row.index:
             bits.append(f"len {int(row['track_length'])}")
+        note = store.note(well_site, particle)
+        if note:
+            bits.append(note if len(note) <= 30 else note[:29] + "...")
         text = "  -  ".join(bits)
-        return f"[excluded]  {text}" if store.is_excluded(well_site, particle) else text
+        marks = ("[excluded] " if store.is_excluded(well_site, particle) else
+                 "") + ("[note] " if note else "")
+        return f"{marks} {text}" if marks else text
 
     def refresh_part_label():
         ws, particle = current()
@@ -540,16 +645,41 @@ def build(root: Path):
             return
         part_box.setItemText(part_box.currentIndex(), part_label(ws, particle))
 
-    def show_traces(well_site, particle, track, fluor_col):
-        """Overlay the rescaled traces; each keeps its native range in the key."""
+    def on_note_edited(text):
+        """Keep the note with the particle it was typed against.
+
+        The edit is held in memory on every keystroke and only written to disk
+        at a pause, so nothing is lost if the user switches particles mid-word.
+        """
+        owner = state.get("note_owner")
+        if owner is None:
+            return
+        store.set_note(owner[0], owner[1], text)
+        refresh_part_label()
+
+    def flush_note():
+        """Persist the note being edited, if any."""
+        if state.get("note_owner") is not None:
+            store.set_note(*state["note_owner"], annot_box.text())
+            store.save_state()
+
+    def show_traces(well_site, particle, track, fluor_cols):
+        """Overlay the rescaled traces; each keeps its native range in the key.
+
+        Legacy workbooks predate the dead classifier, so `dead_proba` and
+        `death_frame` are simply absent (or all-NaN, which means the model was
+        never asked about those frames). Either way they are left off the plot
+        rather than drawn as a flat line at zero.
+        """
         ax.clear()
         frames = track["frame"].to_numpy()
         drawn = []
 
-        specs = [("semantic", "semantic", False),
-                 (fluor_col, "fluorescence", True),
-                 ("dead_proba", "dead_proba", False)]
-        for col, kind, robust in specs:
+        specs = [("semantic", SEMANTIC_COLOR, False)]
+        specs += [(col, FLUOR_COLORS[i % len(FLUOR_COLORS)], True)
+                  for i, col in enumerate(fluor_cols)]
+        specs += [("dead_proba", DEAD_COLOR, False)]
+        for col, color, robust in specs:
             if col is None or col not in track.columns:
                 continue
             values = track[col].to_numpy(dtype=float)
@@ -557,7 +687,15 @@ def build(root: Path):
                 continue
             scaled, (lo, hi) = rescale(values, robust=robust)
             label = f"{col} [{lo:.3g}, {hi:.3g}]"
-            ax.plot(frames, scaled, lw=1.2, color=PLOT_COLORS[kind], label=label)
+            # A correction factor that varies by <1% of its own magnitude is
+            # noise once stretched over the full axis; say so rather than
+            # letting it look like signal next to the real traces.
+            mid = np.nanmedian(values)
+            flat = (robust and np.isfinite(mid) and mid != 0
+                    and (hi - lo) / abs(mid) < 0.01)
+            ax.plot(frames, scaled, lw=1.2, color=color,
+                    alpha=0.5 if flat else 1.0, ls=":" if flat else "-",
+                    label=label + (" ~flat" if flat else ""))
             drawn.append(col)
 
         row = store.summary_row(well_site, particle)
@@ -573,16 +711,19 @@ def build(root: Path):
                             color="0.4", lw=0.8, alpha=0.8)
         state["cursor"] = cursor
         # Headroom above 1.0 keeps the legend and the event labels clear of the
-        # traces, which use the full 0-1 range.
-        ax.set_ylim(-0.05, 1.45)
+        # traces, which use the full 0-1 range. A tall legend needs more.
+        ncol = 2 if len(drawn) > 3 else max(len(drawn), 1)
+        rows = int(np.ceil(len(drawn) / ncol))
+        ax.set_ylim(-0.05, 1.12 + 0.14 * rows)
         ax.set_xlabel("frame")
         ax.set_ylabel("rescaled 0-1")
         ax.set_title(f"{well_site}  particle {particle}", fontsize=9)
         if drawn:
-            ax.legend(fontsize=5.5, loc="upper center", ncol=len(drawn),
+            ax.legend(fontsize=5.5, loc="upper center", ncol=ncol,
                       framealpha=0.7, borderpad=0.3, columnspacing=0.9,
                       handlelength=1.2)
         canvas.draw_idle()
+        return drawn
 
     def move_cursor(event=None):
         """Keep the trace cursor on the frame napari is showing."""
@@ -623,6 +764,7 @@ def build(root: Path):
         well_site, particle = current()
         if state["loading"] or well_site is None or particle is None:
             return
+        flush_note()  # the box still holds the note of the previous particle
         pos = store.positions[well_site]
         track = store.track(well_site, particle)
         if track.empty:
@@ -640,7 +782,19 @@ def build(root: Path):
         if wanted in cols:
             fluor_box.setCurrentText(wanted)
         fluor_box.blockSignals(False)
-        fluor_col = fluor_box.currentText() or (cols[0] if cols else None)
+        fluor_all.setEnabled(len(cols) > 1)
+        if len(cols) < 2:
+            fluor_all.setChecked(False)
+        fluor_box.setEnabled(not fluor_all.isChecked())
+        if fluor_all.isChecked():
+            fluor_cols = cols
+        else:
+            fluor_cols = [fluor_box.currentText() or (cols[0] if cols else None)]
+
+        annot_box.blockSignals(True)
+        annot_box.setText(store.note(well_site, particle))
+        annot_box.blockSignals(False)
+        state["note_owner"] = (well_site, particle)
 
         if not pos.stacks:
             status.setText(f"<b>no image stacks found for {well_site}</b> "
@@ -671,16 +825,20 @@ def build(root: Path):
             if layer.name not in movies:
                 viewer.layers.remove(layer)
 
-        show_traces(well_site, particle, track, fluor_col)
+        drawn = show_traces(well_site, particle, track, fluor_cols)
         show_info(well_site, particle, track, frames)
         move_cursor()
         exclude_btn.setText("Include this particle"
                             if store.is_excluded(well_site, particle)
                             else "Exclude this particle")
+        missing = [c for c in ("dead_proba",) if c not in drawn]
         n_excl = len(store.excluded[well_site])
         status.setText(f"{well_site}: {len(store.particles(well_site))} particles, "
                        f"{n_excl} excluded. Channels: "
-                       f"{', '.join(sorted(pos.stacks)) or 'none'}")
+                       f"{', '.join(sorted(pos.stacks)) or 'none'}. "
+                       f"{roi_cache.stats()}."
+                       + (f"<br>Not plotted (absent from this workbook): "
+                          f"{', '.join(missing)}" if missing else ""))
 
     def refill_particles():
         well_site = site_box.currentData()
@@ -709,6 +867,7 @@ def build(root: Path):
         refill_particles()
 
     def rescan():
+        flush_note()  # rescanning reloads curation state from disk
         inference_root = Path(inf_box.text().strip())
         image_root = (inference_root if same_box.isChecked()
                       else Path(img_box.text().strip()))
@@ -769,19 +928,22 @@ def build(root: Path):
         well_site, _ = current()
         if well_site is None:
             return
-        touched = [ws for ws, ps in store.excluded.items() if ps]
+        flush_note()
+        # A position counts as curated if anything was excluded or annotated.
+        touched = ({ws for ws, ps in store.excluded.items() if ps}
+                   | {ws for ws, ns in store.notes.items() if any(ns.values())})
         targets = [well_site]
-        others = [ws for ws in touched if ws != well_site]
+        others = sorted(touched - {well_site})
         if others:
             answer = QMessageBox.question(
                 panel, "Export scope",
-                f"{len(others)} other position(s) also have exclusions "
-                f"({', '.join(sorted(others))}).\n\n"
-                "Yes: export every position with exclusions.\n"
+                f"{len(others)} other position(s) also have exclusions or "
+                f"annotations ({', '.join(others)}).\n\n"
+                "Yes: export every curated position.\n"
                 f"No: export only {well_site}.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if answer == QMessageBox.Yes:
-                targets = sorted(set(touched) | {well_site})
+                targets = sorted(touched | {well_site})
 
         suggested = (store.positions[well_site].inference
                      / f"{well_site}_curated.xlsx")
@@ -807,8 +969,9 @@ def build(root: Path):
                 QMessageBox.critical(panel, "Export failed", f"{ws}: {exc}")
                 status.setText(f"<b>export failed for {ws}: {exc}</b>")
                 return
+            n_notes = sum(1 for p in store.kept(ws) if store.note(ws, p))
             written.append(f"{ws}: {n_kept} particles kept ({n_drop} excluded), "
-                           f"{n_rows} tracking rows")
+                           f"{n_rows} tracking rows, {n_notes} annotated")
         QMessageBox.information(
             panel, "Export complete",
             f"Wrote {2 * len(written)} files to {chosen.parent}\n\n"
@@ -830,6 +993,9 @@ def build(root: Path):
     site_box.currentIndexChanged.connect(lambda _: refill_particles())
     part_box.currentIndexChanged.connect(lambda _: load_particle())
     fluor_box.currentIndexChanged.connect(lambda _: load_particle())
+    fluor_all.toggled.connect(lambda _: load_particle())
+    annot_box.textEdited.connect(on_note_edited)
+    annot_box.editingFinished.connect(flush_note)
     prev_btn.clicked.connect(lambda: step_particle(-1))
     next_btn.clicked.connect(lambda: step_particle(1))
     exclude_btn.clicked.connect(on_exclude)
