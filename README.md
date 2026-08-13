@@ -194,7 +194,20 @@ a model with a different layout does not require editing the call sites. A
 width mismatch raises rather than silently producing confident nonsense.
 
 To re-score analysis files produced before this model, run
-`python augment_dead_label.py <root_folder>`.
+`python augment_dead_label.py <root_folder>`. It rewrites each
+`*_analysis.xlsx` in place and then rebuilds the matching `*_summary.xlsx`
+from the new labels, since the summary is derived entirely from them. Use
+`--suffix` to write copies instead (both files take the suffix), and
+`--cell-type` to pick the `analysis_pars` defaults for the rebuilt summary.
+
+The same path is available directly for re-summarizing an analysis file
+without redoing tracking or signal measurement — no image stacks are read, so
+it takes seconds rather than the better part of an hour:
+
+```python
+from cellaap_analysis import analysis
+analysis.from_analysis_file(path_to_analysis_xlsx, cell_type="hela").summarize_data(True)
+```
 
 **Quality metrics** — `summarize_data` records two, in `self.quality` and in the
 spreadsheet's "quality" sheet: a histogram of mitotic episodes per track, and

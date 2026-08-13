@@ -10,6 +10,10 @@ after each episode - from its instance-masked phase crop, and rewrites the cell
 table with updated dead_flag (1 = dead) and mitotic_proba / dead_proba columns.
 Unscored rows keep NaN probabilities. All other sheets are preserved.
 
+The matching *_summary.xlsx is then rebuilt from those labels with
+analysis.summarize_data, since a summary is derived entirely from them and a
+stale one beside a re-scored analysis file is worse than none.
+
 Usage:
   python augment_dead_label.py <root_folder>                 # all positions
   python augment_dead_label.py <root_folder> --wells A03 B03 # well filter
@@ -28,6 +32,7 @@ import pandas as pd
 import tifffile
 
 from analysis_pars import analysis_pars
+from cellaap_analysis import analysis
 from dead_classifier import (MITOTIC_SEMANTIC_VALUES, classify_dead,
                              rows_to_classify)
 
@@ -35,7 +40,8 @@ MODEL_PATH = Path(__file__).parent / "models" / "dead_classifier_pooled.joblib"
 
 
 def augment_file(inference_dir: Path, model, suffix: str = "",
-                 phase_offset: int = 0, post_peak_frames: int = 0) -> None:
+                 phase_offset: int = 0, post_peak_frames: int = 0,
+                 cell_type: str = "hela") -> None:
     xlsx = sorted(inference_dir.glob("*_analysis.xlsx"))
     if not xlsx:
         print(f"{inference_dir.name}: no analysis file, skipping")
@@ -103,6 +109,14 @@ def augment_file(inference_dir: Path, model, suffix: str = "",
     print(f"{out.name}: {int(cell_data.dead_flag.sum())}/{n_mitotic} "
           f"detections flagged dead-like")
 
+    # The summary is derived entirely from the labels just rewritten, so a
+    # stale one next to a re-scored analysis file is worse than none. Rebuild
+    # it from the file that was actually written.
+    summary = analysis.from_analysis_file(out, cell_type=cell_type
+                                          ).summarize_data(True, suffix=suffix)
+    print(f"{out.name.replace('_analysis', '_summary')}: {len(summary)} tracks "
+          f"summarized")
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
@@ -122,6 +136,9 @@ def main():
                     default=analysis_pars().post_peak_frames,
                     help="frames scored after each mitotic episode, so a death "
                          "on mitotic exit is seen (default from analysis_pars)")
+    ap.add_argument("--cell-type", default="hela",
+                    help="analysis_pars defaults used for the rebuilt summary "
+                         "(default: hela)")
     args = ap.parse_args()
 
     if not args.root_folder.is_dir():
@@ -138,7 +155,8 @@ def main():
     for folder in folders:
         augment_file(folder, model, suffix=args.suffix,
                      phase_offset=args.phase_offset,
-                     post_peak_frames=args.post_peak_frames)
+                     post_peak_frames=args.post_peak_frames,
+                     cell_type=args.cell_type)
 
 
 if __name__ == "__main__":

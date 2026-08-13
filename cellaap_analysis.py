@@ -262,42 +262,9 @@ class analysis:
 
         self.tracked["semantic"] = semantic_label
 
-        # Different cellaap versions write different mitotic mask values (101 in
-        # this pipeline, 100 in others). If the configured value is absent the
-        # analysis silently finds no mitosis anywhere, so resolve it against
-        # what the segmentation actually contains, and fail loudly when that is
-        # ambiguous rather than returning an empty result.
-        observed = set(np.unique(semantic_label).tolist())
-        if self.defaults.mitotic_mask_value not in observed:
-            present = [v for v in self.defaults.mitotic_semantic_values
-                       if v in observed]
-            if len(present) == 1:
-                print(f"mitotic_mask_value={self.defaults.mitotic_mask_value} is "
-                      f"absent from this segmentation; using {present[0]} instead "
-                      f"(observed values {sorted(observed)}).")
-                self.defaults.mitotic_mask_value = present[0]
-            else:
-                raise ValueError(
-                    f"mitotic_mask_value={self.defaults.mitotic_mask_value} does not "
-                    f"occur in the semantic segmentation, which contains {sorted(observed)}. "
-                    f"Set analysis_pars.mitotic_mask_value to the mitotic value for "
-                    f"this dataset, otherwise no mitotic events will be detected.")
+        self._label_semantic()
 
-        # remove 0's and 2's, and fill gaps in the semantic vector.
-        self.tracked.loc[self.tracked.semantic != self.defaults.mitotic_mask_value, "semantic"] = 1
 
-        self.tracked.loc[:, "semantic"] = medfilt(self.tracked.semantic,
-                                                  self.defaults.semantic_gap_closing)
-
-        # Turn into Boolean. Compare against the mask value directly; the former
-        # (semantic - 1)//99 only happened to work for values of 100 or 101.
-        semantic_smoothed = (self.tracked.semantic
-                             == self.defaults.mitotic_mask_value).astype(int)
-        semantic_smoothed = closing(semantic_smoothed,
-                                    self.defaults.semantic_footprint)
-        self.tracked["semantic_smoothed"] = semantic_smoothed
-
-        
         ###########################################################################
         # Mitotic/dead discrimination
         # Detections whose semantic label is mitotic, plus post_peak_frames
@@ -336,22 +303,115 @@ class analysis:
         self.stacks.pop("phase", None)
         ###########################################################################
 
-        
-        # classify the cells as dividing or non-dividing
-        # observed division = 1; no division = 0
-        for id in list(set(self.tracked.particle)):
-            index  = self.tracked[self.tracked.particle==id].index
-
-            if np.isin(self.defaults.mitotic_mask_value, self.tracked[self.tracked.particle==id].semantic):
-                self.tracked.loc[index, "mitotic"] = 1
-            else:
-                self.tracked.loc[index, "mitotic"] = 0
-        
         if save_flag:
             self.tracked.to_excel(self.cellaap_dir / Path(self.expt_name+self.name_stub+"_tracks.xlsx"))
 
         return self.tracked
     
+    def _label_semantic(self):
+        '''Turn the raw semantic label into the columns the summary needs.
+
+        Adds semantic_smoothed (gaps closed, 1 = mitotic) and mitotic (1 for a
+        track that was ever mitotic), and collapses semantic to the mitotic
+        mask value against 1. Shared by track_centroids and
+        from_analysis_file, since an analysis file written before these
+        columns existed needs exactly the same treatment.
+        '''
+        # Different cellaap versions write different mitotic mask values (101 in
+        # this pipeline, 100 in others). If the configured value is absent the
+        # analysis silently finds no mitosis anywhere, so resolve it against
+        # what the segmentation actually contains, and fail loudly when that is
+        # ambiguous rather than returning an empty result.
+        observed = set(np.unique(self.tracked.semantic).tolist())
+        if self.defaults.mitotic_mask_value not in observed:
+            present = [v for v in self.defaults.mitotic_semantic_values
+                       if v in observed]
+            if len(present) == 1:
+                print(f"mitotic_mask_value={self.defaults.mitotic_mask_value} is "
+                      f"absent from this segmentation; using {present[0]} instead "
+                      f"(observed values {sorted(observed)}).")
+                self.defaults.mitotic_mask_value = present[0]
+            else:
+                raise ValueError(
+                    f"mitotic_mask_value={self.defaults.mitotic_mask_value} does not "
+                    f"occur in the semantic segmentation, which contains {sorted(observed)}. "
+                    f"Set analysis_pars.mitotic_mask_value to the mitotic value for "
+                    f"this dataset, otherwise no mitotic events will be detected.")
+
+        # remove 0's and 2's, and fill gaps in the semantic vector.
+        self.tracked.loc[self.tracked.semantic != self.defaults.mitotic_mask_value, "semantic"] = 1
+        self.tracked.loc[:, "semantic"] = medfilt(self.tracked.semantic,
+                                                  self.defaults.semantic_gap_closing)
+
+        # Turn into Boolean. Compare against the mask value directly; the former
+        # (semantic - 1)//99 only happened to work for values of 100 or 101.
+        semantic_smoothed = (self.tracked.semantic
+                             == self.defaults.mitotic_mask_value).astype(int)
+        self.tracked["semantic_smoothed"] = closing(
+            semantic_smoothed, self.defaults.semantic_footprint)
+
+        # dividing (1) vs non-dividing (0), per track
+        is_mitotic = self.tracked.semantic == self.defaults.mitotic_mask_value
+        self.tracked["mitotic"] = self.tracked.particle.map(
+            is_mitotic.groupby(self.tracked.particle).any()).astype(int)
+        return self.tracked
+
+    @classmethod
+    def from_analysis_file(cls, analysis_xlsx: Path, cell_type: str = "hela",
+                           frame_shape=None):
+        '''Build an object that can summarize a saved *_analysis.xlsx.
+
+        Only what summarize_data reads is populated - no image stacks are
+        loaded - so this is the cheap path for re-summarizing an existing
+        analysis after its dead/mitotic labels change, as augment_dead_label
+        does. Columns the file predates (semantic_smoothed, mitotic) are
+        derived here.
+
+        Inputs:
+        analysis_xlsx : path to a *_analysis.xlsx written by measure_signal
+        cell_type     : selects the analysis_pars defaults. Only the tracking
+                        parameters differ by cell type and summarize_data uses
+                        none of them, so this rarely matters here.
+        frame_shape   : (rows, cols) at analysis scale, for the border test.
+                        Inferred from the bounding boxes when omitted.
+
+        semantic_smoothed and mitotic are derived only when absent. Deriving
+        them from a file that already has them would median-filter an already
+        filtered trace, which is not idempotent - it shifted 72 of 118486 rows
+        on E10_s7 - so a file that carries them is left alone.
+        '''
+        analysis_xlsx = Path(analysis_xlsx)
+        stub = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})",
+                         analysis_xlsx.name)
+        if stub is None:
+            raise ValueError(f"cannot parse a well/position stub from "
+                             f"{analysis_xlsx.name}; expected something like A12_s2")
+
+        sheets = pd.read_excel(analysis_xlsx, sheet_name=None, index_col=0)
+        # the cell table is 'cell_data' in newer files and 'Sheet1' in older ones
+        cell = sheets["cell_data" if "cell_data" in sheets else list(sheets)[0]]
+
+        self = cls.__new__(cls)
+        self.defaults = analysis_pars(cell_type=cell_type)
+        self.paths = {"analysis": analysis_xlsx}
+        self.stacks = {}
+        self.quality = {}
+        self.tracked = cell
+        self.cellaap_dir = analysis_xlsx.parent
+        self.root_folder = analysis_xlsx.parent.parent
+        self.name_stub = stub.group()
+        self.expt_name = analysis_xlsx.name.split(self.name_stub)[0]
+        if frame_shape is not None:
+            self.frame_shape = frame_shape
+
+        missing = {"semantic", "particle", "frame", "x", "y", "area"} - set(cell.columns)
+        if missing:
+            raise ValueError(f"{analysis_xlsx.name} is missing {sorted(missing)}, "
+                             f"which summarize_data needs")
+        if not {"semantic_smoothed", "mitotic"}.issubset(cell.columns):
+            self._label_semantic()
+        return self
+
     def measure_signal(self, channel: str, save_flag: False, id = -1,):
         '''
         Measures the average cell signal over the eroded cell masks. Also
@@ -518,7 +578,7 @@ class analysis:
             return int(s)
         return None
 
-    def summarize_data(self, save_flag: True):
+    def summarize_data(self, save_flag: True, suffix: str = ""):
         '''
         Summarizes data stored in the tracked dataframe; operates on all measured channels.
 
@@ -574,6 +634,8 @@ class analysis:
 
         Inputs -
         save_flag : whether to export the data as an xlsx file
+        suffix    : appended to the summary file name, before the extension,
+                    to match a suffixed analysis file (augment_dead_label)
 
         Outputs -
         None
@@ -768,7 +830,9 @@ class analysis:
 
 
         if save_flag:
-            with pd.ExcelWriter(self.cellaap_dir / Path(self.expt_name+self.name_stub+"_summary.xlsx")) as writer: 
+            out = self.cellaap_dir / Path(
+                self.expt_name + self.name_stub + "_summary" + suffix + ".xlsx")
+            with pd.ExcelWriter(out) as writer:
                 self.summaryDF.to_excel(writer,sheet_name = "Summary", index=False)
                 pd.DataFrame([self.paths]).T.to_excel(writer, sheet_name='file_data')
                 pd.DataFrame([self.defaults.__dict__]).T.to_excel(writer,sheet_name='parameters')
