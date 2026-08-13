@@ -56,7 +56,7 @@ Be careful when using the "predictive" tracking mode. It's very powerful, but ca
 
 **Step 3:** Use the **measure_signal** function to measure the fluorescence from the specified channel. The channel string must match the channel name in the file names. The "id = -1" will make the function measure data for all cells that went through a complete mitosis during the time lapse. Optionally, one can provide a list with cell numbers (development only). Thus, cells that remained in interphase throughout the experiment are not measured. Their tracks are still reported.
 
-**Step 4:** Use the **summarize_data** function to create the summary Excel file that lists the average signals measured for all channels, duraion of mitosis, and the correction factors to account for background and excitation intensity variation. Before computing the summary measurements, **any gaps in the semantic label vector are filling by "closing" with a footprint (semantic_footprint) with width equal to the minimum mitotic duration (min_mitotic_duration = 3). Only gaps < 3 frames are filled.**
+**Step 4:** Use the **summarize_data** function to create the summary Excel file that lists the average signals measured for all channels, duraion of mitosis, and the correction factors to account for background and excitation intensity variation. Before computing the summary measurements, **gaps in the semantic label vector are filled by "closing" with a footprint (semantic_footprint) of width min_mitotic_duration = 3, so only gaps < 3 frames are filled. The median filter and the closing are applied per particle, over that track's own frames in frame order** — run over the whole table they would bleed across track boundaries, letting the end of one cell's trace close a gap at the start of the next.
 ### How a cell is summarized
 
 Two rules, per track. No smoothing-vs-classifier precedence, no state decode —
@@ -117,6 +117,7 @@ mechanisms — worth checking in this order when a cell you expect is missing:
 |---|---|---|
 | track shorter than 10 frames | `tp.filter_stubs` in `track_centroids` | `min_track_length` |
 | mitotic detection near the frame edge | `summarize_data` | `border_margin`, `exclude_border_tracks` |
+| mitotic on the movie's first or last frame | `summarize_data` | — |
 | no mitotic run ≥ 3 frames | `summarize_data` | `min_mitotic_duration_in_frames` |
 | interphase death (see above) | `summarize_data` | `min_mitotic_duration_in_frames` |
 
@@ -126,9 +127,12 @@ downstream — it never appears in `*_analysis.xlsx` at all. On E10_s7 the borde
 and short-episode filters removed 51 and 53 of 497 mitotic tracks; the 53 had a
 median of 2 mitotic-labeled frames, i.e. sub-threshold roundings.
 
-A track that is still mitotic when the movie ends is *not* filtered — episodes
-are runs read directly off the label trace, so an episode running to the last
-frame is measured like any other.
+A cell mitotic on the **movie's** first or last frame had its entry or exit
+clipped by the acquisition, so no duration is measurable and it is dropped (61
+tracks on E10_s7). The test is deliberately against the movie bounds and not
+the track's own ends: tracks routinely start and stop mid-movie when trackpy
+loses a rounding cell and re-acquires it as a new particle, and excluding those
+would discard 325 of 497 mitotic tracks rather than 73.
 
 ```python
 exp_analysis.files(Path(to_inference_folder), cell_type = "HeLa")

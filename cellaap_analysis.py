@@ -339,16 +339,26 @@ class analysis:
                     f"this dataset, otherwise no mitotic events will be detected.")
 
         # remove 0's and 2's, and fill gaps in the semantic vector.
-        self.tracked.loc[self.tracked.semantic != self.defaults.mitotic_mask_value, "semantic"] = 1
-        self.tracked.loc[:, "semantic"] = medfilt(self.tracked.semantic,
-                                                  self.defaults.semantic_gap_closing)
+        mask_value = self.defaults.mitotic_mask_value
+        self.tracked.loc[self.tracked.semantic != mask_value, "semantic"] = 1
 
-        # Turn into Boolean. Compare against the mask value directly; the former
-        # (semantic - 1)//99 only happened to work for values of 100 or 101.
-        semantic_smoothed = (self.tracked.semantic
-                             == self.defaults.mitotic_mask_value).astype(int)
-        self.tracked["semantic_smoothed"] = closing(
-            semantic_smoothed, self.defaults.semantic_footprint)
+        # Smoothing runs per particle, over that track's frames in order. Run
+        # over the whole column it would bleed across track boundaries, letting
+        # the end of one cell's trace close a gap at the start of the next -
+        # the rows are merely adjacent in the table, not in the movie.
+        semantic = self.tracked.semantic.to_numpy().copy()
+        smoothed = np.zeros(len(semantic), dtype=int)
+        frames = self.tracked.frame.to_numpy()
+        for rows in self.tracked.groupby("particle", sort=False).indices.values():
+            rows = rows[np.argsort(frames[rows])]      # frame order within track
+            trace = medfilt(semantic[rows], self.defaults.semantic_gap_closing)
+            semantic[rows] = trace
+            # Turn into Boolean. Compare against the mask value directly; the
+            # former (semantic - 1)//99 only happened to work for 100 or 101.
+            smoothed[rows] = closing((trace == mask_value).astype(int),
+                                     self.defaults.semantic_footprint)
+        self.tracked["semantic"] = semantic
+        self.tracked["semantic_smoothed"] = smoothed
 
         # dividing (1) vs non-dividing (0), per track
         is_mitotic = self.tracked.semantic == self.defaults.mitotic_mask_value
@@ -627,6 +637,13 @@ class analysis:
         dies). Fluorescence is averaged over the episode up to the death call
         only, so it is NaN for a cell dead from its first mitotic frame.
 
+        A track is excluded outright when it is mitotic on the first or last
+        frame of the movie - the entry or the exit was clipped by the
+        acquisition, so neither the duration nor the time to death is
+        measurable - or when a mitotic-labeled detection lies within
+        defaults.border_margin of the frame edge, where the classifier cannot
+        see a full crop box.
+
         Note what never reaches this function: tracks shorter than
         defaults.min_track_length are removed by trackpy in track_centroids,
         so a cell that rounds up, dies and loses its track inside that window
@@ -641,24 +658,45 @@ class analysis:
         None
         '''
         # Select only those tracks where mitosis was observed
-        idlist    = list(set(self.tracked[self.tracked.mitotic==1].particle))
+        idlist    = sorted(set(self.tracked[self.tracked.mitotic==1].particle))
 
         # Border test: any mitotic-labeled detection closer than the margin
         # means the classifier could not score the cell there.
         margin = self.defaults.border_margin
         rows, cols = self._analysis_frame_shape()
-        near_border_ids = set()
-        if margin:
+        if margin and self.defaults.exclude_border_tracks:
             mit_rows = self.tracked[self.tracked.semantic_smoothed == 1]
             near = ((mit_rows.x < margin) | (mit_rows.x > rows - margin) |
                     (mit_rows.y < margin) | (mit_rows.y > cols - margin))
             near_border_ids = set(mit_rows.loc[near, 'particle'].unique())
-        if self.defaults.exclude_border_tracks and near_border_ids:
             dropped = len(near_border_ids & set(idlist))
             idlist = [i for i in idlist if i not in near_border_ids]
             print(f'excluded {dropped} tracks with mitotic detections within '
                   f'{margin} px of the frame edge ({rows}x{cols})')
-        
+
+        # A cell mitotic on the first or last frame OF THE MOVIE had its entry
+        # or its exit clipped by the acquisition, so neither the mitotic
+        # duration nor the time to death is measurable. The test is against the
+        # movie bounds, not the track's own ends: tracks routinely start and
+        # stop mid-movie when trackpy loses a rounding cell and re-acquires it
+        # as a new particle, and excluding those would discard most of the data
+        # (325 of 497 mitotic tracks on E10_s7, against 73 clipped by the movie).
+        ordered = self.tracked.sort_values(['particle', 'frame'])
+        movie_first, movie_last = self.tracked.frame.min(), self.tracked.frame.max()
+        edge = ordered.groupby('particle').agg(
+            first_frame=('frame', 'first'), last_frame=('frame', 'last'),
+            first_sem=('semantic_smoothed', 'first'),
+            last_sem=('semantic_smoothed', 'last'))
+        clipped = (((edge.first_frame == movie_first) & (edge.first_sem == 1)) |
+                   ((edge.last_frame == movie_last) & (edge.last_sem == 1)))
+        edge_ids = set(edge.index[clipped])
+        if edge_ids:
+            dropped = len(edge_ids & set(idlist))
+            idlist = [i for i in idlist if i not in edge_ids]
+            print(f'excluded {dropped} tracks mitotic at the first or last '
+                  f'frame of the movie (entry or exit not observed)')
+
+
         # A list to store the number of peaks
         # Multiple peaks will reveal either tracking errors or segmentation issues
         peaks_per_track = np.zeros(len(idlist)) 
