@@ -22,9 +22,12 @@ half-resolution segmentation grid, so they are doubled for the raw stacks; the
 
 from __future__ import annotations
 
+import hashlib
 import json
+import queue
 import re
 import sys
+import threading
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,15 +47,22 @@ PHASE_OFFSET = 0  # `frame` indexes the raw stacks directly
 ROI_CACHE_BYTES = 1_500_000_000
 ROI_CACHE_MIN = 4  # never evict below this, however large the entries are
 
-DEFAULT_ROOT = Path(
-    "/Volumes/SharedHITSX/cdb-Joglekar-Lab-GL/Anish_Virdi/CycB_dynamics/"
-    "ixn/20260624/CycB oe/2026-06-24/20576"
-)
+# Below this many particles a bulk pass is not worth it. Reading a whole plane
+# costs ~17 crops locally and ~2-3 over SMB, where a crop already drags in
+# ~400 KB of pages across 100 separate rows; past a handful of particles one
+# sequential pass beats per-particle reads by two orders of magnitude.
+BULK_MIN_PARTICLES = 4
+
+# Home, so the browser opens somewhere that exists on any machine; scan() only
+# looks one level deep, so this costs a couple of directory listings and finds
+# nothing until the user points the folder boxes at a dataset.
+DEFAULT_ROOT = Path.home()
 
 # Machine-local and fully regenerable, so it lives outside the repo.
 _STATE = Path.home() / ".cache" / "particle_browser"
 STATE_FILE = _STATE / "exclusions.json"
 TABLE_CACHE = _STATE / "tables"
+ROI_CACHE_DIR = _STATE / "roi"
 
 # `_A12_s2_` in a stack name, an inference folder name or a workbook name.
 WELL_SITE = re.compile(r"_([A-H]\d{1,2}_s\d{1,2})(?=[_.])")
@@ -72,6 +82,15 @@ FLUOR_PREF = ("GFP", "GFP_bkg_corr", "GFP_int_corr")
 INFO_COLS = ("track_length", "mito_start", "mitosis", "dead_cell_score",
              "fate_label", "death_frame", "n_true_mitotic")
 ANNOTATION_COL = "user_annotation"
+
+# Grouping. The pipeline's own per-particle call is `fate_label`
+# (mitotic_survived / dead_in_mitosis / dead_no_mitosis / dead_post_mitosis),
+# so it leads the list; the user's own notes are offered as a second axis.
+NOTE_GROUP = "user annotation"
+NO_GROUP = "(none)"
+NO_NOTE = "(no note)"
+BLANK_GROUP = "(unlabelled)"
+MAX_GROUPS = 40  # a column with more distinct values than this is not a grouping
 
 
 # ---------------------------------------------------------------- data access
@@ -233,6 +252,51 @@ class Store:
         hit = s[s["particle"] == particle]
         return None if hit.empty else hit.iloc[0]
 
+    # -- grouping ------------------------------------------------------
+    def group_columns(self, well_site: str) -> list:
+        """Summary columns that sort the particles into a few named groups.
+
+        Categorical columns only: a float per particle is a measurement, not a
+        group. `fate_label` leads when present since it is the pipeline's own
+        verdict on each particle. Legacy summaries carry no such column, which
+        is why the caller must cope with an empty list.
+        """
+        s = self.summary(well_site)
+        cols = []
+        for c in s.columns:
+            if c in ("particle", ANNOTATION_COL):
+                continue
+            if not (s[c].dtype == object or pd.api.types.is_bool_dtype(s[c])):
+                continue
+            if 1 <= s[c].nunique(dropna=True) <= MAX_GROUPS:
+                cols.append(c)
+        cols.sort(key=lambda c: (c != "fate_label", str(c)))
+        return cols
+
+    def group_of(self, well_site: str, particle: int, group_by: str) -> str:
+        """Which group a particle falls in, as displayed."""
+        if group_by == NOTE_GROUP:
+            return self.note(well_site, particle) or NO_NOTE
+        row = self.summary_row(well_site, particle)
+        value = None if row is None else row.get(group_by)
+        return BLANK_GROUP if value is None or pd.isna(value) else str(value)
+
+    def groups(self, well_site: str, group_by: str) -> list:
+        """(group, count) for one position, largest group first."""
+        counts: dict = {}
+        for p in self.particles(well_site):
+            g = self.group_of(well_site, p, group_by)
+            counts[g] = counts.get(g, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    def particles_in_group(self, well_site: str, group_by: str, group) -> list:
+        """Particles of one group, in summary order. `group` None means all."""
+        particles = self.particles(well_site)
+        if not group_by or group_by == NO_GROUP or group is None:
+            return particles
+        return [p for p in particles
+                if self.group_of(well_site, p, group_by) == group]
+
     def track(self, well_site: str, particle: int) -> pd.DataFrame:
         a = self.analysis(well_site)
         return a[a["particle"] == particle].sort_values("frame")
@@ -348,6 +412,129 @@ def roi_movie(path: Path, track: pd.DataFrame, size: int = ROI):
     return out, rows["frame"].to_numpy()
 
 
+def roi_movies_bulk(paths: dict, tracks: dict, size: int = ROI,
+                    on_ready=None, should_stop=None) -> None:
+    """One sequential pass over the stacks, scattering crops to many particles.
+
+    The cost of a pass is dominated by reading planes, and that is independent
+    of how many particles are extracted from them: a 100x100 crop already drags
+    in ~400 KB of pages (100 rows, 16 KB pages) and costs one round trip per
+    frame, so per-particle reads pay nearly plane price and pay it again for
+    every particle. Reading each plane once and cutting every particle's crop
+    out of it collapses N per-particle passes into one.
+
+    All channels are advanced together, frame by frame, so a particle is
+    complete - every channel, every frame - the moment its last frame is read,
+    and can be handed over while the rest of the pass continues. Doing a whole
+    channel at a time instead would leave the caller with nothing until the
+    final channel finished.
+
+    on_ready(particle, movies, frames) is called on the calling thread as each
+    particle completes; should_stop() is polled per frame so a position change
+    can abandon the pass promptly.
+    """
+    half = size // 2
+    chans = channel_order(paths)
+    maps, files, shapes = {}, {}, {}
+    try:
+        for ch in chans:
+            try:
+                maps[ch] = tifffile.memmap(paths[ch], mode="r")
+            except (ValueError, MemoryError, OSError):
+                maps[ch] = None
+            files[ch] = tifffile.TiffFile(paths[ch])
+            shapes[ch] = files[ch].series[0].shape[-3:]
+
+        # Plan the pass: which particles want a crop from which plane.
+        n_planes = min(s[0] for s in shapes.values())
+        out, kept, per_frame = {}, {}, defaultdict(list)
+        for pid, track in tracks.items():
+            cols = track[["frame", "x", "y"]]
+            idx = cols["frame"] + PHASE_OFFSET
+            rows = cols[(idx >= 0) & (idx < n_planes)]
+            dtype = files[chans[0]].series[0].dtype
+            out[pid] = {ch: np.zeros((len(rows), size, size), dtype=dtype)
+                        for ch in chans}
+            kept[pid] = rows["frame"].to_numpy()
+            for i, rec in enumerate(rows.itertuples(index=False)):
+                per_frame[int(rec.frame) + PHASE_OFFSET].append(
+                    (pid, i, int(round(rec.x * COORD_SCALE)),
+                     int(round(rec.y * COORD_SCALE))))
+        left = {pid: len(kept[pid]) for pid in out}
+
+        for f in sorted(per_frame):
+            if should_stop is not None and should_stop():
+                return
+            planes = {}
+            for ch in chans:
+                m = maps[ch]
+                planes[ch] = (m[f] if m is not None
+                              else files[ch].pages[f].asarray())
+            for pid, i, cr, cc in per_frame[f]:
+                r0, c0 = cr - half, cc - half
+                for ch in chans:
+                    height, width = shapes[ch][1:]
+                    rs, re_ = max(r0, 0), min(r0 + size, height)
+                    cs, ce = max(c0, 0), min(c0 + size, width)
+                    if rs < re_ and cs < ce:
+                        out[pid][ch][i, rs - r0:re_ - r0, cs - c0:ce - c0] = \
+                            planes[ch][rs:re_, cs:ce]
+                left[pid] -= 1
+                if left[pid] == 0 and on_ready is not None:
+                    on_ready(pid, out.pop(pid), kept[pid])
+    finally:
+        for ch in list(maps):
+            maps[ch] = None
+        for tf in files.values():
+            tf.close()
+
+
+def _stack_signature(paths: dict) -> str:
+    """Identify a position's stacks, so a re-export invalidates its ROIs."""
+    parts = []
+    for ch in sorted(paths):
+        st = paths[ch].stat()
+        parts.append(f"{ch}:{paths[ch].name}:{st.st_size}:{int(st.st_mtime)}")
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def _roi_disk_path(pos: Position, particle: int, size: int) -> Path:
+    return (ROI_CACHE_DIR / pos.well_site /
+            f"{int(particle)}_{_stack_signature(pos.stacks)}_{size}.npz")
+
+
+def roi_disk_load(pos: Position, particle: int, size: int = ROI):
+    """Read a cached ROI set, or None. Never raises: the cache is disposable."""
+    path = _roi_disk_path(pos, particle, size)
+    if not path.exists():
+        return None
+    try:
+        with np.load(path) as z:
+            names = [str(n) for n in z["channels"]]
+            return {ch: z[f"a{i}"] for i, ch in enumerate(names)}, z["frames"]
+    except Exception:
+        return None
+
+
+def roi_disk_save(pos: Position, particle: int, movies: dict, frames,
+                  size: int = ROI) -> None:
+    """Persist one particle's ROI set. Channel names go in their own array -
+    they contain spaces ('Texas Red'), which npz keyword names cannot."""
+    path = _roi_disk_path(pos, particle, size)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        names = list(movies)
+        tmp = path.with_suffix(".tmp.npz")
+        # Plain unicode, not object dtype: an object array would need
+        # allow_pickle on the way back in, which np.load refuses by default.
+        np.savez(tmp, frames=np.asarray(frames),
+                 channels=np.array(names, dtype=str),
+                 **{f"a{i}": movies[ch] for i, ch in enumerate(names)})
+        tmp.replace(path)
+    except Exception:
+        pass  # a full or read-only cache dir must not break browsing
+
+
 def channel_order(stacks) -> list:
     """Phase first so it sits at the bottom of the napari layer stack.
 
@@ -383,19 +570,40 @@ class RoiCache:
         if key in self._d:
             self._d.move_to_end(key)
             return self._d[key]
-        movies, frames = {}, np.array([], dtype=int)
-        for ch in channel_order(pos.stacks):
-            movies[ch], frames = roi_movie(pos.stacks[ch], track)
+        hit = roi_disk_load(pos, particle)
+        if hit is not None:
+            movies, frames = hit
+        else:
+            movies, frames = {}, np.array([], dtype=int)
+            for ch in channel_order(pos.stacks):
+                movies[ch], frames = roi_movie(pos.stacks[ch], track)
+            roi_disk_save(pos, particle, movies, frames)
+        self._insert(key, movies, frames, viewed=True)
+        return movies, frames
+
+    def _insert(self, key, movies, frames, viewed: bool) -> None:
+        if key in self._d:
+            return
         self._d[key] = (movies, frames)
         self._bytes += self._size(movies)
-        self._d.move_to_end(key)
+        # A particle the user actually opened outranks one fetched on spec, so
+        # speculative entries go in at the evict-first end of the LRU.
+        self._d.move_to_end(key, last=viewed)
         while len(self._d) > self.minsize and self._bytes > self.budget:
             _, (old, _) = self._d.popitem(last=False)
             self._bytes -= self._size(old)
-        return movies, frames
+
+    def put(self, well_site: str, particle: int, movies: dict, frames) -> None:
+        """Add a speculatively fetched entry, from the GUI thread only."""
+        self._insert((well_site, int(particle)), movies, frames, viewed=False)
 
     def has(self, pos: Position, particle: int) -> bool:
         return (pos.well_site, int(particle)) in self._d
+
+    def ready(self, pos: Position, particle: int) -> bool:
+        """In memory, or on disk and so effectively instant."""
+        return (self.has(pos, particle)
+                or _roi_disk_path(pos, particle, ROI).exists())
 
     def stats(self) -> str:
         return (f"{len(self._d)} ROI cached, "
@@ -404,6 +612,76 @@ class RoiCache:
     def clear(self) -> None:
         self._d.clear()
         self._bytes = 0
+
+
+class RoiPrefetcher:
+    """Fills the ROI cache for a group of particles, one pass, off the GUI thread.
+
+    The worker only reads and writes the disk cache; finished particles go on a
+    queue and the GUI thread does the in-memory insert, so RoiCache stays
+    single-threaded and needs no lock. Every job carries a generation, bumped
+    whenever the position or group changes, and results from a superseded
+    generation are dropped on arrival rather than cancelled mid-read.
+    """
+
+    def __init__(self, cache: RoiCache):
+        self.cache = cache
+        self._q: queue.Queue = queue.Queue()
+        self._gen = 0
+        self._thread: threading.Thread | None = None
+        self.done = 0
+        self.total = 0
+
+    def cancel(self) -> None:
+        self._gen += 1
+        self.done = self.total = 0
+
+    def start(self, pos: Position, tracks: dict) -> None:
+        """Queue a pass over `tracks` ({particle: dataframe}) for `pos`."""
+        self.cancel()
+        tracks = {p: t for p, t in tracks.items()
+                  if not self.cache.ready(pos, p) and not t.empty}
+        if not pos.stacks or len(tracks) < BULK_MIN_PARTICLES:
+            return
+        gen = self._gen
+        self.total = len(tracks)
+
+        def ready(pid, movies, frames):
+            roi_disk_save(pos, pid, movies, frames)
+            self._q.put((gen, pos.well_site, pid, movies, frames))
+
+        def run():
+            try:
+                roi_movies_bulk(pos.stacks, tracks, on_ready=ready,
+                                should_stop=lambda: gen != self._gen)
+            except Exception as exc:            # a bad stack must not kill the UI
+                self._q.put((gen, None, None, None, exc))
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+
+    def drain(self, limit: int = 8) -> bool:
+        """Move finished particles into the cache. GUI thread only.
+
+        Returns True if anything was taken, so the caller can refresh a status
+        line without polling the queue itself.
+        """
+        took = False
+        for _ in range(limit):
+            try:
+                gen, well_site, pid, movies, frames = self._q.get_nowait()
+            except queue.Empty:
+                break
+            if gen != self._gen or well_site is None:
+                continue                        # superseded, or a worker error
+            self.cache.put(well_site, pid, movies, frames)
+            self.done += 1
+            took = True
+        return took
+
+    @property
+    def running(self) -> bool:
+        return self.total > 0 and self.done < self.total
 
 
 # ----------------------------------------------------------------- trace prep
@@ -527,6 +805,7 @@ def build(root: Path):
     import napari
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
     from matplotlib.figure import Figure
+    from qtpy.QtCore import QTimer
     from qtpy.QtWidgets import (
         QCheckBox,
         QComboBox,
@@ -543,6 +822,7 @@ def build(root: Path):
 
     store = Store()
     roi_cache = RoiCache()
+    prefetch = RoiPrefetcher(roi_cache)
     state = {"loading": False, "frames": None, "particle": None,
              "note_owner": None}
 
@@ -570,8 +850,13 @@ def build(root: Path):
     layout.addWidget(rule0)
 
     # --- selection ------------------------------------------------------
-    well_box, site_box, part_box = QComboBox(), QComboBox(), QComboBox()
+    well_box, site_box = QComboBox(), QComboBox()
+    group_by_box, group_box, part_box = QComboBox(), QComboBox(), QComboBox()
+    group_by_box.setToolTip("Sort this position's particles into groups - the "
+                            "pipeline's fate_label, or your own annotations")
+    group_box.setToolTip("Review only the particles in one group")
     for label, box in (("Well", well_box), ("Site", site_box),
+                       ("Group by", group_by_box), ("Group", group_box),
                        ("Particle", part_box)):
         row = QHBoxLayout()
         row.addWidget(QLabel(label))
@@ -618,6 +903,11 @@ def build(root: Path):
     status = QLabel("")
     status.setWordWrap(True)
     layout.addWidget(status)
+    # Its own line: load_particle rewrites `status` on every particle, and the
+    # background pass reports on its own schedule.
+    cache_label = QLabel("")
+    cache_label.setWordWrap(True)
+    layout.addWidget(cache_label)
     layout.addStretch(1)
 
     # --- helpers --------------------------------------------------------
@@ -662,6 +952,28 @@ def build(root: Path):
         if state.get("note_owner") is not None:
             store.set_note(*state["note_owner"], annot_box.text())
             store.save_state()
+
+    def commit_note():
+        """Persist an edited note, and when the list is grouped by the notes
+        themselves, rebuild the groups around the particle in view."""
+        owner = state.get("note_owner")
+        if owner is None:
+            return
+        flush_note()
+        if group_by_box.currentData() != NOTE_GROUP:
+            return
+        well_site, particle = owner
+        if (group_box.currentData() is not None
+                and store.group_of(well_site, particle, NOTE_GROUP)
+                != group_box.currentData()):
+            # The particle has just left the group under review; widen to all
+            # rather than dropping it out from under the user.
+            group_box.blockSignals(True)
+            group_box.setCurrentIndex(0)
+            group_box.blockSignals(False)
+        # Deferred so that the click which moved focus out of the box is
+        # handled before the lists it may be landing on are rebuilt.
+        QTimer.singleShot(0, lambda: refill_groups(keep=particle))
 
     def show_traces(well_site, particle, track, fluor_cols):
         """Overlay the rescaled traces; each keeps its native range in the key.
@@ -833,27 +1145,105 @@ def build(root: Path):
                             else "Exclude this particle")
         missing = [c for c in ("dead_proba",) if c not in drawn]
         n_excl = len(store.excluded[well_site])
-        status.setText(f"{well_site}: {len(store.particles(well_site))} particles, "
-                       f"{n_excl} excluded. Channels: "
-                       f"{', '.join(sorted(pos.stacks)) or 'none'}. "
-                       f"{roi_cache.stats()}."
+        n_total = len(store.particles(well_site))
+        group = group_box.currentData()
+        shown = (f"{part_box.count()} of {n_total} particles "
+                 f"in {group_by_box.currentData()} = {group}"
+                 if group is not None else f"{n_total} particles")
+        status.setText(f"{well_site}: {shown}, {n_excl} excluded. Channels: "
+                       f"{', '.join(sorted(pos.stacks)) or 'none'}."
                        + (f"<br>Not plotted (absent from this workbook): "
                           f"{', '.join(missing)}" if missing else ""))
 
-    def refill_particles():
+    def refill_particles(keep=None):
         well_site = site_box.currentData()
         part_box.blockSignals(True)
         part_box.clear()
         if well_site:
             try:
-                particles = store.particles(well_site)
+                particles = store.particles_in_group(
+                    well_site, group_by_box.currentData(), group_box.currentData())
             except Exception as exc:  # unreadable workbook
                 particles = []
                 status.setText(f"<b>could not read summary for {well_site}: {exc}</b>")
             for p in particles:
                 part_box.addItem(part_label(well_site, p), p)
+            # Stay on the particle already under review when the group list is
+            # rebuilt around it, rather than jumping back to the top.
+            if keep in particles:
+                part_box.setCurrentIndex(particles.index(keep))
         part_box.blockSignals(False)
         load_particle()
+        start_prefetch()
+
+    def start_prefetch():
+        """Warm the whole listed group in one pass over the stacks.
+
+        Kicked off after the particle list is rebuilt, i.e. on every position,
+        group-by or group change. The particle already on screen is loaded
+        first by load_particle, and anything the pass has not reached yet still
+        works through the ordinary on-demand read.
+        """
+        well_site = site_box.currentData()
+        if not well_site:
+            prefetch.cancel()
+            return
+        pos = store.positions[well_site]
+        particles = [part_box.itemData(i) for i in range(part_box.count())]
+        tracks = {p: store.track(well_site, p) for p in particles
+                  if p is not None}
+        prefetch.start(pos, tracks)
+
+    def drain_prefetch():
+        if prefetch.drain() and prefetch.running:
+            cache_label.setText(f"{roi_cache.stats()} - caching group "
+                                f"{prefetch.done}/{prefetch.total}")
+        elif not prefetch.running:
+            cache_label.setText(roi_cache.stats())
+
+    def refill_groups(keep=None):
+        """List this position's groups, with counts, for the chosen column."""
+        well_site = site_box.currentData()
+        group_by = group_by_box.currentData()
+        wanted = group_box.currentData()
+        group_box.blockSignals(True)
+        group_box.clear()
+        if well_site and group_by:
+            try:
+                groups = store.groups(well_site, group_by)
+            except Exception:
+                groups = []
+            group_box.addItem(f"all ({sum(n for _, n in groups)})", None)
+            for name, n in groups:
+                group_box.addItem(f"{name}  ({n})", name)
+            # Hold the same group across positions when it exists there too.
+            hit = group_box.findData(wanted)
+            group_box.setCurrentIndex(max(hit, 0))
+        group_box.setEnabled(bool(group_by))
+        group_box.blockSignals(False)
+        refill_particles(keep)
+
+    def refill_group_bys():
+        """Offer the categorical summary columns, plus the user's own notes."""
+        well_site = site_box.currentData()
+        # An empty box means nothing has been chosen yet, which is not the same
+        # as having chosen "(none)" - both read back as None.
+        wanted = group_by_box.currentData() if group_by_box.count() else "fate_label"
+        group_by_box.blockSignals(True)
+        group_by_box.clear()
+        group_by_box.addItem(NO_GROUP, None)
+        if well_site:
+            try:
+                for col in store.group_columns(well_site):
+                    group_by_box.addItem(col, col)
+            except Exception:
+                pass
+            group_by_box.addItem(NOTE_GROUP, NOTE_GROUP)
+        # Falls back to "(none)" at index 0 when the wanted column is not in
+        # this position's summary, as in the pre-classifier workbooks.
+        group_by_box.setCurrentIndex(max(group_by_box.findData(wanted), 0))
+        group_by_box.blockSignals(False)
+        refill_groups()
 
     def refill_sites():
         well = well_box.currentData()
@@ -864,7 +1254,7 @@ def build(root: Path):
             text = pos.site if pos.stacks else f"{pos.site}  (no images)"
             site_box.addItem(text, ws)
         site_box.blockSignals(False)
-        refill_particles()
+        refill_group_bys()
 
     def rescan():
         flush_note()  # rescanning reloads curation state from disk
@@ -885,7 +1275,7 @@ def build(root: Path):
         state["loading"] = False
         if not store.positions:
             status.setText(f"<b>no *_inference folders under {inference_root}</b>")
-            for box in (site_box, part_box):
+            for box in (site_box, group_by_box, group_box, part_box):
                 box.clear()
             return
         n_img = sum(1 for p in store.positions.values() if p.stacks)
@@ -990,18 +1380,27 @@ def build(root: Path):
     img_box.editingFinished.connect(rescan)
     same_box.toggled.connect(on_same_toggled)
     well_box.currentIndexChanged.connect(lambda _: refill_sites())
-    site_box.currentIndexChanged.connect(lambda _: refill_particles())
+    site_box.currentIndexChanged.connect(lambda _: refill_group_bys())
+    group_by_box.currentIndexChanged.connect(lambda _: refill_groups())
+    group_box.currentIndexChanged.connect(lambda _: refill_particles())
     part_box.currentIndexChanged.connect(lambda _: load_particle())
     fluor_box.currentIndexChanged.connect(lambda _: load_particle())
     fluor_all.toggled.connect(lambda _: load_particle())
     annot_box.textEdited.connect(on_note_edited)
-    annot_box.editingFinished.connect(flush_note)
+    annot_box.editingFinished.connect(commit_note)
     prev_btn.clicked.connect(lambda: step_particle(-1))
     next_btn.clicked.connect(lambda: step_particle(1))
     exclude_btn.clicked.connect(on_exclude)
     export_btn.clicked.connect(on_export)
     viewer.dims.events.current_step.connect(move_cursor)
     canvas.mpl_connect("button_press_event", on_plot_click)
+
+    # Hands finished particles from the background pass to the cache. Polling
+    # rather than a cross-thread signal keeps every cache mutation on the GUI
+    # thread, so RoiCache needs no locking.
+    drain_timer = QTimer(panel)
+    drain_timer.timeout.connect(drain_prefetch)
+    drain_timer.start(250)
 
     viewer.window.add_dock_widget(panel, name="Particles", area="right")
     rescan()

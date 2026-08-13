@@ -386,11 +386,34 @@ a fallback, so pointing at a parent works.
   export those too, suffixing each pair with its well_site.
 
 Reading a 30 MB analysis workbook takes ~55 s, so each is memoised as parquet
-(keyed by size and mtime) and revisits cost ~0.1 s. ROI reads memory-map the
-stacks and pull only the crop -- ~14 s per channel for a 450-frame track over
-SMB -- so they are cached in memory by total size (1.5 GB, about 80 full-length
+(keyed by size and mtime) and revisits cost ~0.1 s.
+
+**ROI caching.** Selecting a group starts one background pass over the stacks
+that fills every particle in it. A pass is dominated by reading planes, and
+that cost is independent of how many particles are cut from them, so this
+collapses N per-particle reads into one. A 100×100 crop already drags in
+~400 KB of pages (100 rows against 16 KB pages) and costs a round trip per
+frame — hence ~14 s per channel for a 450-frame track over SMB. A whole plane
+costs ~17 crops locally but only ~2–3 over SMB, so a pass pays for itself past
+a handful of particles; `BULK_MIN_PARTICLES` skips it for smaller groups, where
+per-particle reads are still cheaper.
+
+All channels advance together frame by frame, so a particle is complete the
+moment its last frame is read and is handed over while the pass continues.
+Anything the pass has not reached yet still loads through the ordinary
+on-demand path, so browsing is never blocked.
+
+ROIs are held in memory by total size (1.5 GB, about 80 full-length
 two-channel particles) rather than by count, since track lengths vary hugely;
-a revisit is then instant. `ROI_CACHE_BYTES` at the top of the file is the dial.
-Both the parquet cache and the curation state live in
-`~/.cache/particle_browser/`, outside the repo, since they are machine-local
-and regenerable.
+`ROI_CACHE_BYTES` is the dial. Finished particles are also written to
+`roi/` under the cache directory, keyed by the stacks' names, sizes and mtimes,
+so revisiting a position costs nothing in later sessions.
+
+The worker only touches the disk cache; the GUI thread does every in-memory
+insert, so the LRU needs no lock. Speculative entries enter at the evict-first
+end, so a prefetch never displaces a particle you actually opened. Each pass
+carries a generation, bumped on any position or group change, so superseded
+results are discarded on arrival.
+
+Both caches and the curation state live in `~/.cache/particle_browser/`,
+outside the repo, since they are machine-local and regenerable.
