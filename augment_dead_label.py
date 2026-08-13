@@ -10,6 +10,12 @@ after each episode - from its instance-masked phase crop, and rewrites the cell
 table with updated dead_flag (1 = dead) and mitotic_proba / dead_proba columns.
 Unscored rows keep NaN probabilities. All other sheets are preserved.
 
+By default both files are replaced in place. --suffix writes the augmented pair
+alongside the originals; --archive instead renames the originals to *_old.xlsx
+and writes the augmented pair under the plain names, so downstream tools that
+look for the unsuffixed names pick up the new data with the previous run still
+on disk.
+
 The matching *_summary.xlsx is then rebuilt from those labels with
 analysis.summarize_data, since a summary is derived entirely from them and a
 stale one beside a re-scored analysis file is worse than none.
@@ -18,6 +24,7 @@ Usage:
   python augment_dead_label.py <root_folder>                 # all positions
   python augment_dead_label.py <root_folder> --wells A03 B03 # well filter
   python augment_dead_label.py <root_folder> --suffix _dead  # write copies
+  python augment_dead_label.py <root_folder> --archive       # keep the old pair
   python augment_dead_label.py <root_folder> --phase-offset 20
   python augment_dead_label.py <root_folder> --post-peak-frames 0  # mitotic only
                                      (default augments the files in place)
@@ -39,9 +46,34 @@ from dead_classifier import (MITOTIC_SEMANTIC_VALUES, classify_dead,
 MODEL_PATH = Path(__file__).parent / "models" / "dead_classifier_pooled.joblib"
 
 
+def _archive_existing(analysis_xlsx: Path) -> None:
+    """Move the current analysis/summary pair aside as *_old.xlsx.
+
+    Called just before the augmented pair is written under the plain names, so
+    the previous run stays readable next to the new one. Both workbooks have
+    already been read into memory by this point, so renaming them is safe.
+
+    An existing *_old.xlsx is never overwritten: it holds the pre-augmentation
+    original, and clobbering it on a second run would replace that original
+    with an already-augmented copy - losing the only untouched version.
+    """
+    summary_xlsx = analysis_xlsx.with_name(
+        analysis_xlsx.name.replace("_analysis", "_summary"))
+    for src in (analysis_xlsx, summary_xlsx):
+        if not src.exists():
+            continue
+        dst = src.with_name(src.name.replace(".xlsx", "_old.xlsx"))
+        if dst.exists():
+            print(f"  {dst.name} already exists, keeping it and leaving "
+                  f"{src.name} to be overwritten")
+            continue
+        src.rename(dst)
+        print(f"  {src.name} -> {dst.name}")
+
+
 def augment_file(inference_dir: Path, model, suffix: str = "",
                  phase_offset: int = 0, post_peak_frames: int = 0,
-                 cell_type: str = "hela") -> None:
+                 cell_type: str = "hela", archive: bool = False) -> None:
     xlsx = sorted(inference_dir.glob("*_analysis.xlsx"))
     if not xlsx:
         print(f"{inference_dir.name}: no analysis file, skipping")
@@ -101,6 +133,9 @@ def augment_file(inference_dir: Path, model, suffix: str = "",
     cell_data.loc[label_df.index, "dead_flag"] = label_df.dead_flag
     sheets[key] = cell_data
 
+    if archive:
+        _archive_existing(xlsx)
+
     out = xlsx if not suffix else xlsx.with_name(
         xlsx.name.replace("_analysis.xlsx", f"_analysis{suffix}.xlsx"))
     with pd.ExcelWriter(out) as writer:
@@ -136,6 +171,10 @@ def main():
                     default=analysis_pars().post_peak_frames,
                     help="frames scored after each mitotic episode, so a death "
                          "on mitotic exit is seen (default from analysis_pars)")
+    ap.add_argument("--archive", action="store_true",
+                    help="rename the existing analysis and summary files to "
+                         "*_old.xlsx, then write the augmented pair under the "
+                         "plain names; cannot be combined with --suffix")
     ap.add_argument("--cell-type", default="hela",
                     help="analysis_pars defaults used for the rebuilt summary "
                          "(default: hela)")
@@ -143,6 +182,9 @@ def main():
 
     if not args.root_folder.is_dir():
         raise SystemExit(f"{args.root_folder} is not a directory")
+    if args.archive and args.suffix:
+        raise SystemExit("--archive and --suffix are mutually exclusive: "
+                         "--suffix already leaves the originals untouched")
 
     # pass the whole bundle: it declares which feature blocks the model takes
     model = joblib.load(MODEL_PATH)
@@ -156,7 +198,7 @@ def main():
         augment_file(folder, model, suffix=args.suffix,
                      phase_offset=args.phase_offset,
                      post_peak_frames=args.post_peak_frames,
-                     cell_type=args.cell_type)
+                     cell_type=args.cell_type, archive=args.archive)
 
 
 if __name__ == "__main__":
