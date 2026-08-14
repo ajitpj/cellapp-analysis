@@ -387,8 +387,8 @@ class analysis:
 
         semantic_smoothed and mitotic are derived only when absent. Deriving
         them from a file that already has them would median-filter an already
-        filtered trace, which is not idempotent - it shifted 72 of 118486 rows
-        on E10_s7 - so a file that carries them is left alone.
+        filtered trace, which is not idempotent, so a file that carries them is
+        left alone.
         '''
         analysis_xlsx = Path(analysis_xlsx)
         stub = re.search(r"[A-H]([1-9]|[0][1-9]|[1][0-2])_s(\d{2}|\d{1})",
@@ -570,10 +570,9 @@ class analysis:
         transient burst, not a death, and is skipped: the classifier can read a
         cell as dead for a few frames as it rounds up, then correct itself.
         "Recovers" means death_run_frames consecutive scored frames back under
-        1 - death_proba_threshold after the run. Without this, particle 87 of
-        E10_s7 died on the first frame of its mitosis at P(dead) > 0.85, was
-        back at 0.01 five frames later, ran a second mitosis 300 frames on at
-        P(dead) = 0.00, and still reported mitosis = 0.
+        1 - death_proba_threshold after the run. Without this guard such a cell
+        is killed on the first frame of its mitosis and reports a zero-length
+        one, even when it goes on to divide again later.
         '''
         p = np.asarray(dead_proba, dtype=float)
         over = np.where(np.isnan(p), False, p > self.defaults.death_proba_threshold)
@@ -637,12 +636,13 @@ class analysis:
         dies). Fluorescence is averaged over the episode up to the death call
         only, so it is NaN for a cell dead from its first mitotic frame.
 
-        A track is excluded outright when it is mitotic on the first or last
-        frame of the movie - the entry or the exit was clipped by the
-        acquisition, so neither the duration nor the time to death is
-        measurable - or when a mitotic-labeled detection lies within
-        defaults.border_margin of the frame edge, where the classifier cannot
-        see a full crop box.
+        A track is excluded outright when it is already mitotic on its own
+        first frame - no entry was observed, and the segmentation's habit of
+        labeling anaphase mitotic means most of these are a daughter cell
+        trackpy picked up mid-division - or when it is still mitotic on the
+        last frame of the movie, where the acquisition cut the exit off, or
+        when a mitotic-labeled detection lies within defaults.border_margin of
+        the frame edge, where the classifier cannot see a full crop box.
 
         Note what never reaches this function: tracks shorter than
         defaults.min_track_length are removed by trackpy in track_centroids,
@@ -674,27 +674,37 @@ class analysis:
             print(f'excluded {dropped} tracks with mitotic detections within '
                   f'{margin} px of the frame edge ({rows}x{cols})')
 
-        # A cell mitotic on the first or last frame OF THE MOVIE had its entry
-        # or its exit clipped by the acquisition, so neither the mitotic
-        # duration nor the time to death is measurable. The test is against the
-        # movie bounds, not the track's own ends: tracks routinely start and
-        # stop mid-movie when trackpy loses a rounding cell and re-acquires it
-        # as a new particle, and excluding those would discard most of the data
-        # (325 of 497 mitotic tracks on E10_s7, against 73 clipped by the movie).
+        # Two ways a track can carry an episode that was never fully observed,
+        # and they need different tests.
+        #
+        # Starting mitotic disqualifies a track wherever in the movie it
+        # begins. The segmentation labels anaphase mitotic, so when a cell
+        # divides trackpy commonly opens a fresh particle on a daughter that is
+        # still carrying the mitotic label: its "mitosis" is the tail of the
+        # mother's division, with no entry of its own.
+        #
+        # Ending mitotic only disqualifies a track that runs to the LAST frame
+        # of the movie, where the acquisition cut the episode short. A track
+        # that merely stops mid-movie is trackpy losing the cell, which says
+        # nothing about the mitosis and would cost most of the data to exclude.
         ordered = self.tracked.sort_values(['particle', 'frame'])
-        movie_first, movie_last = self.tracked.frame.min(), self.tracked.frame.max()
+        movie_last = self.tracked.frame.max()
         edge = ordered.groupby('particle').agg(
-            first_frame=('frame', 'first'), last_frame=('frame', 'last'),
+            last_frame=('frame', 'last'),
             first_sem=('semantic_smoothed', 'first'),
             last_sem=('semantic_smoothed', 'last'))
-        clipped = (((edge.first_frame == movie_first) & (edge.first_sem == 1)) |
-                   ((edge.last_frame == movie_last) & (edge.last_sem == 1)))
-        edge_ids = set(edge.index[clipped])
-        if edge_ids:
-            dropped = len(edge_ids & set(idlist))
-            idlist = [i for i in idlist if i not in edge_ids]
-            print(f'excluded {dropped} tracks mitotic at the first or last '
-                  f'frame of the movie (entry or exit not observed)')
+        starts_mitotic = set(edge.index[edge.first_sem == 1])
+        ends_clipped = set(edge.index[(edge.last_frame == movie_last)
+                                      & (edge.last_sem == 1)])
+        for ids, why in ((starts_mitotic, 'starting in mitosis (no entry '
+                                          'observed; usually a daughter cell '
+                                          'picked up mid-division)'),
+                         (ends_clipped, 'still mitotic on the last frame of '
+                                        'the movie (no exit observed)')):
+            dropped = len(ids & set(idlist))
+            if dropped:
+                idlist = [i for i in idlist if i not in ids]
+                print(f'excluded {dropped} tracks {why}')
 
 
         # A list to store the number of peaks

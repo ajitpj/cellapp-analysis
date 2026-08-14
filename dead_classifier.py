@@ -1,18 +1,15 @@
 '''
 Mitotic vs dead discrimination for cells carrying the mitotic semantic label.
 
-ONLY mitotic-labeled detections may be scored. The model is binary within the
-rounded-cell population - class 1 "mitotic" against class 0 "dead" - so on a
-flat interphase cell class 0 means nothing more than "not rounded". Measured
-on 20260624_CycB oe_A12_s2: frames BEFORE mitotic entry, from cells that go on
-to divide and are therefore alive by construction, score mean P(dead) = 0.785
-with 82.5% over threshold, against 0.869/90.2% for post-mitotic frames and
-0.294/27.4% for mitotic ones. Extending scoring past the mitotic label to
-catch post-mitotic death was tried and reverted for exactly this reason: it
-moved dead_post_mitosis 1 -> 37 and mitotic_survived 114 -> 27, almost all
-artifact. Post-mitotic death is instead recovered in summarize_data, where a
-dying cell that re-rounds carries the mitotic label again and so stays inside
-this model's competence - see summarize_multi_peak_tracks.
+Only mitotic-labeled detections, plus a short tail after each episode, may be
+scored. The model is binary within the rounded-cell population - class 1
+"mitotic" against class 0 "dead" - so on a flat interphase cell class 0 means
+nothing more than "not rounded". A flat cell that is demonstrably alive, in the
+frames before it enters a mitosis it goes on to complete, scores a mean P(dead)
+of 0.785 with 82.5% of frames over threshold, against 0.294 and 27.4% for
+genuinely mitotic frames. Scoring beyond the rounded state therefore
+manufactures deaths rather than finding them, and the tail exists only because
+a cell dying on mitotic exit is still rounded for a few frames.
 
 Each detection is reduced to an instance-masked phase crop, from which two
 feature blocks are computed and concatenated in this order:
@@ -21,10 +18,10 @@ feature blocks are computed and concatenated in this order:
 
 A model bundle maps that to P(mitotic). Class 1 = mitotic, class 0 = dead.
 Which of the two blocks the model actually consumes is declared by the
-bundle's 'feature_set' key and assembled by _feature_matrix() - the current
-pooled model uses the embedding alone (512 columns), while the previous
-hand-labeled model used both (528). Passing the wrong width silently
-misclassifies everything, so the width is checked before predicting.
+bundle's 'feature_set' key and assembled by _feature_matrix(); the pooled
+model uses the embedding alone (512 columns), other layouts use both (528).
+Passing the wrong width silently misclassifies everything, so the width is
+checked before predicting.
 
 Current model, models/dead_classifier_pooled.joblib: ResNet18-512 -> PCA(32)
 -> logistic regression, trained on 826 hand labels pooled from the BUB1
@@ -32,10 +29,10 @@ dataset (345) and the CycB-oe 20576 dataset (481) across 15 microscope
 positions. Leave-one-position-out balanced accuracy 0.878, AUC 0.945,
 calibration error 0.018.
 
-An earlier version of this model was trained on unsupervised pseudo-labels and
-collapsed onto an area threshold (~639 px), which systematically called small
-but healthy mitotic cells dead. Hand labels replaced those pseudo-labels.
-Feature order and preprocessing must not change - they match the trained model.
+Feature order and preprocessing must not change - they match the trained
+model. The labels behind it are hand-made: a model fitted to unsupervised
+pseudo-labels collapses onto an area threshold and calls small but healthy
+mitotic cells dead.
 '''
 import numpy as np
 import numpy.typing as npt
@@ -230,9 +227,9 @@ def rows_to_classify(tracking_df: pd.DataFrame,
     still looks like something this model was trained on.
 
     Keep the tail short. Scored far enough past the peak the cell is flat
-    again, and a flat cell reads as "dead" to this model whether or not it is:
-    on A12_s2, alive pre-mitotic frames scored mean P(dead) = 0.785. The tail
-    length is analysis_pars.post_peak_frames.
+    again, and a flat cell reads as "dead" to this model whether or not it is
+    (see the module docstring). The tail length is
+    analysis_pars.post_peak_frames.
 
     Episodes are runs of the raw mitotic label, for the same reason
     mitotic_rows gates on it rather than on semantic_smoothed. Tables with no

@@ -59,8 +59,7 @@ Be careful when using the "predictive" tracking mode. It's very powerful, but ca
 **Step 4:** Use the **summarize_data** function to create the summary Excel file that lists the average signals measured for all channels, duraion of mitosis, and the correction factors to account for background and excitation intensity variation. Before computing the summary measurements, **gaps in the semantic label vector are filled by "closing" with a footprint (semantic_footprint) of width min_mitotic_duration = 3, so only gaps < 3 frames are filled. The median filter and the closing are applied per particle, over that track's own frames in frame order** — run over the whole table they would bleed across track boundaries, letting the end of one cell's trace close a gap at the start of the next.
 ### How a cell is summarized
 
-Two rules, per track. No smoothing-vs-classifier precedence, no state decode —
-those were replaced by this scheme.
+Two rules, applied per track.
 
 **Mitotic episodes** are the runs of mitotic semantic label at least
 `min_mitotic_duration_in_frames` long, read straight off the trace. The first
@@ -72,13 +71,12 @@ A later episode is usually the same cell re-rounding, most often to die.
 that run. Unscored frames (`NaN`) break a run — the model was never asked about
 them, so they cannot manufacture a death.
 
-Death is irreversible, so a run the cell **recovers** from is discarded —
+Death is irreversible, so a run the cell **recovers** from is discarded:
 `death_run_frames` consecutive scored frames back under `1 - threshold` after
-the run means it was a transient burst, not a death. The classifier can read a
-cell as dead for a few frames while it rounds up and then correct itself:
-E10_s7 particle 87 died on the first frame of its mitosis at P(dead) > 0.85,
-was back at 0.01 five frames later, and ran a second mitosis 300 frames on at
-P(dead) = 0.00. Without the guard it reported `mitosis = 0`.
+the run mark it as a transient burst rather than a death. The classifier can
+read a cell as dead for a few frames while it rounds up and then correct
+itself, and without this guard such a cell is killed on the first frame of its
+mitosis and reports a zero-length one.
 
 Where the death frame falls relative to the first episode gives `fate_label`:
 
@@ -110,29 +108,40 @@ and compare directly; everything else counted in frames is a duration.
 
 ### What never reaches the summary
 
-Three filters act before or during summarization, and they are separate
-mechanisms — worth checking in this order when a cell you expect is missing:
+Six filters act before or during summarization. They are separate mechanisms,
+worth checking in this order when a cell you expect is missing:
 
 | filter | where | control |
 |---|---|---|
 | track shorter than 10 frames | `tp.filter_stubs` in `track_centroids` | `min_track_length` |
 | mitotic detection near the frame edge | `summarize_data` | `border_margin`, `exclude_border_tracks` |
-| mitotic on the movie's first or last frame | `summarize_data` | — |
+| already mitotic on the track's first frame | `summarize_data` | — |
+| still mitotic on the movie's last frame | `summarize_data` | — |
 | no mitotic run ≥ 3 frames | `summarize_data` | `min_mitotic_duration_in_frames` |
 | interphase death (see above) | `summarize_data` | `min_mitotic_duration_in_frames` |
 
 The first is the one that surprises: a cell that rounds up, dies and loses its
 track inside 10 frames is discarded at tracking and cannot be recovered
-downstream — it never appears in `*_analysis.xlsx` at all. On E10_s7 the border
-and short-episode filters removed 51 and 53 of 497 mitotic tracks; the 53 had a
-median of 2 mitotic-labeled frames, i.e. sub-threshold roundings.
+downstream — it never appears in `*_analysis.xlsx` at all.
 
-A cell mitotic on the **movie's** first or last frame had its entry or exit
-clipped by the acquisition, so no duration is measurable and it is dropped (61
-tracks on E10_s7). The test is deliberately against the movie bounds and not
-the track's own ends: tracks routinely start and stop mid-movie when trackpy
-loses a rounding cell and re-acquires it as a new particle, and excluding those
-would discard 325 of 497 mitotic tracks rather than 73.
+The two mitosis-at-the-edge filters use deliberately different tests.
+
+**Starting mitotic disqualifies a track wherever in the movie it begins.** The
+segmentation labels anaphase mitotic, so when a cell divides trackpy commonly
+opens a fresh particle on a daughter that still carries the mitotic label; its
+"mitosis" is the tail of the mother's division, with no entry of its own. These
+tracks have characteristically high particle numbers and late start frames,
+since they only exist after a division.
+
+**Ending mitotic disqualifies a track only if it runs to the movie's last
+frame,** where the acquisition cut the episode short. A track that merely stops
+mid-movie is trackpy losing the cell, which says nothing about the mitosis.
+
+Note that on a position where cells arrest in mitosis for a long time, the
+starting-mitotic filter also removes genuinely arrested cells that were picked
+up mid-arrest, not only mislabelled daughters. Their entry is unobserved either
+way, so no duration is measurable, but the count of discarded tracks will be
+higher than on a normally cycling population.
 
 ```python
 exp_analysis.files(Path(to_inference_folder), cell_type = "HeLa")
@@ -171,11 +180,11 @@ sit just past the episode.
 **Nothing before mitotic entry is ever scored, and the tail must stay short.**
 The model is binary *within the rounded-cell population* — class 1 mitotic
 against class 0 dead — so on a flat cell class 0 means only "not rounded", not
-"dying". Measured on A12_s2: frames before mitotic entry, from cells that go on
-to divide and are therefore alive, score mean P(dead) = 0.785 with 82.5% over
-0.5, against 0.294/27.4% for mitotic frames. Scoring every frame to the end of
-the track was tried on that basis and reverted — it moved `dead_post_mitosis`
-1 → 37 and `mitotic_survived` 114 → 27, almost entirely artifact.
+"dying". Measured on a flat interphase cell that goes on to divide, and is
+therefore alive, it returns a mean P(dead) of 0.785 with 82.5% of frames over
+0.5, against 0.294 and 27.4% for genuinely mitotic frames. Widening the scored
+set past the rounded state therefore manufactures deaths rather than finding
+them.
 
 The two probabilities are complementary by construction - this is one binary
 model, not two independent scores. Both are reported so downstream code never
@@ -185,8 +194,8 @@ The current model (`models/dead_classifier_pooled.joblib`) is ResNet18-512 ->
 PCA(32) -> logistic regression, trained on 826 hand labels pooled from the BUB1
 and CycB-overexpression datasets across 15 microscope positions:
 leave-one-position-out balanced accuracy 0.878, AUC 0.945, calibration error
-0.018. An area-only baseline reaches 0.691, so the model is not simply
-measuring cell size - the failure mode of the first version of it.
+0.018. An area-only baseline reaches 0.691, so the model is reading more than
+cell size.
 
 Transfer between cell backgrounds is the known weak spot: fitting on one
 dataset and testing on the other gives 0.75-0.83 balanced accuracy. A new cell
