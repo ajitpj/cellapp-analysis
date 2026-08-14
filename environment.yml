@@ -1,0 +1,49 @@
+# Conda environment for cellapp-analysis.
+#
+#   conda env create -f environment.yml
+#   conda activate img-env
+#
+# Covers the analysis module (cellaap_analysis, dead_classifier, cellaap_utils,
+# augment_dead_label) and the napari curation GUI (particle_browser.py). It does
+# NOT cover the upstream cellaap inference itself, which needs cell_AAP and
+# detectron2 and is installed separately.
+#
+# Lower bounds are the versions the pipeline is currently run and tested with.
+name: img-env
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+
+  # core numerics and tables. numpy is held below 2.0 because the pinned
+  # pytorch and scikit-image builds are compiled against the 1.x ABI.
+  - numpy=1.26.*
+  - pandas>=2.2
+  - scipy>=1.14
+
+  # segmentation handling and tracking
+  - scikit-image>=0.24   # erosion, closing, regionprops, GLCM texture features
+  - tifffile>=2024.8     # memory-mapped stack reads; the browser relies on these
+  - trackpy>=0.7         # centroid linking
+  - numba>=0.60          # trackpy's optional accelerator
+
+  # mitotic-vs-dead classifier. The model bundle in models/ is a pickled
+  # sklearn Pipeline, so scikit-learn has to be importable to unpickle it;
+  # torchvision supplies the ImageNet ResNet18 used as the feature extractor.
+  - scikit-learn>=1.5
+  - joblib>=1.4
+  - pytorch>=2.4
+  - torchvision>=0.19
+
+  # workbook and cache IO
+  - openpyxl>=3.1        # pandas read_excel / ExcelWriter
+  - pyarrow>=17          # particle_browser's parquet table cache
+
+  # plotting and the curation GUI
+  - matplotlib>=3.9
+  - seaborn>=0.13
+  - napari>=0.5
+  - qtpy>=2.4
+  - pyqt>=5.15           # napari needs a Qt binding; qtpy wraps whichever is present

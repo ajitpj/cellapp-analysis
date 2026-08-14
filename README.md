@@ -3,6 +3,17 @@
 A python module to track cells and measure fluorescence and mitotic duration using cellapp inference files and raw fluorescence images. It runs trackpy on the instance segmentation file first, and then measures cell state (mitotic/non-mitotic) from the semantic segmentation and raw mean fluorescence value from the specific fluorescence channel. The module also summarizes the analysis by calculating the mean fluorescence for each cell over the duration of mitosis, the total mitotic duration, and correction factors based on intensity and background correction maps (must be acquired using empty wells with DMEM and fluorobrite respectively).
 This analysis and summary are saved as separate excel spreadsheets.
 
+## Installation
+
+```bash
+conda env create -f environment.yml
+conda activate img-env
+```
+
+This covers the analysis module and the napari curation browser. The upstream
+cellaap inference itself needs `cell_AAP` and `detectron2` and is installed
+separately.
+
 ## Usage
 
 1. **Specify the root folder**. This folder must contain cellapp-generated inference folders and the raw intensity stacks and is input as a Path object.
