@@ -647,13 +647,20 @@ class analysis:
         Fluorescence is averaged over the corrected window only, so nothing is
         measured from a cell already called dead.
 
-        A track is excluded outright when it is already mitotic on its own
-        first frame - no entry was observed, and the segmentation's habit of
-        labeling anaphase mitotic means most of these are a daughter cell
-        trackpy picked up mid-division - or when it is still mitotic on the
-        last frame of the movie, where the acquisition cut the exit off, or
-        when a mitotic-labeled detection lies within defaults.border_margin of
-        the frame edge, where the classifier cannot see a full crop box.
+        A track is excluded outright when
+
+          * it is already mitotic on its own first frame - no entry was
+            observed, and the segmentation's habit of labeling anaphase mitotic
+            means most of these are a daughter cell trackpy picked up
+            mid-division;
+          * it begins after defaults.late_track_start_fraction of the movie AND
+            reaches mitosis within defaults.early_mitosis_frames of its start -
+            the same daughter-cell artifact, for the ones whose first frame or
+            two are not yet labeled;
+          * it is still mitotic on the last frame of the movie, where the
+            acquisition cut the exit off;
+          * a mitotic-labeled detection lies within defaults.border_margin of
+            the frame edge, where the classifier cannot see a full crop box.
 
         Note what never reaches this function: tracks shorter than
         defaults.min_track_length are removed by trackpy in track_centroids,
@@ -738,6 +745,13 @@ class analysis:
         n_peaks          = [] # mitotic episodes in the track
         n_scored         = [] # frames the classifier actually scored
         n_interphase_death = 0 # died without ever having a mitosis; excluded
+        n_late_daughter    = 0 # late-starting track that is mitotic at once
+
+        # A track starting after this frame is late enough in the movie to be a
+        # daughter picked up mid-division rather than a cell followed from the
+        # start; frames are 0-indexed, hence the +1 for the movie length.
+        late_start_after = (self.defaults.late_track_start_fraction
+                            * (int(movie_last) + 1))
 
         # Check which channels have been measured. If none, return only "mitotic duration"
         # Need to find a better way to code this.
@@ -774,6 +788,18 @@ class analysis:
             # The first episode is the mitosis being reported; any later one is
             # a re-rounding, most often the cell dying after it divided.
             first_start, first_stop = episodes[0]
+
+            # The rest of the daughter-cell artifact. Rejecting tracks mitotic
+            # on their very first frame misses the ones whose first frame or
+            # two are not yet labeled, so a track that both begins late in the
+            # movie and reaches mitosis almost immediately is rejected too.
+            # Neither condition alone is suspicious.
+            if (frames[0] > late_start_after
+                    and frames[first_start] - frames[0]
+                    < self.defaults.early_mitosis_frames):
+                n_late_daughter += 1
+                continue
+
             death = self._death_row(proba)
 
             if death is None:
@@ -843,6 +869,11 @@ class analysis:
         print(f'summarized {len(particle)} tracks; {n_dead} died during or '
               f'after mitosis (P(dead) > {self.defaults.death_proba_threshold} '
               f'for {self.defaults.death_run_frames} consecutive frames)')
+        if n_late_daughter:
+            print(f'excluded {n_late_daughter} tracks starting after frame '
+                  f'{late_start_after:.0f} that reached mitosis within '
+                  f'{self.defaults.early_mitosis_frames} frames (daughter '
+                  f'cells picked up mid-division)')
         if n_interphase_death:
             print(f'excluded {n_interphase_death} tracks dead within '
                   f'{self.defaults.min_mitotic_duration_in_frames} frames of '

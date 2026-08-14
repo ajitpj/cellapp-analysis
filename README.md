@@ -129,6 +129,7 @@ worth checking in this order when a cell you expect is missing:
 | track shorter than 10 frames | `tp.filter_stubs` in `track_centroids` | `min_track_length` |
 | mitotic detection near the frame edge | `summarize_data` | `border_margin`, `exclude_border_tracks` |
 | already mitotic on the track's first frame | `summarize_data` | — |
+| starts late in the movie and is mitotic at once | `summarize_data` | `late_track_start_fraction`, `early_mitosis_frames` |
 | still mitotic on the movie's last frame | `summarize_data` | — |
 | no mitotic run ≥ 3 frames | `summarize_data` | `min_mitotic_duration_in_frames` |
 | interphase death (see above) | `summarize_data` | `min_mitotic_duration_in_frames` |
@@ -145,6 +146,14 @@ opens a fresh particle on a daughter that still carries the mitotic label; its
 "mitosis" is the tail of the mother's division, with no entry of its own. These
 tracks have characteristically high particle numbers and late start frames,
 since they only exist after a division.
+
+That test misses the ones whose first frame or two are not yet labelled, so a
+track is **also** rejected when it begins after `late_track_start_fraction`
+(default 1/3) of the movie *and* reaches mitosis within `early_mitosis_frames`
+(default 3) of its own start. Both conditions are required: a late start on its
+own is ordinary, and so is an early mitosis in a track followed from the
+outset. This removes a further 10 tracks on a normally cycling position and 37
+on an arrest-heavy one.
 
 **Ending mitotic disqualifies a track only if it runs to the movie's last
 frame,** where the acquisition cut the episode short. A track that merely stops

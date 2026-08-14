@@ -43,6 +43,18 @@ class analysis_pars:
         # whether or not it is (see the dead_classifier docstring).
         self.post_peak_frames = 10
 
+        # Spurious daughter tracks. The segmentation labels anaphase mitotic,
+        # so trackpy opens a fresh particle on a dividing cell: the track
+        # begins late in the movie and is mitotic almost at once. Rejecting
+        # tracks that are mitotic on their very first frame catches most, but
+        # not the ones whose first frame or two are not yet labeled. A track is
+        # also rejected when it starts after late_track_start_fraction of the
+        # movie AND reaches mitosis within early_mitosis_frames of its start.
+        # Both conditions are needed: a late start alone is ordinary, and so is
+        # an early mitosis in a track that has been followed from the outset.
+        self.late_track_start_fraction = 1 / 3
+        self.early_mitosis_frames = 3
+
         # Death call. A cell is dead from the first frame of the first run of
         # death_run_frames consecutive frames with P(dead) above the
         # threshold. High threshold plus a required run keeps isolated
