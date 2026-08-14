@@ -609,13 +609,10 @@ class analysis:
           in_frames                   and no mitotic signal to report, and the
                                       track is left OUT of the summary.
           inside the first episode -> dead_in_mitosis. Reports the frame of
-                                      death, the time in mitosis before it
-                                      (time_to_death), and signal averaged over
-                                      those pre-death mitotic frames.
+                                      death and the frames from entry to it.
           after the first episode  -> dead_post_mitosis. The mitosis completed,
-                                      so the full mitotic duration and its
-                                      signal are reported, plus the frame of
-                                      death.
+                                      so its full duration is reported, plus
+                                      the frame of death.
 
         Death is only visible where the classifier ran: the mitotic frames plus
         defaults.post_peak_frames AFTER each episode. Nothing before mitotic
@@ -628,13 +625,27 @@ class analysis:
         none of its mitotic-labeled detections sit within defaults.border_margin
         of the frame edge, where the classifier cannot see the whole cell.
 
-        Columns: mito_start and death_frame are absolute movie frames, and
-        directly comparable. mitosis is a count of frames - the length of the
-        first episode as observed, never truncated, so a cell that rounds up
-        and dies still reports how long it was seen rounded. time_to_death is
-        the frames from mitotic entry to the death call (NaN if the cell never
-        dies). Fluorescence is averaged over the episode up to the death call
-        only, so it is NaN for a cell dead from its first mitotic frame.
+        Columns. track_start_frame, mitotic_start_frame and death_frame are
+        absolute movie frames and compare directly; the rest of the frame
+        counts are durations.
+
+        sem_frames_in_mitosis        every mitotic-labeled frame in the track.
+        corrected_frames_in_mitosis  of those, the ones before the death call:
+                                     the time the cell spent in mitosis while
+                                     still alive, and the window the channel
+                                     means are taken over. Equal to
+                                     sem_frames_in_mitosis when the cell never
+                                     dies, and the difference between the two
+                                     is the time it lay dead but still labeled
+                                     mitotic.
+        frames_to_death              frames from mitotic entry to the death
+                                     call; NaN if the cell never dies. It can
+                                     exceed corrected_frames_in_mitosis, since
+                                     a post-mitotic death happens after the
+                                     cell has left mitosis.
+
+        Fluorescence is averaged over the corrected window only, so nothing is
+        measured from a cell already called dead.
 
         A track is excluded outright when it is already mitotic on its own
         first frame - no entry was observed, and the segmentation's habit of
@@ -713,19 +724,18 @@ class analysis:
         # Fluctuations in the mask size will indicate segmentation quality
         cell_area_std  = np.zeros_like(peaks_per_track)
 
-        mitosis          = []
-        time_to_death    = [] # frames from mitotic entry to the death call
-        mito_start       = []
-        cell_area        = []
+        corrected_frames_in_mitosis = [] # mitotic frames before the death call
+        sem_frames_in_mitosis = []  # every mitotic-labeled frame in the track
+        frames_to_death  = [] # frames from mitotic entry to the death call
+        track_start_frame   = [] # movie frame the track begins on
+        mitotic_start_frame = [] # movie frame of mitotic entry
         particle         = []
         track_length     = []
         channels         = []
-        max_displacement = []
         dead_cell_score  = [] # keep track of "dead" flags
         fate_label       = [] # mitotic_survived / dead_in_mitosis / dead_post_mitosis
         death_frame      = [] # movie frame of death (NaN if the cell never dies)
         n_peaks          = [] # mitotic episodes in the track
-        n_sem_mitotic    = [] # frames the segmentation called mitotic
         n_scored         = [] # frames the classifier actually scored
         n_interphase_death = 0 # died without ever having a mitosis; excluded
 
@@ -783,37 +793,27 @@ class analysis:
             else:
                 fate = 'dead_post_mitosis'
 
-            # Fluorescence window: the first episode, ending at death if the
-            # cell died during it, so no signal is measured from a cell already
-            # called dead. A cell dead from its first mitotic frame leaves this
-            # empty and its channel means are NaN - there was no live mitotic
-            # frame to measure.
-            window = np.zeros(len(frames), dtype=int)
-            window[first_start:first_stop] = 1
+            # The measured window: every mitotic-labeled frame before the death
+            # call. Nothing is measured from a cell already called dead, so the
+            # channel means describe the cell while it was both mitotic and
+            # alive, and its size is reported as corrected_frames_in_mitosis -
+            # sem_frames_in_mitosis minus whatever fell at or after the death.
+            window = sem_raw.astype(int)
             if death is not None:
-                window[death:] = 0
-
-            # Duration is the observed episode, NOT truncated at death: a cell
-            # that rounds up and dies was still seen rounded for that long, and
-            # zeroing it made those rows unusable. time_to_death carries the
-            # truncated quantity - frames from mitotic entry to the death call,
-            # which for a post-mitotic death runs past the end of the episode.
-            mitosis.append(int(first_stop - first_start))
-            time_to_death.append(int(death - first_start) if death is not None
-                                 else np.nan)
-            mito_start.append(int(frames[first_start]))
+                window = window * (np.arange(len(frames)) < death)
+            corrected_frames_in_mitosis.append(int(window.sum()))
+            sem_frames_in_mitosis.append(int(sem_raw.sum()))
+            frames_to_death.append(int(death - first_start) if death is not None
+                                   else np.nan)
+            track_start_frame.append(int(frames[0]))
+            mitotic_start_frame.append(int(frames[first_start]))
             death_frame.append(int(frames[death]) if death is not None else np.nan)
             fate_label.append(fate)
             n_peaks.append(len(episodes))
             dead_cell_score.append(np.sum(sem_raw*dead_flag))
-            n_sem_mitotic.append(int(sem_raw.sum()))
             n_scored.append(int(np.isfinite(proba).sum()))
-            cell_area.append(track_rows.area.mean())
             particle.append(id)
             track_length.append(len(frames))
-            coords = self.tracked.loc[self.tracked.particle==id, ['x', 'y']]
-            disp_vector = calculate_displacement(coords)
-            max_displacement.append(np.max(disp_vector))
 
             # A cell that dies on the first frame of its mitosis has an empty
             # averaging window, so the channel means are legitimately NaN;
@@ -857,20 +857,22 @@ class analysis:
         self.quality["cell_area_std"]   = pd.DataFrame(cell_area_std, columns = ["Area std."])
 
         # Construct summary DF
+        # Column order is deliberate: identity, then when the track and the
+        # mitosis start, then the durations, then the classifier's evidence and
+        # verdict, with the fluorescence columns last.
         other_storage = {
-                        "particle"         : particle,
-                        "track_length"     : track_length,
-                        "max_displacement" : max_displacement,
-                        "mito_start"       : mito_start,
-                        "cell_area"        : cell_area,
-                        "mitosis"          : mitosis,
-                        "time_to_death"    : time_to_death,
-                        "dead_cell_score"  : dead_cell_score,
-                        "fate_label"       : fate_label,
-                        "death_frame"      : death_frame,
-                        "n_peaks"          : n_peaks,
-                        "n_sem_mitotic"    : n_sem_mitotic,
-                        "n_scored"         : n_scored
+                        "particle"                    : particle,
+                        "track_length"                : track_length,
+                        "n_peaks"                     : n_peaks,
+                        "track_start_frame"           : track_start_frame,
+                        "mitotic_start_frame"         : mitotic_start_frame,
+                        "frames_to_death"             : frames_to_death,
+                        "sem_frames_in_mitosis"       : sem_frames_in_mitosis,
+                        "corrected_frames_in_mitosis" : corrected_frames_in_mitosis,
+                        "n_scored"                    : n_scored,
+                        "dead_cell_score"             : dead_cell_score,
+                        "fate_label"                  : fate_label,
+                        "death_frame"                 : death_frame,
                         }
         
         summary_storage = other_storage | signal_storage

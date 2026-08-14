@@ -375,10 +375,11 @@ def import_filter_data_for_wells(analysis_object, expt_label: str, expt_length: 
     (assembled from the analysis object's inference folders), then applies the
     following processing steps:
 
-    - Removes any records where `mito_start` is less than or equal to 0.
+    - Removes any records where `mitotic_start_frame` is <= 0.
     - Removes records where the mitosis event would extend beyond the
-      experiment length (i.e. `mito_start + mitosis >= expt_length`).
-    - Converts the `mitosis` duration from frames to real time by multiplying
+      experiment length (i.e. `mitotic_start_frame +
+      corrected_frames_in_mitosis >= expt_length`).
+    - Converts `corrected_frames_in_mitosis` from frames to real time by multiplying
       by `delta_t`.
     - Adds a `code` column set to `expt_label` so rows can be identified by
       experiment.
@@ -395,7 +396,7 @@ def import_filter_data_for_wells(analysis_object, expt_label: str, expt_length: 
         Number of frames in the full experiment/movie. Used to remove events
         that end after the movie finishes.
     delta_t : int | float
-        Time per frame (units depend on the dataset). `mitosis` values in the
+        Time per frame (units depend on the dataset). `corrected_frames_in_mitosis` in the
         source summaries are assumed to be in frames; they will be multiplied
         by `delta_t` to convert to time units.
     well_list : list
@@ -406,7 +407,8 @@ def import_filter_data_for_wells(analysis_object, expt_label: str, expt_length: 
     -------
     pandas.DataFrame
         Filtered summary table for the requested wells with columns at least
-        including `mito_start`, `mitosis`, `well`, `position`, `storage_location`,
+        including `mitotic_start_frame`, `corrected_frames_in_mitosis`,
+        `well`, `position`, `storage_location`,
         and `code`. If no data is found for the provided wells, an empty
         DataFrame is returned.
 
@@ -415,7 +417,7 @@ def import_filter_data_for_wells(analysis_object, expt_label: str, expt_length: 
     The actual file I/O and summary assembly is performed by
     `compile_summaries`; this function only post-processes that result.
 
-    Both filters read `mito_start` as an absolute movie frame, which is what
+    Both filters read `mitotic_start_frame` as an absolute movie frame, which is what
     `summarize_data` now writes: a row survives only if mitotic entry was
     actually observed (frame > 0) and the whole episode finished inside the
     movie. Summary files written before that change stored a within-track row
@@ -423,9 +425,10 @@ def import_filter_data_for_wells(analysis_object, expt_label: str, expt_length: 
     tracks that begin late in the movie.
     """
     well_data = compile_summaries(analysis_object, well_list)
-    well_data = well_data[well_data["mito_start"]>0]
-    well_data = well_data[well_data["mito_start"]+well_data["mitosis"] < expt_length].copy()
-    well_data["mitosis"] = well_data["mitosis"] * delta_t
+    start, dur = "mitotic_start_frame", "corrected_frames_in_mitosis"
+    well_data = well_data[well_data[start] > 0]
+    well_data = well_data[well_data[start] + well_data[dur] < expt_length].copy()
+    well_data[dur] = well_data[dur] * delta_t
     well_data["code"] = expt_label
     return well_data
 
@@ -455,7 +458,7 @@ def import_whole_expt_data(wellmap_dict: dict, analysis_object, expt_length: int
         Number of frames in the experiment; used to filter events that extend
         past the end of the movie.
     delta_t : int | float
-        Time per frame used to convert `mitosis` from frames to time units.
+        Time per frame used to convert the mitotic duration into time units.
 
     Returns
     -------

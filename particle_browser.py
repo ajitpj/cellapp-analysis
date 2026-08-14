@@ -78,9 +78,14 @@ FLUOR_COLORS = ("tab:green", "tab:blue", "tab:purple", "tab:olive",
                 "tab:cyan", "tab:brown", "tab:pink")
 # Preference order for the fluorescence trace; the first one present wins.
 FLUOR_PREF = ("GFP", "GFP_bkg_corr", "GFP_int_corr")
-# Summary columns worth showing next to the selected particle, when present.
-INFO_COLS = ("track_length", "mito_start", "mitosis", "dead_cell_score",
-             "fate_label", "death_frame", "n_true_mitotic")
+# Shown next to the selected particle when present. Both the current names and
+# the ones they replaced are listed, so workbooks written before the rename
+# still display.
+INFO_COLS = ("track_length", "n_peaks", "mitotic_start_frame",
+             "frames_to_death", "sem_frames_in_mitosis",
+             "corrected_frames_in_mitosis", "dead_cell_score", "fate_label",
+             "death_frame",
+             "mito_start", "mitosis", "time_to_death", "n_sem_mitotic")
 ANNOTATION_COL = "user_annotation"
 
 # Grouping. The pipeline's own per-particle call is `fate_label`
@@ -1012,9 +1017,11 @@ def build(root: Path):
 
         row = store.summary_row(well_site, particle)
         if row is not None:
-            for col, color in (("mito_start", "tab:blue"),
+            starts = [c for c in ("mitotic_start_frame", "mito_start")
+                      if c in row.index]
+            for col, color in ((starts[0] if starts else None, "tab:blue"),
                                ("death_frame", "black")):
-                if col in row.index and pd.notna(row[col]):
+                if col is not None and col in row.index and pd.notna(row[col]):
                     ax.axvline(float(row[col]), color=color, ls="--", lw=1.0)
                     ax.annotate(col, (float(row[col]), 1.03),
                                 fontsize=6.5, color=color, ha="center")

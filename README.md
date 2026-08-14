@@ -84,27 +84,40 @@ Where the death frame falls relative to the first episode gives `fate_label`:
 |---|---|---|
 | never | `mitotic_survived` | mitotic duration + signal |
 | < `min_mitotic_duration_in_frames` after entry | — **excluded** | the cell never had a mitosis; it rounded up because it was dying |
-| inside the first episode | `dead_in_mitosis` | death frame, `time_to_death`, signal over the pre-death mitotic frames |
+| inside the first episode | `dead_in_mitosis` | death frame, `frames_to_death`, signal over the pre-death mitotic frames |
 | after the first episode | `dead_post_mitosis` | full mitotic duration + signal, plus death frame |
 
 Excluding the interphase deaths is what keeps every remaining row meaningful:
 each one carries both a mitotic duration and a fluorescence measurement, rather
 than a row of `NaN` for a cell that had no mitosis to measure.
 
-**Summary columns.** `mito_start` and `death_frame` are absolute movie frames
-and compare directly; everything else counted in frames is a duration.
+**Summary columns**, in the order they are written. `track_start_frame`,
+`mitotic_start_frame` and `death_frame` are absolute movie frames and compare
+directly; the other frame counts are durations.
 
 | column | meaning |
 |---|---|
-| `mito_start` | frame of mitotic entry (first episode) |
-| `mitosis` | length of the first episode, as observed, never truncated at death |
-| `time_to_death` | frames from mitotic entry to the death call; `NaN` if the cell survives |
-| `death_frame` | frame of the death call; `NaN` if the cell survives |
-| `fate_label` | see the table above |
+| `particle` | trackpy particle id |
+| `track_length` | frames in the track |
 | `n_peaks` | mitotic episodes in the track |
-| `n_sem_mitotic` | frames the segmentation called mitotic |
+| `track_start_frame` | frame the track begins on |
+| `mitotic_start_frame` | frame of mitotic entry (first episode) |
+| `frames_to_death` | frames from mitotic entry to the death call; `NaN` if the cell survives |
+| `sem_frames_in_mitosis` | every mitotic-labelled frame in the track |
+| `corrected_frames_in_mitosis` | of those, the ones before the death call — time in mitosis while still alive |
 | `n_scored` | frames the classifier actually scored |
-| `<channel>` | mean signal over the mitotic window, up to the death call |
+| `dead_cell_score` | mitotic frames the classifier flagged dead |
+| `fate_label` | see the table above |
+| `death_frame` | frame of the death call; `NaN` if the cell survives |
+| `<channel>`… | mean signal over `corrected_frames_in_mitosis` |
+
+`sem_frames_in_mitosis` minus `corrected_frames_in_mitosis` is the time the
+cell lay dead while still carrying the mitotic label; the two are equal when it
+never dies. `frames_to_death` can exceed `corrected_frames_in_mitosis`, since a
+post-mitotic death happens after the cell has already left mitosis.
+
+Fluorescence is averaged over the corrected window only, so nothing is measured
+from a cell already called dead.
 
 ### What never reaches the summary
 
@@ -318,7 +331,7 @@ Inputs:
   elsewhere in the package; it must provide the `root_folder` used by
   `compile_summaries`)
 - `expt_length`: total number of frames in the movie (used to filter events)
-- `delta_t`: time per frame (used to convert `mitosis` frames into time)
+- `delta_t`: time per frame (converts `corrected_frames_in_mitosis` into time)
 
 Example:
 
@@ -367,7 +380,7 @@ a fallback, so pointing at a parent works.
 - **Traces.** `semantic`, fluorescence and `dead_proba` overlaid on a shared
   0-1 axis, with each one's true range in the legend; fluorescence is scaled on
   its 1st-99th percentiles so one bright frame cannot flatten it.
-  `mito_start` and `death_frame` are marked. The cursor follows the napari
+  `mitotic_start_frame` and `death_frame` are marked. The cursor follows the napari
   frame slider, and clicking the plot jumps the viewer to that frame.
   - **Pick one fluorescence column or tick `plot all`** to overlay every one
     the analysis table carries, each in its own colour. A column whose range is
