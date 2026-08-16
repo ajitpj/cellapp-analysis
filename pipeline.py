@@ -159,7 +159,7 @@ PLATEMAP_HEADER = """\
 # notes          free text, ignored by the pipeline.
 #
 # celltype/transfection/drug are also the grouping keys used by
-# cellaap_utils.create_wellmap_dict(), so this same file drives the
+# cellaap_aggregate.load_experiment(), so this same file drives the
 # downstream compilation of summaries.
 """.format(
     celltypes=", ".join(sorted(CELLTYPES)),
@@ -1965,10 +1965,14 @@ def cmd_submit(args) -> int:
 # ---------------------------------------------------------------------------
 
 def read_platemap_df(path):
-    """The platemap as a DataFrame, ready for cellaap_utils.create_wellmap_dict.
+    """The platemap as a DataFrame, for reading the plate layout by hand.
 
     The comment lines at the top of the file need `comment='#'`, which is easy
     to forget; use this instead of a bare pd.read_csv.
+
+    To compile a plate, prefer `cellaap_aggregate.load_experiment()`: it goes
+    through `read_platemap`/`build_tasks` rather than the DataFrame, so it
+    applies the same position-over-well precedence the run applied.
     """
     import pandas as pd
     df = pd.read_csv(path, comment="#")

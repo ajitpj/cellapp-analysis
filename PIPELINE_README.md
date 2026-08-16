@@ -124,20 +124,23 @@ intensity correction, exactly as it does today when no maps are present.
 **Wells you leave out** are run as HeLa, but `check` flags them with a `*` and
 `submit` refuses to run until you either add them or pass `--allow-unmapped`.
 
-The `celltype`, `transfection` and `drug` columns are exactly the grouping keys
-`cellaap_utils.create_wellmap_dict()` expects, so the same file drives the
-downstream compilation:
+The `celltype`, `transfection` and `drug` columns are the grouping keys the
+downstream compilation uses, so this same file drives that too — you never
+transcribe the plate layout twice:
 
 ```python
-import pipeline
-from cellaap_utils import create_wellmap_dict, import_whole_expt_data
+import cellaap_aggregate as agg
 
-wellmap = create_wellmap_dict(pipeline.read_platemap_df(root / "platemap.csv"))
-whole_df = import_whole_expt_data(wellmap, exp_analysis, expt_length=150, delta_t=10)
+whole_df = agg.load_experiment(root, expt_length=150, delta_t=10)
 ```
 
-Use `pipeline.read_platemap_df()` rather than a bare `pd.read_csv()` — the
-comment header needs `comment='#'`.
+`cellaap_aggregate` reads the platemap through this module's own parser, so the
+groups it compiles apply the same precedence, `skip` and blank-media rules the
+run did. See [README.md](README.md#compiling-a-plate-cellaap_aggregatepy).
+
+If you want the platemap as a DataFrame yourself, use
+`pipeline.read_platemap_df()` rather than a bare `pd.read_csv()` — the comment
+header needs `comment='#'`.
 
 ## 3. `check` — validate before spending GPU hours
 

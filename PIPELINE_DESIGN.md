@@ -60,9 +60,14 @@ That arrangement has four specific problems, and they set the requirements:
 ### Non-requirements
 
 Deliberately out of scope: per-track curation (that is `particle_browser.py`),
-cross-well compilation and plotting (`cellaap_utils`), model training, and any
-change to the analysis algorithms themselves. The pipeline is scheduling and
-bookkeeping around unchanged code.
+cross-well compilation and plotting (`cellaap_aggregate.py`), model training,
+and any change to the analysis algorithms themselves. The pipeline is
+scheduling and bookkeeping around unchanged code.
+
+`cellaap_aggregate` is out of scope in the sense that the pipeline does not call
+it — but it calls the pipeline, importing `read_platemap`, `discover_positions`
+and `build_tasks` to resolve the plate exactly as a run resolves it. That makes
+this module's platemap parsing a published interface, not a private one; see §6.
 
 ---
 
@@ -127,9 +132,16 @@ rather than command-line flags that vanish into shell history.
 ### Why the columns are what they are
 
 `celltype`, `transfection`, `drug`, `well_ids` are not chosen freely: they are
-what `cellaap_utils.create_wellmap_dict()` already requires. Matching them
-means one document covers inference, analysis *and* the downstream compilation
-of summaries into groups — the user never transcribes the plate layout twice.
+what the downstream grouping (then `cellaap_utils.create_wellmap_dict()`, now
+`cellaap_aggregate`) already requires. Matching them means one document covers
+inference, analysis *and* the compilation of summaries into groups — the user
+never transcribes the plate layout twice.
+
+That compilation now goes further and reuses `build_tasks` itself rather than
+re-deriving groups from the same columns. Re-deriving was where the two drifted:
+a well-level match on the string `_G03_` also matches `_G03_s9_`, so a site the
+platemap deliberately moved to another condition was counted under both. The
+pipeline resolved that precedence correctly and the compilation did not.
 The rest (`channels`, `model`, `confluency_est`, `conf_threshold`, `skip`,
 `notes`) are pipeline additions.
 
@@ -488,6 +500,21 @@ generation.
 `VALID_MODELS` and `VALID_CHANNELS` are duplicated rather than imported on
 purpose: `check` has to validate a platemap in `img-env`, where importing
 `inference` (and therefore detectron2) is impossible.
+
+### What depends on *this* module
+
+One thing does, and it is the reverse of every row above.
+`cellaap_aggregate.py` imports `read_platemap`, `discover_positions`,
+`build_tasks`, `normalize_well`, `expand_well_token`, `platemap_path`,
+`STUB_RE`, `ROLES` and `MAP_ROLES` from here, so that a compiled group is
+resolved by the same code that resolved the run. The alternative — re-deriving
+groups from the platemap's columns — is what produced the double-counting bug
+described in §3.
+
+Two consequences. First, these names are now interface: renaming `build_tasks`
+or changing what `Task` carries breaks compilation, loudly. Second, the
+no-heavy-imports-at-module-scope rule (§2) is what makes this import cheap
+enough to sit at the top of a notebook module; keep it.
 
 The analysis stage also reuses one `analysis` session across positions when run
 sequentially, deleting `summaryDF` and `tracked` between them — the same guard
