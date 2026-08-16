@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import getpass
 import json
 import os
 import re
@@ -169,10 +170,24 @@ PLATEMAP_HEADER = """\
     threshold=DEFAULT_CONF_THRESHOLD,
 )
 
+def default_mail_user() -> str:
+    """<login>@umich.edu for whoever is submitting.
+
+    Resolved here rather than written as "$USER@umich.edu" into the script:
+    SBATCH directives are not shell-expanded, so the literal string would
+    reach SLURM as an invalid address.
+    """
+    try:
+        user = os.environ.get("USER") or getpass.getuser()
+    except Exception:
+        return ""
+    return f"{user}@umich.edu" if user else ""
+
+
 # SLURM defaults, taken from the submit_*.sh scripts these replace.
 SLURM_DEFAULTS = {
     "account": "ajitj99",
-    "mail_user": "ajitj@umich.edu",
+    "mail_user": default_mail_user(),
     "gpu_partition": "gpu",
     "cpu_partition": "standard",
     "infer_env": "cellaap-env",
@@ -2027,7 +2042,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="actually submit; without it the scripts are only written")
     sp.add_argument("--job-name", default=None, help="default: the root folder name")
     sp.add_argument("--account", default=d["account"])
-    sp.add_argument("--mail-user", default=d["mail_user"])
+    sp.add_argument("--mail-user", default=d["mail_user"],
+                    help="default: $USER@umich.edu (%(default)s here)")
     sp.add_argument("--gpu-partition", default=d["gpu_partition"])
     sp.add_argument("--cpu-partition", default=d["cpu_partition"])
     sp.add_argument("--infer-env", default=d["infer_env"])

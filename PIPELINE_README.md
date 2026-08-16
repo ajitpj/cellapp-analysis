@@ -229,7 +229,7 @@ Common overrides (full list under `submit --help`):
 | `--maps-mem` / `--maps-time` | `48g` / `0-02:00:00` | the background map median-filters the whole blank stack |
 | `--infer-concurrent` / `--analysis-concurrent` | 4 / 12 | array tasks running at once |
 | `--gpus` / `--analysis-cpus` | 1 / 1 | |
-| `--account` / `--mail-user` | `ajitj99` / `ajitj@umich.edu` | |
+| `--account` / `--mail-user` | `ajitj99` / `$USER@umich.edu` | the address is resolved from your login at submit time |
 | `--gpu-partition` / `--cpu-partition` | `gpu` / `standard` | |
 | `--infer-env` / `--analysis-env` | `cellaap-env` / `img-env` | conda envs |
 | `--job-name` | the root folder name | suffixed `_inf` and `_ana` |

@@ -357,7 +357,9 @@ holding queue slots (not resources) while inference runs.
 ### Concurrency and resources
 
 Defaults come from the scripts this replaces (`--account ajitj99`, gpu/standard
-partitions, 12 GB per GPU rounded to 16, 20 GB analysis memory rounded to 24)
+partitions, 12 GB per GPU rounded to 16, 20 GB analysis memory rounded to 24;
+the notification address is `$USER@umich.edu`, resolved at submit time because
+SBATCH directives are not shell-expanded)
 with array throttles — 4 concurrent GPU tasks, 12 CPU — chosen to be polite on
 a shared allocation rather than optimal. All are flags; none require editing
 the script, which was the point.
