@@ -227,9 +227,9 @@ Common overrides (full list under `submit --help`):
 
 | flag | default | |
 | --- | --- | --- |
-| `--infer-time` / `--analysis-time` | `0-03:00:00` / `0-06:00:00` | walltime per position |
-| `--infer-mem` / `--analysis-mem` | `16g` per GPU / `24g` | |
-| `--maps-mem` / `--maps-time` | `48g` / `0-02:00:00` | the background map median-filters the whole blank stack |
+| `--infer-time` / `--analysis-time` | `0-00:40:00` / `0-01:00:00` | walltime per position |
+| `--infer-mem` / `--analysis-mem` | `12g` per GPU / `25g` | |
+| `--maps-mem` / `--maps-time` | `20g` / `0-00:30:00` | per folder; the background map median-filters the whole blank stack |
 | `--infer-concurrent` / `--analysis-concurrent` | 4 / 12 | array tasks running at once |
 | `--gpus` / `--analysis-cpus` | 1 / 1 | |
 | `--account` / `--mail-user` | `ajitj99` / `$USER@umich.edu` | the address is resolved from your login at submit time |
@@ -396,14 +396,15 @@ hour, the time is not going into the filtering. Two things to check:
 * `seff <jobid>` on the maps job. Low CPU efficiency (single digits) means the
   job spent its time waiting, not computing — either memory pressure or the
   filesystem. Near 100% means it really was computing, and the stack is much
-  larger than assumed. A measured example: 57 min wall, 2:53 CPU (5%), 8 GB of
-  48 used — i.e. no memory problem and ~54 min of pure I/O wait, moving about
+  larger than assumed. A measured example: 57 min wall, 2:53 CPU (5%), 8 GB
+  used — i.e. no memory problem and ~54 min of pure I/O wait, moving about
   6 GB, an effective 2 MB/s. That is a filesystem problem, not a pipeline one.
 * Where you ran it. `gen_background_correction_map` holds its result as int64
   while writing int16, so the working buffer is **four times** the size of the
-  blank stack: ~5 GB for 150 frames at 2048x2048, ~15 GB for 450. That fits the
-  48 GB the maps job requests, but not a login node, where it will swap for
-  hours. Run it through `submit`, or with `sbatch`, not interactively.
+  blank stack: ~5 GB for 150 frames at 2048x2048, ~15 GB for 450. The default
+  `--maps-mem 20g` covers the first comfortably and the second not at all, so
+  raise it for long blank stacks. A login node will swap for hours whatever the
+  figure says — run it through `submit`, or with `sbatch`, not interactively.
 
 The maps log (`pipeline/logs/maps/corrections.log`) records the size of each
 source stack, the working buffer it implies, which filesystem the root sits on,
@@ -421,9 +422,13 @@ command or resubmit — only the failed positions run again.
 search radius for that cell type in `analysis_pars.py`, or drop the cell type
 to a `vanilla` track mode. Then `--force` the affected positions.
 
-**The analysis array died at the walltime limit.** Dense positions can exceed
-an hour. Resubmit with `--analysis-time 0-10:00:00`; finished positions are
-skipped, so it picks up where it stopped.
+**The analysis array died at the walltime limit.** The default is one hour per
+position, which is the typical cost; a dense position can take several times
+that. Resubmit with `--analysis-time 0-06:00:00` (or more); finished positions
+are skipped, so it picks up where it stopped rather than starting over.
+
+**The inference array died at the walltime limit.** Same story with
+`--infer-time`; the default is 40 minutes per position.
 
 **Out of memory in analysis.** The zoomed instance mask is the big allocation.
 Resubmit with `--analysis-mem 48g`.

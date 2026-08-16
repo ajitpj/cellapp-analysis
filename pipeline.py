@@ -184,7 +184,11 @@ def default_mail_user() -> str:
     return f"{user}@umich.edu" if user else ""
 
 
-# SLURM defaults, taken from the submit_*.sh scripts these replace.
+# SLURM defaults. The walltimes and memory figures are per array task - one
+# position for the two stages, one folder for the maps job - and are sized to
+# measured runs rather than to the worst case. A task that exceeds its walltime
+# is killed by SLURM, so raise the relevant flag and resubmit; finished
+# positions are skipped, so a resubmit only re-runs what died.
 SLURM_DEFAULTS = {
     "account": "ajitj99",
     "mail_user": default_mail_user(),
@@ -192,13 +196,13 @@ SLURM_DEFAULTS = {
     "cpu_partition": "standard",
     "infer_env": "cellaap-env",
     "analysis_env": "img-env",
-    "infer_time": "0-03:00:00",
-    "analysis_time": "0-06:00:00",
-    "infer_mem": "16g",
-    "analysis_mem": "24g",
+    "infer_time": "0-00:40:00",
+    "analysis_time": "0-01:00:00",
+    "infer_mem": "12g",
+    "analysis_mem": "25g",
     "analysis_cpus": 1,
-    "maps_time": "0-02:00:00",
-    "maps_mem": "48g",
+    "maps_time": "0-00:30:00",
+    "maps_mem": "20g",
     "infer_concurrent": 4,
     "analysis_concurrent": 12,
 }

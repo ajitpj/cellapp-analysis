@@ -320,10 +320,15 @@ Roughly a minute of CPU for a plate.
 What is *not* small is the memory. `gen_background_correction_map` allocates
 `np.zeros_like(stack, dtype=int)` — int64, four times the int16 it eventually
 writes: 4.7 GB for 150 frames, 14 GB for 450. That buffer, not the arithmetic,
-is why this job asks for 48 GB and why it must not be run on a login node. The
-upstream one-word fix (`dtype=np.int16`, matching what the function already
-writes) would cut it by 4x; it lives in `cellaap_utils`, so it is recommended
-rather than made here.
+is what sizes this job, and it is why it must not be run on a login node.
+
+The default is 20 GB, which covers a 150-frame blank stack with room to spare
+and a 450-frame one not at all. That is a deliberate choice of the common case
+over the worst: the figure is a per-plate request on a shared allocation, and
+`--maps-mem` raises it for the plates that need it. The upstream one-word fix
+(`dtype=np.int16`, matching what the function already writes) would cut the
+requirement by 4x and make the question go away; it lives in `cellaap_utils`,
+so it is recommended rather than made here.
 
 The other cost is self-inflicted and was removed: `create_correction_maps()`
 ends by calling `_load_maps()`, which re-reads every map file in the folder.
@@ -368,13 +373,33 @@ holding queue slots (not resources) while inference runs.
 
 ### Concurrency and resources
 
-Defaults come from the scripts this replaces (`--account ajitj99`, gpu/standard
-partitions, 12 GB per GPU rounded to 16, 20 GB analysis memory rounded to 24;
-the notification address is `$USER@umich.edu`, resolved at submit time because
-SBATCH directives are not shell-expanded)
-with array throttles — 4 concurrent GPU tasks, 12 CPU — chosen to be polite on
-a shared allocation rather than optimal. All are flags; none require editing
-the script, which was the point.
+The account, partitions and conda environments come from the scripts this
+replaces (`--account ajitj99`, gpu/standard); the notification address is
+`$USER@umich.edu`, resolved at submit time because SBATCH directives are not
+shell-expanded. Array throttles — 4 concurrent GPU tasks, 12 CPU — are chosen
+to be polite on a shared allocation rather than optimal.
+
+The walltime and memory figures are sized to a typical position rather than to
+the worst one: 40 min / 12 GB per inference task, 1 h / 25 GB per analysis task,
+30 min / 20 GB for the maps job. The earlier values were roughly three to six
+times these, which is the other defensible choice — and the trade is worth
+stating, because it is a real one:
+
+* **Generous defaults** never lose work to a walltime kill, but every task
+  queues against its *requested* resources, not its actual ones. A 6-hour,
+  24 GB request waits behind shorter jobs on a busy partition, and a 40-position
+  plate multiplies that wait by 40.
+* **Tight defaults** start sooner and schedule denser, at the cost that an
+  atypical position is killed at the limit.
+
+The second is the better default *here* specifically because of §5: a killed
+task leaves no `done` marker, so resubmitting re-runs exactly the positions that
+died and skips everything that finished. The cost of under-requesting is one
+resubmit; the cost of over-requesting is paid on every plate. That reasoning
+depends on the resume behaviour holding — if state ever stops being per
+position, revisit this.
+
+All are flags; none require editing the script, which was the point.
 
 ---
 
