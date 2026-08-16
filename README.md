@@ -14,6 +14,10 @@ This covers the analysis module and the napari curation browser. The upstream
 cellaap inference itself needs `cell_AAP` and `detectron2` and is installed
 separately.
 
+Batch runs across a whole plate (platemap, SLURM array jobs, resume after
+failures) are handled by `pipeline.py`, documented separately in
+[PIPELINE_README.md](PIPELINE_README.md) and [PIPELINE_DESIGN.md](PIPELINE_DESIGN.md).
+
 ## Usage
 
 1. **Specify the root folder**. This folder must contain cellapp-generated inference folders and the raw intensity stacks and is input as a Path object.
