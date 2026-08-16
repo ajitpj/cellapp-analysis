@@ -73,7 +73,7 @@ class analysis:
 
                 case "background":
                     self.paths[channel_name + "_background_map"]  = Path(name)
-                    self.stacks[channel_name + "_background_map"] = imread(Path(name))
+                    self.stacks[channel_name + "_background_map"] = tifffile.imread(Path(name))
                     self.background_map_present = True
                     print(f"{name} used as the {channel_name} background map")
 
@@ -158,16 +158,16 @@ class analysis:
                 if "intensity" in key:
                     intensity_map_name = value.parent / Path(value.stem + "_intensity_map.tif")
                     channel_map = value.stem.split('_')[-1] + "_intensity_map"
-                    self.stacks[channel_map] = gen_intensity_correction_map(imread(str(value)))
-                    tifffile.imsave(intensity_map_name, self.stacks[channel_map].astype(np.float16))
+                    self.stacks[channel_map] = gen_intensity_correction_map(tifffile.imread(str(value)))
+                    tifffile.imwrite(intensity_map_name, self.stacks[channel_map].astype(np.float16))
                     self.paths[channel_map] = intensity_map_name
                     print(f"Intensity map saved in the data dir. as {intensity_map_name}")
 
                 elif "background" in key:
                     background_map_name = value.parent / Path(value.stem + "_background_map.tif")
                     channel_map = value.stem.split('_')[-1] + "_background_map"
-                    self.stacks[channel_map] = gen_background_correction_map(imread(str(value)))
-                    tifffile.imsave(background_map_name, self.stacks[channel_map].astype(np.int16))
+                    self.stacks[channel_map] = gen_background_correction_map(tifffile.imread(str(value)))
+                    tifffile.imwrite(background_map_name, self.stacks[channel_map].astype(np.int16))
                     self.paths[channel_map] = background_map_name
                     print(f"Background map saved in the data dir. as {background_map_name}")
             
