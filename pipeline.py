@@ -1035,7 +1035,8 @@ def load_flatfield(root: Path, channel: str):
 def cmd_flatfield(args) -> int:
     """Build the plate's flat fields from the blank wells named in the platemap."""
     root = Path(args.root).resolve()
-    rows = read_platemap(platemap_path(root))
+    mapfile = Path(args.map).resolve() if getattr(args, "map", None) else platemap_path(root)
+    rows = read_platemap(mapfile)
     positions = discover_positions(root, args.pattern)
     _, map_wells, _ = build_tasks(root, positions, rows)
 
@@ -2025,6 +2026,12 @@ python pipeline.py {stage} \\
     --map {jobdir}/platemap.csv{stage_args}
 """
 
+# Every stage the template can launch. SBATCH_TEMPLATE passes --root and --map
+# to all of them, so a stage listed here that does not accept --map dies on
+# argparse the moment SLURM starts it - which is a long way from where the
+# mistake was made. build_parser asserts the flag exists on each of these.
+SBATCH_STAGES = ("infer", "analyze", "flatfield", "maps")
+
 # One array task = one position.
 ARRAY_ARGS = (' \\\n'
               '    --tasks {jobdir}/{tasks} \\\n'
@@ -2356,6 +2363,12 @@ def build_parser() -> argparse.ArgumentParser:
         "flatfield",
         help="build the plate's flat fields from the blank wells (runs before "
              "the analysis array)"))
+    # Every stage SBATCH_TEMPLATE launches is passed --map, so a stage that
+    # does not accept it dies on argparse before it runs. This one is
+    # submitted by `submit`, so it needs the flag - and it should honour it,
+    # since the point of the frozen copy is that a resubmitted job sees the
+    # platemap the run started with rather than one edited since.
+    sp.add_argument("--map", help="platemap to use (default: <root>/platemap.csv)")
     sp.add_argument("--force", action="store_true",
                     help="rebuild even if already built")
     sp.set_defaults(func=cmd_flatfield)
@@ -2434,6 +2447,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help=f"run wells missing from the platemap as {DEFAULT_CELLTYPE}")
     sp.set_defaults(func=cmd_submit)
 
+    # A stage submitted to SLURM but missing a flag the template always sends
+    # fails on the compute node, minutes or hours after submit looked fine.
+    # Catch it here instead: this runs on every invocation and costs nothing.
+    launched = {name: parser for name, parser in
+                sub.choices.items() if name in SBATCH_STAGES}
+    missing = [name for name, parser in launched.items()
+               if not any(a.dest == "map" for a in parser._actions)]
+    if missing:
+        raise AssertionError(
+            f"SBATCH_TEMPLATE passes --map to every stage it launches, but "
+            f"{', '.join(sorted(missing))} do(es) not accept it; those jobs "
+            f"would die on argparse under SLURM")
     return p
 
 
