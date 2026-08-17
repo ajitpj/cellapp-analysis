@@ -26,6 +26,7 @@ __all__ = [
     "gen_intensity_correction_map",
     "gen_background_correction_map",
     "mean_signal_from_mask",
+    "window_stats",
     "calculate_signal",
     "calculate_displacement",
 ]
@@ -138,38 +139,36 @@ def mean_signal_from_mask(img: npt.NDArray, mask: npt.NDArray):
     return mean_signal
 
 
+def window_stats(window, values, empty_mean=0.0):
+    '''
+    Mean and standard deviation of one per-frame trace over a track's window.
+
+    The generic form of `calculate_signal` below, which is fixed at four
+    named traces. `summarize_data` needs to average whatever per-channel
+    columns happen to be present - the raw signal, the two map corrections,
+    and now the position-specific corrected signal - so it loops over columns
+    and calls this instead of taking a fixed tuple apart.
+
+    `empty_mean` is what an all-zero trace reports: 0 for something that is
+    added or subtracted, 1 for something that divides, which is what keeps a
+    missing correction from zeroing a signal downstream.
+    '''
+    values = np.asarray(values)
+    if values.any():
+        selected = values[np.where(window)]
+        return np.nanmean(selected), np.nanstd(selected)
+    return empty_mean, 0.0
+
+
 def calculate_signal(semantic, signal, bkg_corr, int_corr, area, footprint):
     '''
     utility function for calculating signal from the given semantic, signal, and bkg traces
     '''
-    
-    if signal.any():
-        signal_mean = np.nanmean(signal[np.where(semantic)])
-        signal_std = np.nanstd(signal[np.where(semantic)])
-    else:
-        signal_mean = 0
-        signal_std = 0
-    
-    if bkg_corr.any():
-        bkg_corr_mean = np.nanmean(bkg_corr[np.where(semantic)])
-        bkg_corr_std = np.nanstd(bkg_corr[np.where(semantic)])
-    else:
-        bkg_corr_mean = 0
-        bkg_corr_std = 0
 
-    if int_corr.any():
-        int_corr_mean = np.nanmean(int_corr[np.where(semantic)])
-        int_corr_std = np.nanstd(int_corr[np.where(semantic)])
-    else:
-        int_corr_mean = 1
-        int_corr_std = 0
-
-    if area.any():
-        area_mean = np.nanmean(area[np.where(semantic)])
-        area_std = np.nanstd(area[np.where(semantic)])
-    else:
-        area_mean = 1
-        area_std = 0
+    signal_mean, signal_std     = window_stats(semantic, signal, 0)
+    bkg_corr_mean, bkg_corr_std = window_stats(semantic, bkg_corr, 0)
+    int_corr_mean, int_corr_std = window_stats(semantic, int_corr, 1)
+    area_mean, area_std         = window_stats(semantic, area, 1)
 
     return signal_mean, bkg_corr_mean, int_corr_mean, area_mean, signal_std, bkg_corr_std, int_corr_std, area_std
 

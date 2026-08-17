@@ -61,7 +61,7 @@ import subprocess
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from datetime import datetime
 from pathlib import Path
 
@@ -342,6 +342,10 @@ class Task:
     channels: list[str]
     mapped: bool           # False when the well fell through to the default
     root: Path
+    # signal_correction knobs, carried on the task so that changing one marks
+    # finished positions stale rather than silently leaving them uncorrected
+    # under the old settings.
+    correction_params: dict = dc_field(default_factory=dict)
 
     @property
     def stem(self) -> str:
@@ -362,7 +366,10 @@ class Task:
                     "conf_threshold": round(self.conf_threshold, 2)}
         return {"cell_type": self.analysis_cell_type,
                 "channels": sorted(self.channels),
-                "inference_dir": self.inference_dir.name}
+                "inference_dir": self.inference_dir.name,
+                # Changing how the signal is corrected has to re-run the
+                # analysis, the same as changing the cell type would.
+                "correction": dict(self.correction_params)}
 
 
 def discover_positions(root: Path, pattern: str = "*phs.tif") -> list[Position]:
@@ -712,8 +719,20 @@ def quarantine_stale_maps(root: Path, pair: MapPair) -> list[Path]:
     return moved
 
 
+def correction_params(args) -> dict:
+    """The signal_correction knobs, from whichever subcommand is running.
+
+    Every subcommand carries the same three flags with the same defaults, so
+    this returns the same dict everywhere and a finished position only reports
+    stale when the operator actually changed one.
+    """
+    return {"dilation": getattr(args, "correction_dilation", 121),
+            "n_frames": getattr(args, "correction_frames", 24),
+            "block": getattr(args, "correction_block", 64)}
+
+
 def build_tasks(root: Path, positions: list[Position], rows: list[PlateRow],
-                autodetect_channels: bool = True
+                autodetect_channels: bool = True, correction: dict | None = None
                 ) -> tuple[list[Task], list[MapWell], list[str]]:
     """Join positions to platemap rows. Returns (tasks, map_wells, warnings).
 
@@ -802,6 +821,7 @@ def build_tasks(root: Path, positions: list[Position], rows: list[PlateRow],
             drug=row.drug, model=model, confluency_est=confluency,
             conf_threshold=threshold, analysis_cell_type=analysis_cell_type,
             channels=channels, mapped=mapped, root=root,
+            correction_params=dict(correction or {}),
         ))
 
     # A row covering a whole plate row (B01-B12) when only three wells were
@@ -904,6 +924,186 @@ def stage_status(root: Path, task: Task, stage: str) -> str:
 # walks the whole root folder looking for those words in a file name and tries
 # to imread whatever it finds, so a state file named after a role would be
 # read as an image and crash every analysis in the plate.
+# ---------------------------------------------------------------------------
+# Flat fields for signal_correction
+#
+# The correction this pipeline applies is signal_correction's: the background
+# is measured per position from that position's own frames, and the flat field
+# - which is a property of the optics, not of the well - is built once for the
+# plate from the *difference* of the two blank wells. The difference is what
+# cancels the camera offset, which neither blank alone can be separated from;
+# see SIGNAL_CORRECTION_DESIGN.md section 4.
+#
+# The old `*_map.tif` correction maps are no longer built. `pipeline.py maps`
+# still exists for reproducing an old run by hand, but nothing submits it.
+# ---------------------------------------------------------------------------
+
+def flatfield_dir(root: Path) -> Path:
+    return pipeline_dir(root) / "state" / "flatfield"
+
+
+def flatfield_path(root: Path, channel: str) -> Path:
+    """Where this channel's flat field is cached.
+
+    The file name must contain neither "background" nor "intensity":
+    cellaap_analysis._load_maps walks the whole root looking for those words
+    and tries to imread whatever it finds. Channel names are safe on that
+    count; the space in "Texas Red" is not safe as a file name, so it goes.
+    """
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", channel).strip("_")
+    return flatfield_dir(root) / f"{safe}.npz"
+
+
+def flatfield_sources(root: Path, map_wells: list[MapWell]
+                      ) -> tuple[dict[str, tuple[Path, Path]], list[str]]:
+    """Per channel, the (bright, dim) blank stacks a flat field needs.
+
+    Reuses the platemap's existing blank-well roles: the DMEM well (role
+    `intensity`) is the bright one and the FluoroBrite well (role
+    `background`) the dim one. `verify_map_roles` has already swapped them if
+    the measured means say the platemap had them the wrong way round, so this
+    reads whatever survived that check rather than trusting the labels.
+
+    A channel with only one blank declared gets no flat field, and its
+    positions are corrected for background only - which is the larger of the
+    two errors anyway.
+    """
+    pairs, warnings = resolve_correction_maps(root, map_wells)
+    pairs, checks = verify_map_roles(pairs)
+
+    by_channel: dict[str, dict[str, Path]] = {}
+    for pair in pairs:
+        by_channel.setdefault(pair.channel, {})[pair.role] = pair.source
+
+    sources, notes = {}, list(warnings)
+    for channel, roles in sorted(by_channel.items()):
+        bright, dim = roles.get("intensity"), roles.get("background")
+        if bright and dim:
+            sources[channel] = (bright, dim)
+        else:
+            have = "dmem" if bright else "fluorobrite"
+            notes.append(f"{channel}: only the {have} blank well is declared, so "
+                         f"no flat field can be built - positions will be "
+                         f"corrected for background only")
+    return sources, notes
+
+
+def flatfield_status(root: Path, channel: str) -> str:
+    return "built" if flatfield_path(root, channel).exists() else "pending"
+
+
+def build_flatfield(root: Path, channel: str, bright: Path, dim: Path,
+                    frames: int = 12) -> dict:
+    """Build and cache one channel's flat field. Returns its provenance."""
+    import numpy as np
+    import tifffile
+    import signal_correction as sc
+
+    def sample(path: Path):
+        with tifffile.TiffFile(path) as fh:
+            n = fh.series[0].shape[0] if fh.series[0].ndim == 3 else 1
+            step = max(1, n // frames)
+            return tifffile.imread(path, key=range(0, n, step))
+
+    flat = sc.flatfield_from_blank_pair(sample(bright), sample(dim))
+    meta = {
+        "channel": channel,
+        "bright_source": bright.name,
+        "dim_source": dim.name,
+        "centre_edge": round(sc.centre_edge_ratio(flat), 4),
+        "min": round(float(flat.min()), 4),
+        "max": round(float(flat.max()), 4),
+        "built": now(),
+    }
+    path = flatfield_path(root, channel)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, flatfield=flat, meta=json.dumps(meta))
+    return meta
+
+
+def load_flatfield(root: Path, channel: str):
+    """The cached flat field and its provenance, or (None, None)."""
+    import numpy as np
+
+    path = flatfield_path(root, channel)
+    if not path.exists():
+        return None, None
+    with np.load(path, allow_pickle=False) as z:
+        return z["flatfield"], json.loads(str(z["meta"]))
+
+
+def cmd_flatfield(args) -> int:
+    """Build the plate's flat fields from the blank wells named in the platemap."""
+    root = Path(args.root).resolve()
+    rows = read_platemap(platemap_path(root))
+    positions = discover_positions(root, args.pattern)
+    _, map_wells, _ = build_tasks(root, positions, rows)
+
+    sources, notes = flatfield_sources(root, map_wells)
+    for note in dict.fromkeys(notes):
+        log(f"  ! {note}")
+    if not sources:
+        log("No channel has both blank wells declared in the platemap, so no "
+            "flat field is built. Every position will be corrected for "
+            "background only.")
+        return 0
+
+    todo = [c for c in sources
+            if args.force or flatfield_status(root, c) == "pending"]
+    if not todo:
+        log("Every flat field is already built.")
+        for channel in sources:
+            _, meta = load_flatfield(root, channel)
+            log(f"  {channel:<10} centre/edge {meta['centre_edge']} "
+                f"from {meta['bright_source'][:40]}")
+        return 0
+
+    tee = tee_to(root, "flatfield", "flatfield")
+    saved, sys.stdout = sys.stdout, tee
+    failures = 0
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        for channel in todo:
+            bright, dim = sources[channel]
+            started = time.time()
+            try:
+                log(f"[{now()}] {channel}: bright {bright.name}")
+                log(f"           dim    {dim.name}")
+                meta = build_flatfield(root, channel, bright, dim)
+                log(f"  centre/edge {meta['centre_edge']}, range "
+                    f"{meta['min']}-{meta['max']}, {time.time()-started:.0f}s")
+            except Exception as exc:
+                failures += 1
+                log(f"  ! {channel}: {exc}")
+                log(traceback.format_exc())
+    finally:
+        sys.stdout = saved
+        tee.flush()
+
+    built = [c for c in sources if flatfield_status(root, c) == "built"]
+    ratios = {}
+    for channel in built:
+        _, meta = load_flatfield(root, channel)
+        ratios[channel] = meta["centre_edge"]
+        log(f"{channel:<10} centre/edge {meta['centre_edge']}")
+    # The flat field is a property of the optics, so every channel should
+    # measure the same vignette. Two channels disagreeing means one of the
+    # blank pairs is not what the platemap says it is.
+    if len(ratios) > 1:
+        spread = max(ratios.values()) - min(ratios.values())
+        if spread > 0.05:
+            log(f"  ! the channels disagree on the vignette by {spread:.3f} "
+                f"({ratios}); a flat field is optics, so they should agree to "
+                f"~0.01. Check that both blank wells are what the platemap says.")
+        else:
+            log(f"  channels agree on the vignette to {spread:.3f} - good")
+    if built:
+        log("")
+        log("Positions analyzed before this was built keep their old numbers; "
+            "re-run them with  pipeline.py submit --force-analysis")
+    return 1 if failures else 0
+
+
 def maps_ledger_path(root: Path) -> Path:
     return pipeline_dir(root) / "state" / "maps" / "corrections.json"
 
@@ -1106,54 +1306,70 @@ def cmd_infer(args) -> int:
 # Stage 2: analysis (img-env, CPU)
 # ---------------------------------------------------------------------------
 
-def write_corrections_sheet(session, task: Task, root: Path) -> None:
+def write_corrections_sheet(session, task: Task, root: Path,
+                            corrections: list[dict] | None = None) -> None:
     """Append a `corrections` sheet to this position's summary workbook.
 
     The summary is the file that outlives the run, so the provenance of the
-    correction applied to its numbers belongs in it: which blank well each map
-    came from, whether that well was labeled the right way round in the
-    platemap, and whether the map was actually loaded for this position. A
-    position measured with no corrections says so, which is equally worth
-    knowing later.
+    correction applied to its numbers belongs in it. Two things are recorded,
+    because two corrections can be present at once:
+
+    * what `signal_correction` did for this position - the background it
+      measured, how far it drifted, how close to cells it had to work, and
+      which blank pair the flat field came from. This is the correction behind
+      the `<ch>_corrected` columns, and the one to read.
+    * whether the legacy `*_map.tif` files were also on disk and loaded by
+      cellaap_analysis, which is what the `<ch>_bkg_corr` / `<ch>_int_corr`
+      columns carry. The pipeline no longer builds those, but a folder from an
+      earlier run still has them, and a reader months later needs to know that
+      the two sets of numbers are not the same correction.
     """
     import pandas as pd
 
-    ledger = read_maps_ledger(root)
-    applied = {"background": session.background_map_present,
-               "intensity": session.intensity_map_present}
-
     rows = []
-    for role in MAP_ROLES:
-        entries = [e for e in ledger.values() if e.get("role") == role]
-        if not entries:
-            rows.append({"role": role, "channel": "", "source_well": "",
-                         "source_file": "", "map_file": "",
-                         "role_check": "no blank well declared",
-                         "dmem_mean": "", "fluorobrite_mean": "",
-                         "applied_to_this_position": "no"})
-            continue
-        for e in entries:
-            check = e.get("role_check", {})
-            rows.append({
-                "role": role,
-                "channel": e.get("channel", ""),
-                "source_well": e.get("source_well", ""),
-                "source_file": e.get("source", ""),
-                "map_file": e.get("output", ""),
-                "role_check": check.get("verdict", "not-checked"),
-                "dmem_mean": check.get("dmem_mean", ""),
-                "fluorobrite_mean": check.get("fluorobrite_mean", ""),
-                "applied_to_this_position": "yes" if applied[role] else "no",
-            })
+    for record in (corrections or []):
+        rows.append({
+            "correction": "signal_correction (per position)",
+            "channel": record.get("channel", ""),
+            "applied": "yes",
+            "flatfield_from": record.get("flatfield", "") or "none - background only",
+            "flatfield_centre_edge": record.get("flatfield_centre_edge", ""),
+            "background_counts": record.get("background_mean_range", ""),
+            "background_drift_percent": round(
+                float(record.get("background_drift_percent", 0)), 1),
+            "dilation_used_px": record.get("dilation_used", ""),
+            "unusable_block_fraction": round(
+                float(record.get("unusable_block_fraction", 0)), 3),
+            "frames_sampled": record.get("n_frames_sampled", ""),
+            "background_model": record.get("background_model", ""),
+        })
+    if not rows:
+        rows.append({"correction": "signal_correction (per position)",
+                     "channel": "", "applied": "no",
+                     "flatfield_from": "", "flatfield_centre_edge": "",
+                     "background_counts": "", "background_drift_percent": "",
+                     "dilation_used_px": "", "unusable_block_fraction": "",
+                     "frames_sampled": "", "background_model": ""})
+
+    legacy = {"background": session.background_map_present,
+              "intensity": session.intensity_map_present}
+    for role, present in legacy.items():
+        rows.append({
+            "correction": f"legacy {role} map (not built by this pipeline)",
+            "channel": "", "applied": "yes" if present else "no",
+            "flatfield_from": "", "flatfield_centre_edge": "",
+            "background_counts": "", "background_drift_percent": "",
+            "dilation_used_px": "", "unusable_block_fraction": "",
+            "frames_sampled": "", "background_model": "",
+        })
     frame = pd.DataFrame(rows)
 
-    swapped = [r for r in rows if r["role_check"] == "swapped"]
-    note = ("The platemap had the two blank wells the wrong way round; the "
-            "pipeline swapped them, so the maps named here come from the wells "
-            "listed, NOT from the wells the platemap labeled."
-            if swapped else
-            "dmem well -> intensity map, fluorobrite well -> background map, "
-            "confirmed by the dmem well being the brighter of the two.")
+    note = ("`<ch>_corrected` is signal_correction's number: background measured "
+            "from this position's own frames, illumination from the difference "
+            "of the two blank wells. `<ch>` is raw. `<ch>_bkg_corr` and "
+            "`<ch>_int_corr` come from the legacy *_map.tif files if any were "
+            "still in the folder, and are a DIFFERENT correction - do not mix "
+            "them with `<ch>_corrected`. See SIGNAL_CORRECTION_README.md.")
 
     for summary in sorted(task.inference_dir.glob("*_summary*.xlsx")):
         try:
@@ -1175,8 +1391,83 @@ def write_corrections_sheet(session, task: Task, root: Path) -> None:
             log(f"  ! could not add the corrections sheet to {summary.name} ({exc})")
 
 
-def run_analysis_one(session, task: Task, semantic_gap: int | None) -> None:
-    """Track, measure and summarize one inference folder."""
+def apply_signal_correction(session, task: Task, args) -> list[dict]:
+    """Add `<ch>_corrected` to this position's per-frame table.
+
+    Runs after every channel has been measured and before summarize_data, so
+    the corrected signal is in `cell_data` - where the per-frame dynamics can
+    be recovered from it - and gets averaged into the summary along with
+    everything else.
+
+    The background is estimated from this position's own frames. The flat
+    field is the plate's, built earlier by `pipeline.py flatfield`; when the
+    platemap declares no blank pair for a channel there is none, and that
+    channel is corrected for background only.
+    """
+    import numpy as np
+    import tifffile
+    import signal_correction as sc
+
+    records = []
+    labels = session.stacks.get("instance")
+    if labels is None:
+        log("  ! no instance stack in memory; signal correction skipped")
+        return records
+
+    for channel in task.channels:
+        if channel not in session.paths or channel not in session.tracked.columns:
+            continue
+        flat, flat_meta = load_flatfield(task.root, channel)
+
+        with tifffile.TiffFile(session.paths[channel]) as fh:
+            stack = fh.series[0].asarray(out="memmap")
+            correction = sc.estimate_position_correction(
+                stack, stem=task.stem, channel=channel, labels=labels,
+                flatfield=flat, n_frames=args.correction_frames,
+                block=args.correction_block, dilation=args.correction_dilation)
+
+            # Centroids are at segmentation scale; the fluorescence frame is
+            # bigger by whatever the inference downsampling was. Derive the
+            # factor from the two shapes rather than assuming the 2x that
+            # cellaap currently uses - a different binning would otherwise
+            # sample the correction from the wrong part of the field, silently.
+            frame_shape = stack.shape[-2:]
+        scale_y = frame_shape[0] / labels.shape[-2]
+        scale_x = frame_shape[1] / labels.shape[-1]
+
+        session.tracked[f"{channel}_corrected"] = correction.correct_measurements(
+            session.tracked[channel].to_numpy(dtype=float),
+            session.tracked["x"].to_numpy(dtype=float) * scale_x,
+            session.tracked["y"].to_numpy(dtype=float) * scale_y,
+            session.tracked["frame"].to_numpy(dtype=int))
+
+        d = correction.diagnostics
+        measured = session.tracked[f"{channel}_corrected"].notna().sum()
+        log(f"  corrected {channel}: background "
+            f"{d['background_mean_range'][0]:.1f}-{d['background_mean_range'][1]:.1f} "
+            f"counts (drift {d['background_drift_percent']:.0f}%), "
+            f"dilation {d['dilation_used']}, "
+            f"{100*d['unusable_block_fraction']:.0f}% blocks unusable, "
+            f"flat field {'yes' if flat is not None else 'NO - background only'}, "
+            f"{measured} rows")
+        records.append({
+            "channel": channel,
+            "scale": round(scale_x, 3),
+            "flatfield": flat_meta["bright_source"] if flat_meta else "",
+            "flatfield_dim_source": flat_meta["dim_source"] if flat_meta else "",
+            "flatfield_centre_edge": flat_meta["centre_edge"] if flat_meta else "",
+            **{k: (json.dumps(v) if isinstance(v, list) else v)
+               for k, v in d.items()},
+        })
+
+    if records:
+        session.write_analysis_file()
+    return records
+
+
+def run_analysis_one(session, task: Task, semantic_gap: int | None,
+                     args=None) -> None:
+    """Track, measure, correct and summarize one inference folder."""
     import numpy as np
 
     if not inference_outputs_present(task):
@@ -1201,8 +1492,16 @@ def run_analysis_one(session, task: Task, semantic_gap: int | None) -> None:
             continue
         log(f"  measuring {channel} ...")
         session.measure_signal(channel, True, -1)
+
+    # Correction before the summary, deliberately. summarize_data averages
+    # whatever per-channel columns it finds over each track's window, so
+    # `<ch>_corrected` only reaches the summary if it is on the table first -
+    # and analysis_outputs_present keys on the summary existing, so a position
+    # whose correction failed reports pending rather than finished-but-wrong.
+    corrections = apply_signal_correction(session, task, args) if args else []
+
     session.summarize_data(True)
-    write_corrections_sheet(session, task, task.root)
+    write_corrections_sheet(session, task, task.root, corrections)
 
 
 def cmd_analyze(args) -> int:
@@ -1219,8 +1518,15 @@ def cmd_analyze(args) -> int:
     session = cellaap_analysis.analysis(root, plotting_only=False)
     # Say it once, up front: which corrections these numbers carry is the kind
     # of thing that has to be recoverable from the log months later.
-    log(f"corrections: background map {'yes' if session.background_map_present else 'no'}, "
-        f"intensity map {'yes' if session.intensity_map_present else 'no'}")
+    built = [c for c in ("GFP", "Texas Red", "Cy5")
+             if flatfield_status(root, c) == "built"]
+    log(f"signal_correction: background measured per position; flat field "
+        f"{'for ' + ', '.join(built) if built else 'NOT built - background only'}")
+    if session.background_map_present or session.intensity_map_present:
+        log(f"  legacy *_map.tif files are also on disk and loaded "
+            f"(background {'yes' if session.background_map_present else 'no'}, "
+            f"intensity {'yes' if session.intensity_map_present else 'no'}); "
+            f"they fill <ch>_bkg_corr/<ch>_int_corr, NOT <ch>_corrected")
     failures = 0
     for i, task in enumerate(tasks, start=1):
         tee = tee_to(root, "analysis", task.stem)
@@ -1230,7 +1536,7 @@ def cmd_analyze(args) -> int:
             log(f"[{now()}] analysis {i}/{len(tasks)}: {task.stem} "
                 f"(cell_type={task.analysis_cell_type}, "
                 f"channels={task.channels or 'none'})")
-            run_analysis_one(session, task, args.semantic_gap)
+            run_analysis_one(session, task, args.semantic_gap, args)
             outputs = sorted(p.name for p in task.inference_dir.glob("*.xlsx"))
             write_state(root, "analysis", task, "done", started, outputs=outputs)
             log(f"[{now()}] done in {time.time() - started:.0f}s")
@@ -1262,7 +1568,8 @@ def load_tasks_for_run(root: Path, args) -> list[Task]:
     mapfile = Path(args.map).resolve() if getattr(args, "map", None) else platemap_path(root)
     rows = read_platemap(mapfile)
     positions = discover_positions(root, args.pattern)
-    tasks, map_wells, warnings = build_tasks(root, positions, rows)
+    tasks, map_wells, warnings = build_tasks(
+        root, positions, rows, correction=correction_params(args))
 
     if getattr(args, "tasks", None):
         wanted = [ln.strip() for ln in Path(args.tasks).read_text().splitlines()
@@ -1335,7 +1642,8 @@ def cmd_check(args) -> int:
     positions = discover_positions(root, args.pattern)
     if not positions:
         die(f"no files matching {args.pattern} in {root}")
-    tasks, map_wells, warnings = build_tasks(root, positions, rows)
+    tasks, map_wells, warnings = build_tasks(
+        root, positions, rows, correction=correction_params(args))
 
     problems: list[str] = []
     for task in tasks:
@@ -1363,7 +1671,19 @@ def cmd_check(args) -> int:
     pairs, map_warnings = resolve_correction_maps(root, map_wells)
     warnings.extend(map_warnings)
     pairs, role_checks = verify_map_roles(pairs)
-    problems.extend(check_map_files(root, pairs))
+    ff_sources, ff_notes = flatfield_sources(root, map_wells)
+    warnings.extend(ff_notes)
+    # Legacy *_map.tif files are no longer built, but cellaap_analysis still
+    # loads any it finds, so a folder from an earlier run needs saying so.
+    stale_maps = [p.name for role in MAP_ROLES for channel in
+                  {q.channel for q in pairs}
+                  for p in find_map_files(root, channel, role)]
+    if stale_maps:
+        warnings.append(
+            f"{len(stale_maps)} legacy *_map.tif file(s) are still in the "
+            f"folder and will be loaded into <ch>_bkg_corr/<ch>_int_corr. "
+            f"They are a different correction from <ch>_corrected; the "
+            f"pipeline no longer builds them")
 
     log(f"Root:      {root}")
     log(f"Platemap:  {platemap_path(root)}")
@@ -1392,22 +1712,26 @@ def cmd_check(args) -> int:
         log(f"* well not in the platemap; defaulted to {DEFAULT_CELLTYPE}")
 
     log("")
+    log("Signal correction:")
+    log(f"  background   measured per position from its own frames "
+        f"(dilation {args.correction_dilation} px, "
+        f"{args.correction_frames} frames) - always applied")
     if map_wells:
-        log("Correction maps (built once, before the analysis):")
         for line in report_role_checks(role_checks):
             log(line)
         if any(c.verdict == "swapped" for c in role_checks):
             log("  the sources below are AFTER that swap")
-        for pair in pairs:
-            log(f"  {pair.role:<10} {pair.channel:<10} from "
-                f"{pair.source.name[:52]:<53} {map_status(pair)}")
-        missing_role = [r for r in MAP_ROLES if not any(p.role == r for p in pairs)]
-        for role in missing_role:
-            log(f"  {role:<10} -          no well declared; that correction "
-                f"will not be applied")
+        if ff_sources:
+            for channel, (bright, dim) in sorted(ff_sources.items()):
+                state = flatfield_status(root, channel)
+                log(f"  flat field   {channel:<10} {state:<8} from "
+                    f"{bright.name[:34]:<35} - {dim.name[:34]}")
+        else:
+            log("  flat field   no channel has BOTH blank wells declared, so "
+                "illumination is not corrected")
     else:
-        log("Correction maps: no background/intensity wells in the platemap, "
-            "so the analysis will run uncorrected.")
+        log("  flat field   no blank wells in the platemap; positions get the "
+            "background correction only")
 
     pending_inf = counts["inference"].get("pending", 0) + counts["inference"].get("stale", 0)
     pending_ana = counts["analysis"].get("pending", 0) + counts["analysis"].get("stale", 0)
@@ -1446,7 +1770,8 @@ def cmd_status(args) -> int:
     root = Path(args.root).resolve()
     rows = read_platemap(platemap_path(root))
     positions = discover_positions(root, args.pattern)
-    tasks, map_wells, _ = build_tasks(root, positions, rows)
+    tasks, map_wells, _ = build_tasks(
+        root, positions, rows, correction=correction_params(args))
 
     records = []
     for task in tasks:
@@ -1470,20 +1795,16 @@ def cmd_status(args) -> int:
         for stage in ("inference", "analysis"):
             counts[stage][rec[stage]] = counts[stage].get(rec[stage], 0) + 1
 
-    pairs, _ = resolve_correction_maps(root, map_wells)
-    map_counts = {}
-    for pair in pairs:
-        s = map_status(pair)
-        map_counts[s] = map_counts.get(s, 0) + 1
-
-    log(f"{len(records)} position(s) under {root}")
-    log(f"  inference: {fmt_counts(counts['inference'])}")
-    log(f"  analysis:  {fmt_counts(counts['analysis'])}")
-    if pairs:
-        log(f"  maps:      {fmt_counts(map_counts)} "
-            f"({len(map_wells)} blank-media position(s))")
+    ff_sources, _ = flatfield_sources(root, map_wells)
+    ff_counts = {}
+    for channel in ff_sources:
+        s = flatfield_status(root, channel)
+        ff_counts[s] = ff_counts.get(s, 0) + 1
+    if ff_sources:
+        log(f"  flat field: {fmt_counts(ff_counts)} "
+            f"({', '.join(sorted(ff_sources))})")
     else:
-        log(f"  maps:      none declared; analysis runs uncorrected")
+        log(f"  flat field: no blank pair declared; background correction only")
 
     failed = [(r, s) for r in records for s in ("inference", "analysis")
               if r[s] == "failed"]
@@ -1733,7 +2054,8 @@ def cmd_submit(args) -> int:
     module_dir = Path(__file__).resolve().parent
     rows = read_platemap(platemap_path(root))
     positions = discover_positions(root, args.pattern)
-    tasks, map_wells, warnings = build_tasks(root, positions, rows)
+    tasks, map_wells, warnings = build_tasks(
+        root, positions, rows, correction=correction_params(args))
     if not tasks:
         die("the platemap leaves nothing to run")
 
@@ -1844,23 +2166,24 @@ def cmd_submit(args) -> int:
             env=args.analysis_env, stage="analyze",
             stage_args=array + analysis_args, **common))
 
-    # The correction maps are plate-wide and every analysis task reads them at
-    # start-up, so they are built once, in their own job, before any analysis
-    # array is released. Building them inside an array instead would have all
-    # the tasks racing to write the same files.
-    pairs, map_warnings = resolve_correction_maps(root, map_wells)
-    for w in dict.fromkeys(map_warnings):
+    # The flat field is plate-wide - it is a property of the optics, not of a
+    # position - so it is built once, in its own job, before any analysis array
+    # is released. Building it inside the array instead would have every task
+    # racing to write the same file. The per-position background needs no such
+    # job: each analysis task measures its own.
+    ff_sources, ff_notes = flatfield_sources(root, map_wells)
+    for w in dict.fromkeys(ff_notes):
         log(f"  ! {w}")
-    pending_maps = [p for p in pairs if map_status(p) == "pending"]
+    pending_ff = [c for c in ff_sources if flatfield_status(root, c) == "pending"]
     maps_sbatch = None
-    if pending_maps:
-        maps_sbatch = jobdir / "maps.sbatch"
+    if pending_ff:
+        maps_sbatch = jobdir / "flatfield.sbatch"
         maps_sbatch.write_text(SBATCH_TEMPLATE.format(
-            job_name=f"{name}_map", partition=args.cpu_partition,
+            job_name=f"{name}_flat", partition=args.cpu_partition,
             extra_directives=f"#SBATCH --mem={args.maps_mem}\n",
             cpus=1, walltime=args.maps_time, array_directive="",
             output_pattern="%x_%j.out",
-            env=args.analysis_env, stage="maps",
+            env=args.analysis_env, stage="flatfield",
             stage_args=pattern_arg, **common))
 
     log("")
@@ -1882,13 +2205,17 @@ def cmd_submit(args) -> int:
         f"{args.analysis_time}, {args.analysis_concurrent} at a time, "
         f"env {args.analysis_env}"
         f"{', forced re-run' if args.force_analysis else ''}")
-    if pairs:
-        built = len(pairs) - len(pending_maps)
-        log(f"  maps          : {len(pending_maps)} to build"
-            f"{f' ({built} already built)' if built else ''}, "
+    if ff_sources:
+        done_ff = len(ff_sources) - len(pending_ff)
+        log(f"  flat field    : {len(pending_ff)} channel(s) to build"
+            f"{f' ({done_ff} already built)' if done_ff else ''}, "
             f"{args.maps_mem}, {args.maps_time}")
     else:
-        log(f"  maps          : none declared; analysis runs uncorrected")
+        log(f"  flat field    : no blank pair declared; positions are corrected "
+            f"for background only")
+    log(f"  background    : measured per position inside each analysis task "
+        f"(dilation {args.correction_dilation} px, "
+        f"{args.correction_frames} frames)")
 
     if not args.sbatch:
         log("")
@@ -1910,18 +2237,18 @@ def cmd_submit(args) -> int:
         die("sbatch not found on this machine; run submit from a login node "
             "or use the printed commands there")
 
-    # Maps first: both analysis arrays depend on them, and a failure here is
-    # the one case where submitting nothing else is the right answer.
+    # Flat field first: both analysis arrays depend on it, and a failure here
+    # is the one case where submitting nothing else is the right answer.
     maps_job = ""
     if maps_sbatch:
         maps_job, err = submit_one(maps_sbatch)
         if err:
-            die(f"sbatch failed for the correction-map job ({err}); "
+            die(f"sbatch failed for the flat-field job ({err}); "
                 f"nothing else was submitted")
-        log(f"submitted correction-map job {maps_job}")
+        log(f"submitted flat-field job {maps_job}")
     maps_dep = f"afterok:{maps_job}" if maps_job else ""
 
-    jobids = {"maps": maps_job, "submitted": now()}
+    jobids = {"flatfield": maps_job, "submitted": now()}
     failed = False
 
     if ready_sbatch:
@@ -2001,6 +2328,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="folder holding the *phs.tif stacks")
         sp.add_argument("--pattern", default="*phs.tif",
                         help="glob for the phase stacks (default: %(default)s)")
+        # These live on every subcommand on purpose. They go into the analysis
+        # stage's parameter fingerprint, so if `check` and `analyze` disagreed
+        # about their defaults every finished position would report stale.
+        sp.add_argument("--correction-dilation", type=int, default=121,
+                        metavar="PX",
+                        help="how far from a cell the background is measured, "
+                             "in fluorescence pixels (default: %(default)s)")
+        sp.add_argument("--correction-frames", type=int, default=24,
+                        metavar="N",
+                        help="frames sampled per position for the background "
+                             "(default: %(default)s)")
+        sp.add_argument("--correction-block", type=int, default=64,
+                        metavar="PX",
+                        help="block size for the background grid "
+                             "(default: %(default)s)")
         return sp
 
     sp = common(sub.add_parser("init", help="write a platemap template for this folder"))
@@ -2009,6 +2351,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = common(sub.add_parser("check", help="validate the platemap and show the plan"))
     sp.set_defaults(func=cmd_check)
+
+    sp = common(sub.add_parser(
+        "flatfield",
+        help="build the plate's flat fields from the blank wells (runs before "
+             "the analysis array)"))
+    sp.add_argument("--force", action="store_true",
+                    help="rebuild even if already built")
+    sp.set_defaults(func=cmd_flatfield)
 
     sp = common(sub.add_parser("status", help="what has finished, what failed"))
     sp.add_argument("--csv", nargs="?", const="-", default=None,

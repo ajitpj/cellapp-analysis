@@ -117,9 +117,11 @@ platemap, because it is what everything else reads. Wells within 5% of each
 other are reported as too close to call and left exactly as labeled. The check
 is a few sampled frames per stack, not a full read, so it costs nothing.
 
-Declare none and nothing breaks: the analysis runs with no background or
-intensity correction, exactly as it does today when no maps are present.
-`check` says which of the two corrections you will get.
+Declare none and nothing breaks. The background correction is measured from
+each position's own frames and always applies; the blank pair is only needed
+for the **flat field**, so a plate without blanks is corrected for background
+alone — which is the larger of the two errors anyway. `check` says which of the
+two you will get. See [SIGNAL_CORRECTION_README.md](SIGNAL_CORRECTION_README.md).
 
 **Wells you leave out** are run as HeLa, but `check` flags them with a `*` and
 `submit` refuses to run until you either add them or pass `--allow-unmapped`.
@@ -205,11 +207,12 @@ segmented and part not gets both: the GPU array plus a paired analysis array
 for the new positions, and a second analysis array running immediately over the
 folders that already exist.
 
-If the platemap declares blank-media wells whose maps are not built yet, a
-small CPU job builds them first and every analysis array waits on that
-(`afterok`). The maps are plate-wide and every analysis task reads them at
-start-up, so they are built once, in one place, rather than by 40 array tasks
-racing to write the same files.
+If the platemap declares a blank pair whose flat field is not built yet, a
+small CPU job builds it first and every analysis array waits on that
+(`afterok`). The flat field is plate-wide — it is a property of the optics, not
+of a position — so it is built once, in one place, rather than by 40 array
+tasks racing to write the same file. The per-position background needs no such
+job: each analysis task measures its own.
 
 Everything is recorded in `<root>/pipeline/jobs/<timestamp>/`: the two sbatch
 scripts, the task list, a frozen copy of the platemap, the job ids, and the
@@ -229,7 +232,9 @@ Common overrides (full list under `submit --help`):
 | --- | --- | --- |
 | `--infer-time` / `--analysis-time` | `0-00:40:00` / `0-01:00:00` | walltime per position |
 | `--infer-mem` / `--analysis-mem` | `12g` per GPU / `25g` | |
-| `--maps-mem` / `--maps-time` | `20g` / `0-00:30:00` | per folder; the background map median-filters the whole blank stack |
+| `--maps-mem` / `--maps-time` | `20g` / `0-00:30:00` | the flat-field job; it reads a dozen frames of each blank |
+| `--correction-dilation` | `121` | how far from a cell the background is measured, in fluorescence pixels |
+| `--correction-frames` | `24` | frames sampled per position for the background |
 | `--infer-concurrent` / `--analysis-concurrent` | 4 / 12 | array tasks running at once |
 | `--gpus` / `--analysis-cpus` | 1 / 1 | |
 | `--account` / `--mail-user` | `ajitj99` / `$USER@umich.edu` | the address is resolved from your login at submit time |
@@ -271,12 +276,12 @@ python pipeline.py status --root <folder>
 python pipeline.py status --root <folder> --csv        # also writes pipeline/status.csv
 ```
 
-Each position's `*_summary.xlsx` also gains a **`corrections` sheet**: for each
-role, the blank well the map came from, the map file, the measured DMEM and
-FluoroBrite means, whether the role check passed or had to swap the labels, and
-whether that correction was actually applied to this position. A position
-measured without corrections says so. The summary is the file that outlives the
-run, so the provenance of its numbers travels with it.
+Each position's `*_summary.xlsx` also gains a **`corrections` sheet**: the
+background level this position measured and how far it drifted, how close to
+cells it could work, which blank pair the flat field came from, and whether any
+legacy `*_map.tif` files were also on disk. A position measured without a flat
+field says so. The summary is the file that outlives the run, so the provenance
+of its numbers travels with it.
 
 Counts per stage, and for anything that failed, the last line of its traceback
 and where the full log is. The CSV has one row per position with well, cell
@@ -300,13 +305,13 @@ skim when a plate looks odd.
 │   └── ..._tracks.xlsx   ..._analysis.xlsx  ..._summary.xlsx <- from analyze
 └── pipeline/
     ├── state/{inference,analysis}/<position>.json    <- what finished, with which parameters
-    ├── state/maps/corrections.json                   <- which map came from which well
+    ├── state/flatfield/{GFP,Texas_Red}.npz           <- the plate's flat fields
     ├── superseded/                                   <- maps built from a well later swapped away
-    ├── logs/{inference,analysis,maps}/*.log          <- one log per position
+    ├── logs/{inference,analysis,flatfield}/*.log     <- one log per position
     ├── status.csv                                    <- written by `status --csv`
     └── jobs/20251025_142233/
         ├── platemap.csv  tasks.txt  tasks_ready.txt  <- frozen at submit time
-        ├── infer.sbatch  maps.sbatch                  <- only when needed
+        ├── infer.sbatch  flatfield.sbatch             <- only when needed
         ├── analyze.sbatch      (positions being segmented now)
         ├── analyze_ready.sbatch (positions already segmented)
         ├── jobids.json
@@ -337,43 +342,85 @@ python pipeline.py analyze --root <folder> --semantic-gap 5    # override gap cl
 `--force` redoes positions that are already finished. This is the quickest way
 to try tracking parameters on a single movie before committing the plate.
 
-## Correction maps
+## Signal correction
 
-Normally you do not run this: `submit` builds the maps the platemap's
-blank-media wells describe, in their own job, before the analysis array starts.
-Run it directly to build them ahead of time, or when working outside SLURM:
+Two corrections are applied, and they are estimated in different places
+because they are different kinds of quantity. The full account is in
+[SIGNAL_CORRECTION_README.md](SIGNAL_CORRECTION_README.md); the short version:
+
+| | scope | when | needs blanks? |
+| --- | --- | --- | --- |
+| **background** `D + A(t)F` | per position, per frame | inside each analysis task | no |
+| **flat field** `F` | one per plate per channel | the `flatfield` job, before the analysis array | yes |
+
+The background is measured from each position's own cell-free pixels, because
+the medium's brightness depends on the well, the position and the time — on the
+20250213 plate it runs 115–140 counts across positions and climbs 9–15% through
+a movie, which no single blank well can represent. The flat field is a property
+of the optics, so one is enough for the plate, and it comes from the
+*difference* of the two blank wells: both are `D + A·F` with the same camera
+offset, so subtracting one from the other cancels an offset that neither alone
+can be separated from.
+
+Normally you do not run this: `submit` builds the flat fields before the
+analysis array starts. Run it directly to build them ahead of time, or when
+working outside SLURM:
 
 ```bash
 conda activate img-env
-python pipeline.py maps --root <folder>
+python pipeline.py flatfield --root <folder>
 ```
 
-It reads the `role` column, builds one map per channel per role, skips maps
-that already exist (`--force` rebuilds), and writes them into the root folder.
-`cellaap_analysis` picks them up from there on its own — there is nothing to
-point at them.
+It reads the `role` column, builds one flat field per channel from the DMEM
+(`intensity`) and FluoroBrite (`background`) wells, skips channels already
+built (`--force` rebuilds), and caches them under
+`<root>/pipeline/state/flatfield/`. A channel with only one blank declared gets
+no flat field and is corrected for background only.
 
-If the blanks were acquired in a **separate experiment**, they have no well id
-on this plate; name the stacks directly instead, which overrides the platemap
-for that run:
+**Check that the channels agree.** The flat field is optics, so every channel
+should measure the same vignette; the job prints the centre-to-edge ratio per
+channel and warns if they differ by more than 0.05. On the 20250213 plate GFP
+gives 1.220 and Texas Red 1.229.
 
-```bash
-python pipeline.py maps --root <folder> \
-    --background "/other/expt/20251009_blank_G03_s8_Texas Red.tif" \
-    --intensity  "/other/expt/20251009_dmem_H03_s6_Texas Red.tif"
-```
+### What lands in the tables
 
-Both flags are repeatable, one per channel. The stack file name must end in
-`_<channel>.tif` — that is where the channel name is read from — and the
-pipeline says so rather than silently writing a map called `s8_intensity_map`.
+| column | meaning |
+| --- | --- |
+| `<ch>` | raw mean inside the cell mask |
+| `<ch>_corrected` | **the corrected signal** — `(raw − background) / flat field` |
+| `<ch>_bkg_corr`, `<ch>_int_corr` | legacy `*_map.tif` corrections, only if such files are still in the folder |
 
-A map is applied to every analysis started *after* it exists. Positions already
-analyzed without it keep their uncorrected numbers until re-run with `--force`,
-which is why the maps job is ordered ahead of the analysis array.
+`<ch>_corrected` appears **per frame** in the `cell_data` sheet of
+`*_analysis.xlsx`, so corrected signal *dynamics* can be recovered, and
+**per track** in the summary, averaged over each track's mitotic window
+alongside `<ch>_corrected_std`.
 
-Nothing here is mandatory. With no blank wells declared and no flags given, the
-analysis runs uncorrected — `measure_signal` reports raw means, with the
-correction columns left at their neutral values (`_bkg_corr` 0, `_int_corr` 1).
+The correction runs after every channel is measured and **before** the summary
+is written, so the summary always reflects it. Since `check` treats a position
+as analyzed only when its `*_summary.xlsx` exists, a position whose correction
+failed reports `pending` and is re-run, rather than sitting there finished but
+uncorrected.
+
+### The old `*_map.tif` maps
+
+The pipeline no longer builds them. `pipeline.py maps` still exists for
+reproducing an old run by hand, but nothing submits it, and the aggregate
+notebook's finding stands: applying those maps made the field *less* flat, not
+more, because the intensity map keeps the camera offset in it. See
+[SIGNAL_CORRECTION_DESIGN.md](SIGNAL_CORRECTION_DESIGN.md) §1.
+
+`cellaap_analysis` still loads any such file it finds anywhere under the root,
+so a folder from an earlier run will keep populating `<ch>_bkg_corr` and
+`<ch>_int_corr`. That is harmless — they are extra columns — but they are a
+**different correction** and must not be mixed with `<ch>_corrected`. `check`
+warns when it finds them.
+
+A correction applies to every analysis started *after* the flat field exists.
+Positions already analyzed keep their numbers until re-run with
+`--force-analysis`, which is why the flat-field job is ordered ahead of the
+analysis array. Changing `--correction-dilation`, `--correction-frames` or
+`--correction-block` marks finished positions `stale`, so `check` and `submit`
+will offer to re-run them.
 
 ---
 

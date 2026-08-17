@@ -626,3 +626,59 @@ end-to-end verification on this workstation was not possible. What was done:
 * The real `inference` and `cellaap_analysis` calls are therefore exercised
   only through their signatures. The first cluster run is the real test of
   those two call sites.
+
+
+---
+
+## 12. Signal correction replaces the blank-well maps
+
+The pipeline originally built two `*_map.tif` files per channel from two blank
+wells — a background map to subtract and an intensity map to divide by — and
+applied both to every position. The aggregate notebook then found that the
+correction made the field *less* flat than the raw signal, which is what
+prompted `signal_correction.py`.
+
+The diagnosis, in full, is in
+[SIGNAL_CORRECTION_DESIGN.md](SIGNAL_CORRECTION_DESIGN.md). What matters for
+the pipeline's shape is the conclusion: **the two corrections have different
+scopes, and treating them alike was the error.**
+
+* The medium's brightness depends on the well, the position and the time — on
+  the 20250213 plate 115–140 counts across positions, climbing 9–15% through a
+  movie. One blank well cannot stand in for that, so the background is measured
+  per position, per frame, from that position's own cell-free pixels.
+* The illumination is a property of the optics, identical everywhere on the
+  plate. One flat field is enough, and pooling is what makes it precise.
+
+That maps onto the job graph with no new machinery. The plate-wide quantity
+keeps the slot the maps job had — a small CPU job with an `afterok` dependency
+into the analysis arrays — and the per-position quantity moves inside the
+analysis task, where the frames and the segmentation are already in memory. The
+`role` column and its swap check are unchanged; the flat field reads whichever
+well `verify_map_roles` decided was the brighter one.
+
+Three consequences worth stating:
+
+1. **Ordering is load-bearing.** The correction runs after the channels are
+   measured and before `summarize_data`, because the summary averages whatever
+   per-channel columns it finds. `analysis_outputs_present` keys on the summary
+   existing, so a position whose correction failed reports `pending` rather
+   than finished-but-uncorrected. That property came free and is worth keeping.
+
+2. **`summarize_data` had to stop hard-coding its columns.** It listed
+   `<ch>`, `<ch>_bkg_corr` and `<ch>_int_corr` explicitly and called
+   `calculate_signal`, which takes exactly four traces. It now discovers the
+   per-channel columns present on the table and averages each over the track's
+   window, so `<ch>_corrected` reaches the summary without a further edit — and
+   so will the next column anyone adds.
+
+3. **Blank wells became optional.** They are only needed for the flat field.
+   A plate acquired without them still gets the background correction, which is
+   the larger of the two errors by an order of magnitude, and the corrections
+   sheet records that no flat field was applied.
+
+The old maps are not built any more. `pipeline.py maps` survives for
+reproducing an earlier run by hand, and `check` warns when legacy `*_map.tif`
+files are still in a folder, because `cellaap_analysis` will keep loading them
+into `<ch>_bkg_corr`/`<ch>_int_corr` — harmless extra columns, but a different
+correction that must not be mixed with `<ch>_corrected`.

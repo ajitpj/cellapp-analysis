@@ -502,14 +502,32 @@ class analysis:
 
 
         if save_flag:
-            with pd.ExcelWriter(self.cellaap_dir / Path(self.expt_name+self.name_stub+'_analysis.xlsx')) as writer:  
-                self.tracked.to_excel(writer, sheet_name='cell_data')
-                # There are no scalars - so turn into list; transform
-                pd.DataFrame([self.paths]).T.to_excel(writer,   sheet_name='file_data')
-                pd.DataFrame([self.defaults.__dict__]).T.to_excel(writer,sheet_name='parameters')
-            # self.tracked.to_excel()
+            self.write_analysis_file()
 
         return self.tracked
+
+
+    def analysis_file_path(self) -> Path:
+        '''Where this position's `*_analysis.xlsx` lives.'''
+        return self.cellaap_dir / Path(self.expt_name + self.name_stub + '_analysis.xlsx')
+
+
+    def write_analysis_file(self):
+        '''
+        Write `self.tracked` and the run's provenance to `*_analysis.xlsx`.
+
+        Split out of measure_signal because the table is written more than
+        once: measure_signal saves it per channel, and anything that adds
+        columns afterwards - signal_correction's per-frame corrected signal -
+        has to put them on disk before summarize_data runs. Rewrites the whole
+        workbook each time, so the sheets never hold a stale mix of columns.
+        '''
+        with pd.ExcelWriter(self.analysis_file_path()) as writer:
+            self.tracked.to_excel(writer, sheet_name='cell_data')
+            # There are no scalars - so turn into list; transform
+            pd.DataFrame([self.paths]).T.to_excel(writer,   sheet_name='file_data')
+            pd.DataFrame([self.defaults.__dict__]).T.to_excel(writer,sheet_name='parameters')
+        return self.analysis_file_path()
     
     
     def _analysis_frame_shape(self):
@@ -762,14 +780,26 @@ class analysis:
             channels.append("Texas Red")
         if "Cy5" in self.tracked.columns:
             channels.append("Cy5")
+        # Which per-channel columns to average over each track's window. The
+        # list is discovered rather than fixed, so a column added upstream -
+        # `<ch>_corrected` from signal_correction is the reason this is not
+        # hard-coded any more - reaches the summary without another edit here.
+        # The second element is what an all-zero trace should report: 0 for a
+        # quantity that is added or subtracted, 1 for one that divides.
+        CHANNEL_COLUMNS = (("", 0), ("_bkg_corr", 0), ("_int_corr", 1),
+                           ("_corrected", 0))
+        # NB `column_suffix`, not `suffix`: `suffix` is this function's
+        # file-name argument, and a loop over it here would leak into the
+        # output name at the bottom.
+        measured = {channel: [(cs, empty) for cs, empty in CHANNEL_COLUMNS
+                              if f'{channel}{cs}' in self.tracked.columns]
+                    for channel in channels}
+
         signal_storage = {}
         for channel in channels:
-            signal_storage[f'{channel}'] = []
-            signal_storage[f'{channel}_std'] = []
-            signal_storage[f'{channel}_bkg_corr'] = []
-            signal_storage[f'{channel}_bkg_corr_std'] = []
-            signal_storage[f'{channel}_int_corr'] = []
-            signal_storage[f'{channel}_int_corr_std'] = []
+            for column_suffix, _ in measured[channel]:
+                signal_storage[f'{channel}{column_suffix}'] = []
+                signal_storage[f'{channel}{column_suffix}_std'] = []
 
         for index, id in enumerate(idlist):
 
@@ -846,23 +876,14 @@ class analysis:
             # numpy's empty-slice warnings would otherwise flood the log.
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', RuntimeWarning)
+                track_rows_id = self.tracked[self.tracked.particle==id]
                 for channel in channels:
-                    signal, bkg_corr, int_corr, area, signal_std, bkg_std, int_std, area_std = calculate_signal(
-                                                                window,
-                                                                self.tracked[self.tracked.particle==id][f'{channel}'].to_numpy(),
-                                                                self.tracked[self.tracked.particle==id][f'{channel}_bkg_corr'].to_numpy(),
-                                                                self.tracked[self.tracked.particle==id][f'{channel}_int_corr'].to_numpy(),
-                                                                self.tracked[self.tracked.particle==id].area.to_numpy(),
-                                                                self.defaults.semantic_footprint
-                                                                )
-                    signal_storage[f'{channel}'].append(signal)
-                    signal_storage[f'{channel}_std'].append(signal_std)
-                    signal_storage[f'{channel}_bkg_corr'].append(bkg_corr)
-                    signal_storage[f'{channel}_bkg_corr_std'].append(bkg_std)
-                    signal_storage[f'{channel}_int_corr'].append(int_corr)
-                    signal_storage[f'{channel}_int_corr_std'].append(int_std)
-                    # signal_storage[f'{channel}_area_mean'].append(area)
-                    # signal_storage[f'{channel}_area_std'].append(area_std)
+                    for column_suffix, empty in measured[channel]:
+                        column = f'{channel}{column_suffix}'
+                        mean, std = window_stats(
+                            window, track_rows_id[column].to_numpy(), empty)
+                        signal_storage[column].append(mean)
+                        signal_storage[f'{column}_std'].append(std)
 
 
         n_dead = sum(1 for f in fate_label if f != 'mitotic_survived')
