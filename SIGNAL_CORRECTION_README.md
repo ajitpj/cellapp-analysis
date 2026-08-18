@@ -91,8 +91,8 @@ magnitude on this data.
 ```python
 corr = estimate_position_correction(
     stack, stem='', channel='', labels=None, flatfield=None, darkfield=None,
-    background_model='grid', n_frames=24, block=64, dilation=121,
-    min_usable_blocks=0.05, how=None, smooth=1.5, keep_grids=True)
+    background_model='auto', grid_min_blocks=0.05, n_frames=24, block=64,
+    dilation=121, min_usable_blocks=0.05, how=None, smooth=1.5, keep_grids=True)
 ```
 
 | argument | default | meaning |
