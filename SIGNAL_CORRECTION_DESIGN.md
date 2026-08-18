@@ -322,9 +322,66 @@ It lost, clearly:
 
 The reason is that the background is genuinely **not** proportional to `F`:
 out-of-focus haze follows local cell density, which has its own spatial
-structure, and a flexible grid can follow that where two parameters cannot. Kept
-as `background_model='flatfield'` for when so few blocks survive that the grid is
-mostly interpolation, and for when the fitted offset is wanted as a diagnostic.
+structure, and a flexible grid can follow that where two parameters cannot.
+
+So it is kept as a **fallback, not an improvement**: `background_model='auto'`
+(the default) uses the grid and drops to the fit only when a position is too
+crowded to measure a grid at all.
+
+**Where the crossover sits was measured.** Fitting each model to a random
+subset of the measured blocks and predicting the held-out ones:
+
+| blocks kept | grid + smooth | `offset + level·F` |
+| --- | --- | --- |
+| 2% | 6.74 | **6.01** |
+| 5% | **5.73** | 5.78 |
+| 12% | **4.88** | 5.64 |
+| 40% | **4.06** | 5.57 |
+
+(counts RMS, median over 13 positions × 14 frames × 2 channels). The grid keeps
+improving as blocks accumulate; the fit plateaus near 5.6 counts, which is what
+two free parameters buys. Hence `grid_min_blocks = 0.05`.
+
+**Measured on real positions.** Six positions spanning the confluence range,
+both channels, 41k cell measurements:
+
+* *The fallback is dormant on this plate.* All twelve default runs chose the
+  grid, at 9.1–30.8% usable blocks — every one above the trip point. The
+  dilation ladder gets there first: its own floor (`min_usable_blocks`) is also
+  0.05, so the ladder opens the exclusion until 5% of blocks survive, and only
+  a field too crowded for its widest rung can drop the model below the
+  threshold. The switch is a genuine last resort, not a routine path.
+* *Forced on at normal density the fit is worse*, reproducing the
+  cross-validation on the endpoint that matters rather than on held-out blocks:
+
+  | pooled, 41k cells | grid | flatfield |
+  | --- | --- | --- |
+  | GFP radial RMS | **11.4%** | 22.7% |
+  | GFP spatial swing | **5.3 counts** | 7.9 counts |
+  | Texas Red radial RMS | **81.5%** | 120.8% |
+  | Texas Red spatial swing | **18.2 counts** | 22.0 counts |
+
+* *The two models agree on the population but not on the cell.* Median
+  difference −0.07 counts (GFP) and −0.52 (Texas Red) — no systematic offset,
+  which is what makes a mixed plate safe in aggregate — but the IQR is ±2–3
+  counts and 48–60% of cells move by more than 2. Against a 14-count (GFP) or
+  9-count (Texas Red) signal that is real per-cell scatter.
+* *The switch and the refusal both fire when starved.* Disabling the ladder at
+  a 161 px exclusion drove 10 of 12 runs below 5% blocks and all ten switched,
+  logging the reason. At 201 px six runs hit the terminal case and raised the
+  explicit "no sampled frame has the 10 measurable blocks" error rather than
+  inventing a surface.
+
+One result points at a possible improvement rather than a problem. Under the
+starved configuration a few positions came out markedly *better* — Texas Red
+C08_s5 went from 9.3 to 26.4 counts of signal with negatives falling from 29%
+to 0.2%, and A08_s1's residual radial trend fell from 368% to 76% — because a
+161 px exclusion keeps far more halo out of the background than the 60–121 px
+the ladder settles on. Others got worse, as ten fitted blocks should. It
+suggests the ladder may be trading halo cleanliness for block count, and that
+*wide exclusion + two-parameter fit* could beat *narrow exclusion + grid* on
+crowded positions. That is a hint, not a result: it would need the same
+held-out comparison run per rung before any default changed.
 
 ### 7.2 Fitting the flat field to the cells
 
