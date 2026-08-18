@@ -104,7 +104,8 @@ corr = estimate_position_correction(
 | `min_usable_blocks` | `0.05` | back off `dilation` on any frame where fewer than this fraction of blocks survive |
 | `n_frames` | `24` | frames sampled for the surfaces; the level is interpolated between them |
 | `block` | `64` | block side; 64 on a 2048 frame gives a 32×32 grid |
-| `background_model` | `'grid'` | `'grid'` fills and smooths the measured grid; `'flatfield'` fits `offset + level·F` per frame instead |
+| `background_model` | `'auto'` | `'grid'` fills and smooths the measured grid; `'flatfield'` fits `offset + level·F` per frame; `'auto'` uses the grid and falls back when a position is too crowded |
+| `grid_min_blocks` | `0.05` | block fraction below which `'auto'` switches to the flat-field fit |
 
 ### `dilation` is the one to think about
 
@@ -121,6 +122,26 @@ the exclusion off **per frame** (121 → 60 → 30 → 15 → none) until
 
 If your cells are larger, more spread, or imaged at higher magnification than
 HT1080 at 20×, raise `dilation` in proportion.
+
+### When a position is too crowded to measure a grid
+
+`background_model='auto'` (the default) drops to a two-parameter fit,
+`offset + level·F`, which needs ten measurable blocks rather than a whole grid.
+It engages when fewer than `grid_min_blocks` of blocks survive, or when any
+sampled frame has none at all — the case the grid model cannot survive. The
+switch and its reason are logged, stored in `diagnostics`, and written to the
+corrections sheet.
+
+The threshold is deliberately low, because the fit is a **fallback, not an
+improvement**: cross-validated on the 20250213 plate, the grid predicts
+held-out background blocks better from 5% of blocks upwards (5.7 vs 5.8 counts
+at 5%, 4.5 vs 5.7 at 20%) and only loses below ~4% (6.7 vs 6.0 at 2%). The
+fit's error plateaus near 5.6 counts however many blocks it gets — that is what
+two parameters buys. Force it with `background_model='flatfield'` if you want
+it everywhere.
+
+With no flat field *and* no measurable blocks there is nothing to fall back on,
+and the estimator raises rather than inventing a background.
 
 ---
 

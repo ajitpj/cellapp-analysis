@@ -728,7 +728,8 @@ def correction_params(args) -> dict:
     """
     return {"dilation": getattr(args, "correction_dilation", 121),
             "n_frames": getattr(args, "correction_frames", 24),
-            "block": getattr(args, "correction_block", 64)}
+            "block": getattr(args, "correction_block", 64),
+            "model": getattr(args, "correction_model", "auto")}
 
 
 def build_tasks(root: Path, positions: list[Position], rows: list[PlateRow],
@@ -1343,6 +1344,7 @@ def write_corrections_sheet(session, task: Task, root: Path,
                 float(record.get("unusable_block_fraction", 0)), 3),
             "frames_sampled": record.get("n_frames_sampled", ""),
             "background_model": record.get("background_model", ""),
+            "model_switch_reason": record.get("background_model_reason", ""),
         })
     if not rows:
         rows.append({"correction": "signal_correction (per position)",
@@ -1350,7 +1352,8 @@ def write_corrections_sheet(session, task: Task, root: Path,
                      "flatfield_from": "", "flatfield_centre_edge": "",
                      "background_counts": "", "background_drift_percent": "",
                      "dilation_used_px": "", "unusable_block_fraction": "",
-                     "frames_sampled": "", "background_model": ""})
+                     "frames_sampled": "", "background_model": "",
+                     "model_switch_reason": ""})
 
     legacy = {"background": session.background_map_present,
               "intensity": session.intensity_map_present}
@@ -1362,6 +1365,7 @@ def write_corrections_sheet(session, task: Task, root: Path,
             "background_counts": "", "background_drift_percent": "",
             "dilation_used_px": "", "unusable_block_fraction": "",
             "frames_sampled": "", "background_model": "",
+            "model_switch_reason": "",
         })
     frame = pd.DataFrame(rows)
 
@@ -1425,7 +1429,8 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
             correction = sc.estimate_position_correction(
                 stack, stem=task.stem, channel=channel, labels=labels,
                 flatfield=flat, n_frames=args.correction_frames,
-                block=args.correction_block, dilation=args.correction_dilation)
+                block=args.correction_block, dilation=args.correction_dilation,
+                background_model=args.correction_model)
 
             # Centroids are at segmentation scale; the fluorescence frame is
             # bigger by whatever the inference downsampling was. Derive the
@@ -1444,13 +1449,17 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
 
         d = correction.diagnostics
         measured = session.tracked[f"{channel}_corrected"].notna().sum()
+        fell_back = d["background_model"] != d.get("background_model_requested")
         log(f"  corrected {channel}: background "
             f"{d['background_mean_range'][0]:.1f}-{d['background_mean_range'][1]:.1f} "
             f"counts (drift {d['background_drift_percent']:.0f}%), "
             f"dilation {d['dilation_used']}, "
             f"{100*d['unusable_block_fraction']:.0f}% blocks unusable, "
             f"flat field {'yes' if flat is not None else 'NO - background only'}, "
-            f"{measured} rows")
+            f"model {d['background_model']}, {measured} rows")
+        if d.get("background_model_reason"):
+            log(f"    ! switched to the {d['background_model']} background model: "
+                f"{d['background_model_reason']}")
         records.append({
             "channel": channel,
             "scale": round(scale_x, 3),
@@ -2350,6 +2359,12 @@ def build_parser() -> argparse.ArgumentParser:
                         metavar="PX",
                         help="block size for the background grid "
                              "(default: %(default)s)")
+        sp.add_argument("--correction-model", default="auto",
+                        choices=("auto", "grid", "flatfield"),
+                        help="background surface model. 'auto' uses the grid "
+                             "and falls back to a two-parameter fit against "
+                             "the flat field when a position is too crowded "
+                             "to measure a grid (default: %(default)s)")
         return sp
 
     sp = common(sub.add_parser("init", help="write a platemap template for this folder"))
