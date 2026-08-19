@@ -24,7 +24,9 @@ offset `D` - the one quantity that cannot be pinned down from this data - off
 the critical path entirely.
 
 Usage, the parameters and what to check afterwards are in
-SIGNAL_CORRECTION_README.md. Why it is built this way, what was measured, and
+SIGNAL_CORRECTION_README.md. Reading a saved correction back, applying one to
+numbers already in a workbook, and lending a shape to a position too crowded to
+measure its own live in `correction_tools` (CORRECTION_TOOLS_README.md). Why it is built this way, what was measured, and
 which alternatives were tried and rejected are in SIGNAL_CORRECTION_DESIGN.md.
 
 Typical use::
@@ -45,7 +47,6 @@ you hand `PositionCorrection.save` a path that points there.
 from __future__ import annotations
 
 import json
-import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,10 +69,6 @@ __all__ = [
     # driver and container
     "estimate_position_correction",
     "PositionCorrection",
-    # saved surfaces, for inspection
-    "save_background_stack",
-    "read_background_stack",
-    "upsample_stack",
     # diagnostics
     "upsample",
     "radial_profile",
@@ -455,8 +452,9 @@ class PositionCorrection:
 
         The map this correction actually subtracts, materialised. Cheap to
         rebuild from `background_shape` and the two per-frame series, so this
-        is for looking at and for `save_background_stack`, not for storage -
-        the object itself is smaller than its own output.
+        is for looking at, not for storage - the object itself is smaller than
+        its own output. `correction_tools.save_background_stack` writes it to a
+        TIFF when a surface needs to be inspected outside Python.
         """
         idx = (np.arange(len(self.background_level)) if frames is None
                else np.asarray(list(frames), int))
@@ -795,85 +793,6 @@ def estimate_position_correction(stack,
 # --------------------------------------------------------------------------
 # diagnostics
 # --------------------------------------------------------------------------
-
-def save_background_stack(correction: "PositionCorrection", path: str | Path,
-                          compression: str | None = "zlib") -> Path:
-    """Write the per-frame background map as a TIFF stack, for inspection.
-
-    `(n_frames, gy, gx)` float32 in counts, at the correction's own grid
-    resolution - 32 x 32 for the default 64-pixel block on a 2048 frame. It is
-    not upsampled on the way out because the surface genuinely has no structure
-    finer than one block; `read_background_stack(..., shape=...)` expands it
-    when something needs frame-sized pixels.
-
-    About 490 kB per position per channel compressed (137 frames), so ~12 MB
-    for a 13-position two-channel plate - 0.03% of that plate's raw stacks.
-
-    **The file name must not contain "background" or "intensity".**
-    `cellaap_analysis._load_maps` walks the *entire* root folder, the pipeline
-    directory included, treats any file matching those words as a plate-wide
-    correction map, and imreads it. A per-position surface picked up that way
-    would be applied to every position on the plate - silently reinstating the
-    blank-well bug this module exists to remove. This refuses such a name
-    rather than trusting the caller to remember.
-    """
-    path = Path(path).with_suffix(".tif")
-    if re.search(r"background|intensity", path.name):
-        raise ValueError(
-            f"{path.name!r} contains 'background' or 'intensity'; "
-            f"cellaap_analysis._load_maps would pick it up as a plate-wide "
-            f"correction map and apply this one position's surface to every "
-            f"position. Name it '<stem>_<channel>_bkg.tif' or similar.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    stack = correction.background_stack()
-    meta = {"stem": correction.stem, "channel": correction.channel,
-            "units": "counts", "block": correction.block,
-            "frame_shape": list(correction.frame_shape),
-            "grid_shape": list(correction.background_shape.shape),
-            "n_frames": int(stack.shape[0]),
-            "what": "per-frame background B(x,y,t) that was subtracted; "
-                    "upsample to frame_shape to overlay on the raw stack",
-            "diagnostics": correction.diagnostics}
-    import tifffile
-    tifffile.imwrite(path, stack, compression=compression,
-                     description=json.dumps(meta))
-    return path
-
-
-def read_background_stack(path: str | Path,
-                          shape: tuple[int, int] | None = None
-                          ) -> tuple[npt.NDArray, dict]:
-    """Read a stack written by `save_background_stack`.
-
-    Returns `(stack, metadata)`. Pass `shape` - or `metadata["frame_shape"]` -
-    to get it back at frame resolution, ready to subtract from or overlay on
-    the raw images.
-    """
-    import tifffile
-    with tifffile.TiffFile(path) as fh:
-        stack = fh.series[0].asarray().astype(np.float32)
-        try:
-            meta = json.loads(fh.pages[0].description)
-        except Exception:
-            meta = {}
-    if shape is not None:
-        stack = upsample_stack(stack, shape)
-    return stack, meta
-
-
-def upsample_stack(stack: npt.NDArray, shape: tuple[int, int]) -> npt.NDArray:
-    """`upsample` every frame of an `(n, gy, gx)` stack to `shape`.
-
-    Bilinear, frame by frame, so a 137 x 32 x 32 stack expanded to 2048 x 2048
-    becomes 2.3 GB - materialise a slice rather than the whole movie unless you
-    mean it.
-    """
-    a = np.asarray(stack, np.float32)
-    if a.ndim == 2:
-        return upsample(a, shape)
-    return np.stack([upsample(f, shape) for f in a])
-
 
 def _dilation_ladder(dilation: int) -> list[int]:
     """Exclusion widths to try, widest first, ending at no mask at all."""

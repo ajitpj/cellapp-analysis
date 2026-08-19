@@ -1522,6 +1522,7 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
     import numpy as np
     import tifffile
     import signal_correction as sc
+    import correction_tools as ct
 
     records = []
     labels = session.stacks.get("instance")
@@ -1562,7 +1563,7 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
         # It is redundant with the correction object, which reconstructs it
         # exactly, but a TIFF opens in Fiji and an npz does not.
         try:
-            written = sc.save_background_stack(
+            written = ct.save_background_stack(
                 correction, surface_path(task.root, task.stem, channel))
         except Exception as exc:
             written = None

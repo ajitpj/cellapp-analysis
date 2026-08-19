@@ -7,7 +7,10 @@ of from a blank well, and takes the illumination correction from the
 inference.
 
 For why it is built this way, and what was measured to justify it, see
-[SIGNAL_CORRECTION_DESIGN.md](SIGNAL_CORRECTION_DESIGN.md). For the analysis
+[SIGNAL_CORRECTION_DESIGN.md](SIGNAL_CORRECTION_DESIGN.md). For reading a saved
+correction back, applying one to numbers already in a workbook, or lending a
+shape to a position too crowded to measure its own, see
+[CORRECTION_TOOLS_README.md](CORRECTION_TOOLS_README.md). For the analysis
 module whose output it corrects, see [README.md](README.md).
 
 ---

@@ -547,8 +547,11 @@ gives 1.220 and Texas Red 1.229.
 
 The background each position subtracted is also kept, at grid resolution, in
 `pipeline/state/surfaces/` — ~490 kB per position-channel, ~12 MB for a plate.
-Open it in Fiji, or read it with `signal_correction.read_background_stack()`.
-The `corrections` sheet names the file for each channel.
+Open it in Fiji, or read it with `correction_tools.read_background_stack()`.
+The `corrections` sheet names the file for each channel. Everything you might
+want to do with a correction after the run — inspect it, apply it to numbers
+already in a workbook, lend its shape to a crowded position — is in
+[CORRECTION_TOOLS_README.md](CORRECTION_TOOLS_README.md).
 
 `<ch>_corrected` appears **per frame** in the `cell_data` sheet of
 `*_analysis.xlsx`, so corrected signal *dynamics* can be recovered, and
