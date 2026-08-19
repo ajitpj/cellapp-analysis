@@ -45,6 +45,7 @@ you hand `PositionCorrection.save` a path that points there.
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +68,10 @@ __all__ = [
     # driver and container
     "estimate_position_correction",
     "PositionCorrection",
+    # saved surfaces, for inspection
+    "save_background_stack",
+    "read_background_stack",
+    "upsample_stack",
     # diagnostics
     "upsample",
     "radial_profile",
@@ -445,6 +450,20 @@ class PositionCorrection:
              + float(self.background_level[frame]) * self.background_shape)
         return upsample(b, self.frame_shape) if full_resolution else b
 
+    def background_stack(self, frames: Iterable[int] | None = None) -> npt.NDArray:
+        """`B` for every frame as one `(n, gy, gx)` array, in counts.
+
+        The map this correction actually subtracts, materialised. Cheap to
+        rebuild from `background_shape` and the two per-frame series, so this
+        is for looking at and for `save_background_stack`, not for storage -
+        the object itself is smaller than its own output.
+        """
+        idx = (np.arange(len(self.background_level)) if frames is None
+               else np.asarray(list(frames), int))
+        return (self.background_offset[idx, None, None]
+                + self.background_level[idx, None, None]
+                * self.background_shape[None]).astype(np.float32)
+
     def flat(self, full_resolution: bool = True) -> npt.NDArray:
         """The flat field, optionally at frame resolution."""
         g = self._flat_grid()
@@ -607,503 +626,8 @@ def estimate_position_correction(stack,
         The block fraction below which `auto` switches to the flat-field fit.
         Cross-validated by fitting each model to a random subset of measured
         blocks and predicting the held-out ones: the grid wins from 5% of
-        blocks upwards (5.7 vs 5.8 counts at 5%, 4.5 vs 5.7 at 20%) and loses
-        below ~4% (6.7 vs 6.0 at 2%). The flat-field fit's error plateaus near
-        5.6 counts however many blocks it is given, which is what two
-        parameters buys. 0.05 is deliberately conservative - it switches only
-        when the grid is genuinely inoperative.
-    dilation : int
-        Side of the square used to grow the mask, in fluorescence pixels. The
-        segmentation follows the cell body; out-of-focus haze reaches past it,
-        and 21 px covers that on a 20x field. Set 0 to skip.
-
-    Returns
-    -------
-    Boolean array the shape of the fluorescence frame, True where no cell is.
-    """
-    cell = np.asarray(labels) != 0
-    if shape is not None and cell.shape != tuple(shape):
-        fy = shape[0] / cell.shape[0]
-        fx = shape[1] / cell.shape[1]
-        if abs(fy - round(fy)) < 1e-9 and abs(fx - round(fx)) < 1e-9 and fy >= 1:
-            # integer upsampling: repeat is far cheaper than ndi.zoom
-            cell = np.repeat(np.repeat(cell, int(round(fy)), 0), int(round(fx)), 1)
-        else:
-            cell = ndi.zoom(cell.astype(np.uint8), (fy, fx), order=0).astype(bool)
-    if dilation:
-        # maximum_filter with a scalar size is the separable form of dilating
-        # by a square, and gives a bit-identical result 100x faster - 0.03 s
-        # against 4.9 s for a 121 px square on a 2048 frame, which is the
-        # difference between this being usable per frame and not.
-        cell = ndi.maximum_filter(cell, size=int(dilation), mode="nearest")
-    return ~cell
-def block_reduce_robust(image: npt.NDArray, block: int, how: str = "mean",
-                        mask: npt.NDArray | None = None,
-                        min_pixels: int = 64,
-                        quantile: float = 0.10,
-                        clip_sigma: float = 2.5,
-                        clip_iters: int = 3) -> npt.NDArray:
-    """Reduce an image to a grid of per-block statistics.
-
-    `how` selects the estimator, and the choice matters more than it looks:
-
-    ``mean``, ``std``, ``median``
-        the plain thing, over the pixels `mask` selects.
-    ``quantile``
-        the `quantile`-th percentile of the block. Rejects cells without any
-        mask, but sits low by roughly `z_q` noise sigmas - on the 20250213
-        plate the 10th percentile runs 12-25 counts under the true cell-free
-        median, which is 10-17% of the background. Use it only where a
-        constant offset does not matter.
-    ``clipped_mean``
-        iterative sigma-clipping, rejecting the high side only. This is the
-        one to use without a mask: it converges on the bulk of the medium
-        pixels rather than a tail quantile, so it is unbiased where
-        ``quantile`` is not, and it tolerates any cell coverage that leaves
-        the medium as the majority of the block.
-
-    Blocks with fewer than `min_pixels` usable pixels come back NaN.
-    """
-    a = np.asarray(image, np.float32)
-    h, w = a.shape
-    ny, nx = h // block, w // block
-    if ny == 0 or nx == 0:
-        raise ValueError(f"block {block} is larger than the {h}x{w} image")
-    a = a[:ny * block, :nx * block]
-    v = a.reshape(ny, block, nx, block).swapaxes(1, 2).reshape(ny, nx, -1)
-
-    if mask is not None:
-        m = np.asarray(mask, bool)[:ny * block, :nx * block]
-        m = m.reshape(ny, block, nx, block).swapaxes(1, 2).reshape(ny, nx, -1)
-        v = np.where(m, v, np.nan)
-        enough = m.sum(-1) >= min_pixels
-    else:
-        enough = np.ones((ny, nx), bool)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN blocks
-        if how == "mean":
-            out = np.nanmean(v, -1)
-        elif how == "median":
-            out = np.nanmedian(v, -1)
-        elif how == "std":
-            out = np.nanstd(v, -1)
-        elif how == "quantile":
-            out = np.nanquantile(v, quantile, axis=-1)
-        elif how == "clipped_mean":
-            out = _clipped_mean(v, clip_sigma, clip_iters)
-        else:
-            raise ValueError(f"unknown reduction {how!r}")
-
-    return np.where(enough, out, np.nan).astype(np.float32)
-
-
-def _clipped_mean(v: npt.NDArray, sigma: float, iters: int) -> npt.NDArray:
-    """Mean of each block after iteratively dropping the bright tail.
-
-    One-sided on purpose: cells only ever add signal, so clipping the low side
-    as well would throw away the medium pixels this is trying to measure.
-    """
-    x = np.where(np.isfinite(v), v, np.nan)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        for _ in range(iters):
-            med = np.nanmedian(x, -1, keepdims=True)
-            # median absolute deviation scaled to a Gaussian sigma, measured on
-            # the low half only so cells cannot inflate the width they are
-            # about to be compared against
-            lo = np.where(x <= med, x, np.nan)
-            mad = np.nanmedian(med - lo, -1, keepdims=True) * 1.4826
-            mad = np.where(mad > 0, mad, np.nanstd(x, -1, keepdims=True))
-            x = np.where(x <= med + sigma * mad, x, np.nan)
-        return np.nanmean(x, -1)
-
-
-def _fill_and_smooth(grid: npt.NDArray, smooth: float = 1.5) -> npt.NDArray:
-    """Fill NaN grid points from their nearest measured neighbour, then smooth.
-
-    Blocks go NaN where a position is too crowded to measure. Nearest-neighbour
-    fill keeps the surface defined everywhere without inventing structure, and
-    the Gaussian afterwards is what makes the result a smooth field rather than
-    a mosaic. Returns a copy; the input is untouched.
-    """
-    g = np.array(grid, np.float32)
-    bad = ~np.isfinite(g)
-    if bad.all():
-        raise ValueError("no usable blocks: every block was masked out or empty")
-    if bad.any():
-        idx = ndi.distance_transform_edt(bad, return_distances=False,
-                                         return_indices=True)
-        g = g[tuple(idx)]
-    if smooth:
-        g = ndi.gaussian_filter(g, smooth, mode="nearest")
-    return g
-
-
-def background_surface(image: npt.NDArray,
-                       cell_free: npt.NDArray | None = None,
-                       block: int = DEFAULT_BLOCK,
-                       how: str | None = None,
-                       smooth: float = 1.5,
-                       full_resolution: bool = False) -> npt.NDArray:
-    """The background under one frame: `D + A(t) F(x, y)`, cells excluded.
-
-    Parameters
-    ----------
-    image : 2D array
-        One fluorescence frame.
-    cell_free : bool array, optional
-        From `cell_free_mask_from_labels`. With a mask the estimator defaults
-        to a per-block median; without one it defaults to `clipped_mean`,
-        which rejects cells on its own.
-    block, smooth
-        Grid coarseness, and the Gaussian applied to the grid afterwards in
-        units of grid points.
-    full_resolution : bool
-        Return a surface the size of `image` instead of the coarse grid.
-        Bilinear from the grid - the surface has no structure finer than
-        `block` either way, so keep the grid unless you need to subtract the
-        surface from the frame pixel by pixel.
-    """
-    if how is None:
-        how = "median" if cell_free is not None else "clipped_mean"
-    grid = _fill_and_smooth(block_reduce_robust(image, block, how, mask=cell_free),
-                            smooth)
-    if not full_resolution:
-        return grid
-    return upsample(grid, np.asarray(image).shape)
-
-
-def fit_background_to_flatfield(grid: npt.NDArray, flatfield: npt.NDArray
-                                ) -> tuple[float, float]:
-    """Fit `B = offset + level * F` to one measured background grid.
-
-    The constrained alternative to smoothing the grid, and the better estimator
-    when the cells are faint. Two free numbers instead of ~1000 grid points, so
-    the fit averages over every block rather than tracking each one, which
-    matters when the thing being subtracted is ten times the size of the signal
-    left behind: a 1% wobble in the surface is a 10% error in the cell.
-
-    It also removes two biases that a smoothed grid carries. Gaussian smoothing
-    pulls the corners of the grid towards the brighter interior, and blocks too
-    crowded to measure get filled from their neighbours - both land at the
-    field edge, where the flat field is furthest from 1 and the error is
-    multiplied.
-
-    Requires a flat field from somewhere independent - `flatfield_from_blank_pair`
-    is the intended source. Returns `(offset, level)`; `offset` is an estimate
-    of the camera offset, and comparing it across frames and positions is a
-    good check that the model is holding.
-    """
-    g = np.asarray(grid, np.float32)
-    f = np.asarray(flatfield, np.float32)
-    if f.shape != g.shape:
-        f = ndi.zoom(f, np.array(g.shape) / np.array(f.shape), order=1,
-                     mode="nearest")
-    ok = np.isfinite(g)
-    if ok.sum() < 10:
-        raise ValueError("fewer than 10 usable blocks to fit a background to")
-    A = np.stack([np.ones(int(ok.sum()), np.float32), f[ok]], axis=1)
-    coef, *_ = np.linalg.lstsq(A, g[ok], rcond=None)
-    return float(coef[0]), float(coef[1])
-
-
-def background_surfaces(frames: Iterable[npt.NDArray],
-                        cell_free: Iterable[npt.NDArray] | None = None,
-                        block: int = DEFAULT_BLOCK,
-                        how: str | None = None,
-                        smooth: float = 1.5) -> npt.NDArray:
-    """`background_surface` over a sequence of frames -> (n, ny, nx) grids."""
-    masks = iter(cell_free) if cell_free is not None else None
-    out = []
-    for frame in frames:
-        m = next(masks) if masks is not None else None
-        out.append(background_surface(frame, m, block, how, smooth))
-    return np.stack(out)
-def flatfield_from_blank_pair(bright: npt.NDArray, dim: npt.NDArray,
-                              block: int = DEFAULT_BLOCK,
-                              smooth: float = 1.0,
-                              min_contrast: float = 20.0) -> npt.NDArray:
-    """Flat field from two blank wells of different brightness. **Preferred.**
-
-    Two blanks imaged through the same optics are `D + A_bright F` and
-    `D + A_dim F`. Their difference is `(A_bright - A_dim) F` - the camera
-    offset cancels exactly, with no need to know it. That makes this the only
-    background-derived route to `F` that does not rest on the one quantity
-    none of the estimators here can pin down.
-
-    On the 20250213 plate (DMEM as `bright`, FluoroBrite as `dim`) it gives a
-    centre-to-edge ratio of 1.220 in GFP and 1.230 in Texas Red. Two
-    independent checks say that is right where the single-blank maps are not:
-
-    * the two channels agree to 1%, as an optical property must, while the
-      single-blank maps disagree by 9% (1.190 vs 1.090 in GFP) purely because
-      the wells held different amounts of medium;
-    * feeding it back through `raw = D + (A + S) F` predicts a raw cell-signal
-      falloff of 1.132, against 1.121 measured over 430k cells.
-
-    Parameters
-    ----------
-    bright, dim : (t, y, x) or (y, x) arrays
-        The two blank stacks. Order matters only for the sign; a bigger gap
-        between them is better, so pass the brightest and the dimmest blanks
-        available.
-    min_contrast : float
-        Refuse if the mean difference is smaller than this many counts - too
-        small a gap and the difference is mostly noise.
-    """
-    gb = _mean_blank_surface(bright, block)
-    gd = _mean_blank_surface(dim, block)
-    diff = gb - gd
-    contrast = float(np.nanmean(diff))
-    if abs(contrast) < min_contrast:
-        raise ValueError(
-            f"the two blanks differ by only {contrast:.1f} counts on average; "
-            f"their difference is mostly noise. Use blanks whose media differ "
-            f"more - see SIGNAL_CORRECTION_DESIGN.md section 4 for the "
-            f"alternatives when no usable blank pair exists.")
-    if contrast < 0:                     # caller swapped them; harmless
-        diff = -diff
-    return _normalise_flatfield(diff, smooth)
-
-
-def _mean_blank_surface(blank: npt.NDArray, block: int) -> npt.NDArray:
-    """Mean block-reduced surface of a cell-free stack."""
-    a = np.asarray(blank, np.float32)
-    frames = a if a.ndim == 3 else a[None]
-    return np.stack([block_reduce_robust(f, block, "clipped_mean")
-                     for f in frames]).mean(axis=0)
-def _normalise_flatfield(grid: npt.NDArray, smooth: float) -> npt.NDArray:
-    """Fill, smooth, normalise to mean 1, and refuse anything unphysical."""
-    g = _fill_and_smooth(grid, smooth)
-    m = float(np.mean(g))
-    if not np.isfinite(m) or m <= 0:
-        raise ValueError("flat field has a non-positive mean; the darkfield is "
-                         "probably larger than the background it was removed from")
-    g = g / m
-    if g.min() <= 0:
-        raise ValueError(f"flat field reaches {g.min():.3f}; dividing by it would "
-                         "flip the sign of the signal. The darkfield is too large.")
-    return g.astype(np.float32)
-@dataclass
-class PositionCorrection:
-    """Everything needed to correct one channel of one position.
-
-    The background is stored as one fixed shape with two numbers per frame::
-
-        B(x, y, t) = background_offset[t] + background_level[t] * background_shape(x, y)
-
-    The offset term is what lets the `"flatfield"` background model be stored
-    exactly: there `background_shape` *is* the flat field, `background_level`
-    is the medium brightness `A(t)`, and `background_offset` is the camera
-    offset the fit found - per frame, never assumed. The `"grid"` model leaves
-    the offset at zero and puts everything in the shape. Either way nothing
-    downstream has to know which was used.
-
-        corrected = (I - B(t)) / flatfield
-
-    Three small arrays replace the two full-size map stacks the pipeline
-    carries today: a 32x32 shape, a 32x32 flat field, and two numbers a frame.
-    """
-
-    stem: str
-    channel: str
-    background_shape: npt.NDArray             # (gy, gx), mean 1
-    background_level: npt.NDArray             # (n_frames,), counts
-    frame_shape: tuple[int, int]
-    flatfield: npt.NDArray | None = None      # (gy, gx), mean 1; None = uncorrected
-    background_offset: npt.NDArray | None = None  # (n_frames,), counts
-    block: int = DEFAULT_BLOCK
-    darkfield: float | None = None            # provenance only, if one was used
-    background_grids: npt.NDArray | None = None   # measured, (n_sampled, gy, gx)
-    sampled_frames: npt.NDArray | None = None
-    diagnostics: dict = field(default_factory=dict)
-
-    def __post_init__(self):
-        self.background_shape = np.asarray(self.background_shape, np.float32)
-        self.background_level = np.asarray(self.background_level, np.float32)
-        self.frame_shape = tuple(int(s) for s in self.frame_shape)
-        if self.background_offset is None:
-            self.background_offset = np.zeros_like(self.background_level)
-        else:
-            self.background_offset = np.asarray(self.background_offset, np.float32)
-        if self.flatfield is not None:
-            self.flatfield = np.asarray(self.flatfield, np.float32)
-
-    # -- the flat field is set later, after pooling the plate --------------
-    def set_flatfield(self, flatfield: npt.NDArray,
-                      darkfield: float | None = None) -> "PositionCorrection":
-        """Attach a flat field, resampling it to this position's grid."""
-        f = np.asarray(flatfield, np.float32)
-        if f.shape != self.background_shape.shape:
-            f = ndi.zoom(f, np.array(self.background_shape.shape) / np.array(f.shape),
-                         order=1, mode="nearest")
-        self.flatfield = (f / f.mean()).astype(np.float32)
-        if darkfield is not None:
-            self.darkfield = float(darkfield)
-        self.diagnostics["flatfield_centre_edge"] = centre_edge_ratio(self.flatfield)
-        return self
-
-    def _flat_grid(self) -> npt.NDArray:
-        if self.flatfield is None:
-            return np.ones_like(self.background_shape)
-        return self.flatfield
-
-    # -- applying it ------------------------------------------------------
-    def background(self, frame: int, full_resolution: bool = True) -> npt.NDArray:
-        """The background under one frame."""
-        b = (float(self.background_offset[frame])
-             + float(self.background_level[frame]) * self.background_shape)
-        return upsample(b, self.frame_shape) if full_resolution else b
-
-    def flat(self, full_resolution: bool = True) -> npt.NDArray:
-        """The flat field, optionally at frame resolution."""
-        g = self._flat_grid()
-        return upsample(g, self.frame_shape) if full_resolution else g
-
-    def apply(self, image: npt.NDArray, frame: int) -> npt.NDArray:
-        """`(I - B(t)) / F` for a whole frame."""
-        return ((np.asarray(image, np.float32) - self.background(frame))
-                / self.flat())
-
-    def _grid_index(self, x, y):
-        gy, gx = self.background_shape.shape
-        j = np.clip((np.asarray(x, float) / self.frame_shape[1] * gx).astype(int),
-                    0, gx - 1)
-        i = np.clip((np.asarray(y, float) / self.frame_shape[0] * gy).astype(int),
-                    0, gy - 1)
-        return i, j
-
-    def subtract_background(self, raw, x, y, frame) -> npt.NDArray:
-        """`raw - B(x, y, t)` for per-cell measurements. Pass 1 of the workflow.
-
-        Useful on its own when no flat field is available: the background is
-        the larger of the two corrections by an order of magnitude here.
-        """
-        i, j = self._grid_index(x, y)
-        f = np.clip(np.asarray(frame, int), 0, len(self.background_level) - 1)
-        bg = (self.background_offset[f]
-              + self.background_level[f] * self.background_shape[i, j])
-        return np.asarray(raw, float) - bg
-
-    def correct_measurements(self, raw, x, y, frame) -> npt.NDArray:
-        """Fully corrected per-cell signal, without touching the images.
-
-        The route into the existing tables: `cellaap_analysis` already stores a
-        raw mean per cell per frame and the centroid it came from, so this
-        recomputes the corrected signal from `*_analysis.xlsx` alone.
-
-        Sampling the fields at the centroid rather than averaging them over the
-        mask - which is what `<ch>_bkg_corr` and `<ch>_int_corr` do - is fine
-        here: both are smooth on a scale of `block` pixels, far larger than a
-        cell, so the two agree to well under a percent.
-        """
-        i, j = self._grid_index(x, y)
-        return self.subtract_background(raw, x, y, frame) / self._flat_grid()[i, j]
-
-    # -- persistence ------------------------------------------------------
-    def save(self, path: str | Path) -> Path:
-        """Write to a `.npz`, with a human-readable `.json` beside it."""
-        path = Path(path).with_suffix(".npz")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        meta = {"stem": self.stem, "channel": self.channel,
-                "frame_shape": list(self.frame_shape), "block": self.block,
-                "darkfield": self.darkfield, "diagnostics": self.diagnostics}
-        np.savez_compressed(
-            path,
-            background_shape=self.background_shape,
-            background_level=self.background_level,
-            background_offset=self.background_offset,
-            flatfield=(self.flatfield if self.flatfield is not None
-                       else np.array([], np.float32)),
-            background_grids=(self.background_grids
-                              if self.background_grids is not None
-                              else np.array([], np.float32)),
-            sampled_frames=(self.sampled_frames if self.sampled_frames is not None
-                            else np.array([], int)),
-            meta=json.dumps(meta))
-        path.with_suffix(".json").write_text(json.dumps(
-            {**meta,
-             "background_level_first": float(self.background_level[0]),
-             "background_level_last": float(self.background_level[-1]),
-             "flatfield_applied": self.flatfield is not None}, indent=2))
-        return path
-
-    @classmethod
-    def load(cls, path: str | Path) -> "PositionCorrection":
-        z = np.load(Path(path).with_suffix(".npz"), allow_pickle=False)
-        meta = json.loads(str(z["meta"]))
-        flat, grids, frames = z["flatfield"], z["background_grids"], z["sampled_frames"]
-        return cls(stem=meta["stem"], channel=meta["channel"],
-                   background_shape=z["background_shape"],
-                   background_level=z["background_level"],
-                   background_offset=z["background_offset"],
-                   frame_shape=tuple(meta["frame_shape"]),
-                   flatfield=flat if flat.size else None,
-                   block=meta["block"], darkfield=meta.get("darkfield"),
-                   background_grids=grids if grids.size else None,
-                   sampled_frames=frames if frames.size else None,
-                   diagnostics=meta.get("diagnostics", {}))
-
-
-# --------------------------------------------------------------------------
-# driver
-# --------------------------------------------------------------------------
-
-def estimate_position_correction(stack,
-                                 *,
-                                 stem: str = "",
-                                 channel: str = "",
-                                 labels: npt.NDArray | None = None,
-                                 flatfield: npt.NDArray | None = None,
-                                 darkfield: float | None = None,
-                                 background_model: str = "auto",
-                                 grid_min_blocks: float = 0.05,
-                                 n_frames: int = 24,
-                                 block: int = DEFAULT_BLOCK,
-                                 dilation: int = 121,
-                                 min_usable_blocks: float = 0.05,
-                                 how: str | None = None,
-                                 smooth: float = 1.5,
-                                 keep_grids: bool = True) -> PositionCorrection:
-    """Estimate the background correction for one position and channel.
-
-    Measures a background surface on `n_frames` evenly spaced frames, splits
-    those into one shape and a per-frame level, and interpolates the level over
-    the whole movie.
-
-    Parameters
-    ----------
-    stack : (t, y, x) array or anything indexable per frame
-        The fluorescence movie. A `tifffile` memory map is fine and preferred -
-        only the sampled frames are read.
-    labels : (t, ly, lx) array, optional
-        The instance or semantic segmentation, for masking cells out. Strongly
-        recommended; without it the estimator falls back to `clipped_mean`,
-        which is decent but not as good.
-    flatfield : 2D array, optional
-        The illumination correction, normally from `flatfield_from_blank_pair`
-        and shared by the whole plate. It is used twice: to divide out the
-        illumination, and - under `background_model="flatfield"` - as the shape
-        the background is fitted to. Without one the result corrects background
-        only, using the `"grid"` model.
-    darkfield : float, optional
-        Recorded for provenance if the `flatfield` you pass was derived using
-        one. Nothing in this function divides by it.
-    background_model : {"grid", "flatfield"}
-        How the measured block values become a surface. `"grid"`, the default,
-        fills and smooths the measured grid. `"flatfield"` instead fits
-        `offset + level * F` per frame - two numbers rather than ~1000 grid
-        points, no smoothing bias, and a fitted camera offset for free.
-
-        The constrained fit ought to win when the cells are faint, and on the
-        20250213 plate it does not: measured over 44k cells its residual radial
-        trend is 25% against the grid's 9% (GFP). The reason is that the
-        background is genuinely not proportional to `F` - out-of-focus haze
-        follows local cell density, which has its own shape - and the grid can
-        follow that where two parameters cannot. Reach for `"flatfield"` when
-        so few blocks survive masking that the grid is mostly interpolation, or
-        when you want the fitted offset as a diagnostic.
+        blocks upwards and loses below ~4%. 0.05 is deliberately conservative -
+        it switches only when the grid is genuinely inoperative.
     dilation : int
         How far from the segmentation to stay when measuring background, in
         fluorescence pixels, and **the single most important parameter here**.
@@ -1163,11 +687,11 @@ def estimate_position_correction(stack,
     # Which model can this position actually support? The grid needs enough
     # measured blocks to interpolate between; below a few percent it is mostly
     # inventing structure, and the two-parameter fit does better. Cross-
-    # validated on this plate by fitting each model to a random subset of
-    # blocks and predicting the held-out ones: the grid wins from 5% of blocks
-    # upwards (5.7 vs 5.8 counts at 5%, 4.5 vs 5.7 at 20%) and loses below
-    # ~4% (6.7 vs 6.0 at 2%). The flat-field fit's error plateaus around 5.6
-    # counts however many blocks it gets, which is what two parameters buys.
+    # validated by fitting each model to a random subset of blocks and
+    # predicting the held-out ones: the grid wins from 5% of blocks upwards
+    # (5.7 vs 5.8 counts at 5%, 4.5 vs 5.7 at 20%) and loses below ~4% (6.7 vs
+    # 6.0 at 2%). The fit's error plateaus near 5.6 counts however many blocks
+    # it gets, which is what two parameters buys.
     usable = float(np.mean([np.mean(np.isfinite(g)) for g in measured]))
     empty_frames = int(sum(1 for g in measured if not np.isfinite(g).any()))
     chosen, why = background_model, ""
@@ -1178,7 +702,7 @@ def estimate_position_correction(stack,
                 f"only {100*usable:.1f}% of blocks are measurable, below the "
                 f"{100*grid_min_blocks:.0f}% the grid model needs")
         else:
-            chosen, why = "grid", ""
+            chosen = "grid"
 
     # The grid model cannot produce a surface for a frame with no measured
     # block at all, so a position that crowded has to use the fit or fail.
@@ -1271,6 +795,85 @@ def estimate_position_correction(stack,
 # --------------------------------------------------------------------------
 # diagnostics
 # --------------------------------------------------------------------------
+
+def save_background_stack(correction: "PositionCorrection", path: str | Path,
+                          compression: str | None = "zlib") -> Path:
+    """Write the per-frame background map as a TIFF stack, for inspection.
+
+    `(n_frames, gy, gx)` float32 in counts, at the correction's own grid
+    resolution - 32 x 32 for the default 64-pixel block on a 2048 frame. It is
+    not upsampled on the way out because the surface genuinely has no structure
+    finer than one block; `read_background_stack(..., shape=...)` expands it
+    when something needs frame-sized pixels.
+
+    About 490 kB per position per channel compressed (137 frames), so ~12 MB
+    for a 13-position two-channel plate - 0.03% of that plate's raw stacks.
+
+    **The file name must not contain "background" or "intensity".**
+    `cellaap_analysis._load_maps` walks the *entire* root folder, the pipeline
+    directory included, treats any file matching those words as a plate-wide
+    correction map, and imreads it. A per-position surface picked up that way
+    would be applied to every position on the plate - silently reinstating the
+    blank-well bug this module exists to remove. This refuses such a name
+    rather than trusting the caller to remember.
+    """
+    path = Path(path).with_suffix(".tif")
+    if re.search(r"background|intensity", path.name):
+        raise ValueError(
+            f"{path.name!r} contains 'background' or 'intensity'; "
+            f"cellaap_analysis._load_maps would pick it up as a plate-wide "
+            f"correction map and apply this one position's surface to every "
+            f"position. Name it '<stem>_<channel>_bkg.tif' or similar.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    stack = correction.background_stack()
+    meta = {"stem": correction.stem, "channel": correction.channel,
+            "units": "counts", "block": correction.block,
+            "frame_shape": list(correction.frame_shape),
+            "grid_shape": list(correction.background_shape.shape),
+            "n_frames": int(stack.shape[0]),
+            "what": "per-frame background B(x,y,t) that was subtracted; "
+                    "upsample to frame_shape to overlay on the raw stack",
+            "diagnostics": correction.diagnostics}
+    import tifffile
+    tifffile.imwrite(path, stack, compression=compression,
+                     description=json.dumps(meta))
+    return path
+
+
+def read_background_stack(path: str | Path,
+                          shape: tuple[int, int] | None = None
+                          ) -> tuple[npt.NDArray, dict]:
+    """Read a stack written by `save_background_stack`.
+
+    Returns `(stack, metadata)`. Pass `shape` - or `metadata["frame_shape"]` -
+    to get it back at frame resolution, ready to subtract from or overlay on
+    the raw images.
+    """
+    import tifffile
+    with tifffile.TiffFile(path) as fh:
+        stack = fh.series[0].asarray().astype(np.float32)
+        try:
+            meta = json.loads(fh.pages[0].description)
+        except Exception:
+            meta = {}
+    if shape is not None:
+        stack = upsample_stack(stack, shape)
+    return stack, meta
+
+
+def upsample_stack(stack: npt.NDArray, shape: tuple[int, int]) -> npt.NDArray:
+    """`upsample` every frame of an `(n, gy, gx)` stack to `shape`.
+
+    Bilinear, frame by frame, so a 137 x 32 x 32 stack expanded to 2048 x 2048
+    becomes 2.3 GB - materialise a slice rather than the whole movie unless you
+    mean it.
+    """
+    a = np.asarray(stack, np.float32)
+    if a.ndim == 2:
+        return upsample(a, shape)
+    return np.stack([upsample(f, shape) for f in a])
+
 
 def _dilation_ladder(dilation: int) -> list[int]:
     """Exclusion widths to try, widest first, ending at no mask at all."""

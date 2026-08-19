@@ -458,6 +458,7 @@ except the optional CSV.
 └── pipeline/
     ├── state/{inference,analysis}/<position>.json    <- what finished, with which parameters
     ├── state/flatfield/{GFP,Texas_Red}.npz           <- the plate's flat fields
+    ├── state/surfaces/<stem>_<channel>_bkg.tif       <- background actually subtracted
     ├── superseded/                                   <- maps built from a well later swapped away
     ├── logs/{inference,analysis,flatfield}/*.log     <- one log per position
     ├── status.csv                                    <- written by `status --csv`
@@ -543,6 +544,11 @@ gives 1.220 and Texas Red 1.229.
 | `<ch>` | raw mean inside the cell mask |
 | `<ch>_corrected` | **the corrected signal** — `(raw − background) / flat field` |
 | `<ch>_bkg_corr`, `<ch>_int_corr` | legacy `*_map.tif` corrections, only if such files are still in the folder |
+
+The background each position subtracted is also kept, at grid resolution, in
+`pipeline/state/surfaces/` — ~490 kB per position-channel, ~12 MB for a plate.
+Open it in Fiji, or read it with `signal_correction.read_background_stack()`.
+The `corrections` sheet names the file for each channel.
 
 `<ch>_corrected` appears **per frame** in the `cell_data` sheet of
 `*_analysis.xlsx`, so corrected signal *dynamics* can be recovered, and

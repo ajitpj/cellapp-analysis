@@ -185,6 +185,38 @@ median, so the corrected numbers are directly comparable to the stock ones.
 
 ---
 
+## 3b. Inspecting the saved background surfaces
+
+The pipeline writes the background it actually subtracted, per position and
+channel, to `<root>/pipeline/state/surfaces/<stem>_<channel>_bkg.tif`:
+`(n_frames, 32, 32)` float32 **in counts**, ~490 kB per position-channel
+compressed — about 12 MB for a 13-position two-channel plate, against ~42 GB of
+raw stacks. The `corrections` sheet of each summary names the file.
+
+```python
+from signal_correction import read_background_stack, upsample_stack
+
+stack, meta = read_background_stack(path)              # (137, 32, 32), counts
+stack, meta = read_background_stack(path, shape=(2048, 2048))   # frame-sized
+one_frame   = upsample_stack(stack[68], (2048, 2048))  # just one, cheaply
+```
+
+`meta` carries the stem, channel, block size, frame shape and the full
+diagnostics dict, so a stack found on disk months later explains itself.
+
+It is stored at grid resolution because the surface has no structure finer than
+one block — upsampling adds pixels, not information. Expanding a whole 137-frame
+movie to 2048² is 2.3 GB, so take a slice unless you mean it.
+
+**The file name must not contain `background` or `intensity`.**
+`cellaap_analysis._load_maps` walks the entire root — the pipeline directory
+included — and loads any file matching those words as a *plate-wide* correction
+map. A per-position surface caught that way would be applied to every position,
+silently reinstating the blank-well bug. `save_background_stack` refuses such a
+name, and the pipeline names them `_bkg.tif`.
+
+---
+
 ## 4. The building blocks
 
 `estimate_position_correction` is a driver over these; reach for them directly
@@ -198,6 +230,9 @@ only when you want to do something it does not.
 | `background_surfaces(frames, cell_free, ...)` | the same over a sequence → `(n, gy, gx)` |
 | `fit_background_to_flatfield(grid, flatfield)` | fits `offset + level·F` to one grid, returns `(offset, level)`. The `background_model='flatfield'` path |
 | `upsample(grid, shape)` | bilinear resize of a coarse grid to a full frame |
+| `upsample_stack(stack, shape)` | the same, frame by frame over an `(n, gy, gx)` stack |
+| `save_background_stack(corr, path)` | write the per-frame background as a TIFF, with metadata |
+| `read_background_stack(path, shape=None)` | read one back, optionally frame-sized |
 | `centre_edge_ratio(grid)` | middle-to-rim ratio; a one-number vignette depth |
 
 Note `block_reduce_robust`'s `clipped_mean`: it clips the **high side only**,

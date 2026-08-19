@@ -1027,6 +1027,24 @@ def stage_status(root: Path, task: Task, stage: str) -> str:
 # still exists for reproducing an old run by hand, but nothing submits it.
 # ---------------------------------------------------------------------------
 
+def surface_dir(root: Path) -> Path:
+    """Where the per-position background surfaces are kept for inspection."""
+    return pipeline_dir(root) / "state" / "surfaces"
+
+
+def surface_path(root: Path, stem: str, channel: str) -> Path:
+    """`<stem>_<channel>_bkg.tif` - deliberately NOT `..._background.tif`.
+
+    cellaap_analysis._load_maps walks the whole root, this directory included,
+    and treats any file whose name matches `background|intensity` as a
+    plate-wide correction map. A per-position surface caught that way would be
+    applied to every position on the plate. signal_correction.save_background_stack
+    refuses such a name too; this is the belt to its braces.
+    """
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", channel).strip("_")
+    return surface_dir(root) / f"{stem}_{safe}_bkg.tif"
+
+
 def flatfield_dir(root: Path) -> Path:
     return pipeline_dir(root) / "state" / "flatfield"
 
@@ -1433,6 +1451,7 @@ def write_corrections_sheet(session, task: Task, root: Path,
             "frames_sampled": record.get("n_frames_sampled", ""),
             "background_model": record.get("background_model", ""),
             "model_switch_reason": record.get("background_model_reason", ""),
+            "surface_file": record.get("surface_file", ""),
         })
     if not rows:
         rows.append({"correction": "signal_correction (per position)",
@@ -1441,7 +1460,7 @@ def write_corrections_sheet(session, task: Task, root: Path,
                      "background_counts": "", "background_drift_percent": "",
                      "dilation_used_px": "", "unusable_block_fraction": "",
                      "frames_sampled": "", "background_model": "",
-                     "model_switch_reason": ""})
+                     "model_switch_reason": "", "surface_file": ""})
 
     legacy = {"background": session.background_map_present,
               "intensity": session.intensity_map_present}
@@ -1453,7 +1472,7 @@ def write_corrections_sheet(session, task: Task, root: Path,
             "background_counts": "", "background_drift_percent": "",
             "dilation_used_px": "", "unusable_block_fraction": "",
             "frames_sampled": "", "background_model": "",
-            "model_switch_reason": "",
+            "model_switch_reason": "", "surface_file": "",
         })
     frame = pd.DataFrame(rows)
 
@@ -1462,7 +1481,10 @@ def write_corrections_sheet(session, task: Task, root: Path,
             "of the two blank wells. `<ch>` is raw. `<ch>_bkg_corr` and "
             "`<ch>_int_corr` come from the legacy *_map.tif files if any were "
             "still in the folder, and are a DIFFERENT correction - do not mix "
-            "them with `<ch>_corrected`. See SIGNAL_CORRECTION_README.md.")
+            "them with `<ch>_corrected`. See SIGNAL_CORRECTION_README.md. "
+            "`surface_file` is the background this position actually "
+            "subtracted, saved at grid resolution; read it with "
+            "signal_correction.read_background_stack().")
 
     for summary in sorted(task.inference_dir.glob("*_summary*.xlsx")):
         try:
@@ -1535,6 +1557,17 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
             session.tracked["y"].to_numpy(dtype=float) * scale_y,
             session.tracked["frame"].to_numpy(dtype=int))
 
+        # Keep the surface that was subtracted, at grid resolution: ~490 kB
+        # per position-channel, against ~1.1 GB for the stack it came from.
+        # It is redundant with the correction object, which reconstructs it
+        # exactly, but a TIFF opens in Fiji and an npz does not.
+        try:
+            written = sc.save_background_stack(
+                correction, surface_path(task.root, task.stem, channel))
+        except Exception as exc:
+            written = None
+            log(f"  ! could not save the {channel} background surface ({exc})")
+
         d = correction.diagnostics
         measured = session.tracked[f"{channel}_corrected"].notna().sum()
         fell_back = d["background_model"] != d.get("background_model_requested")
@@ -1545,6 +1578,9 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
             f"{100*d['unusable_block_fraction']:.0f}% blocks unusable, "
             f"flat field {'yes' if flat is not None else 'NO - background only'}, "
             f"model {d['background_model']}, {measured} rows")
+        if written:
+            log(f"    surface saved to {written.parent.name}/{written.name} "
+                f"({written.stat().st_size/1024:.0f} kB)")
         if d.get("background_model_reason"):
             log(f"    ! switched to the {d['background_model']} background model: "
                 f"{d['background_model_reason']}")
@@ -1554,6 +1590,7 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
             "flatfield": flat_meta["bright_source"] if flat_meta else "",
             "flatfield_dim_source": flat_meta["dim_source"] if flat_meta else "",
             "flatfield_centre_edge": flat_meta["centre_edge"] if flat_meta else "",
+            "surface_file": str(written.relative_to(task.root)) if written else "",
             **{k: (json.dumps(v) if isinstance(v, list) else v)
                for k, v in d.items()},
         })
