@@ -497,6 +497,95 @@ python pipeline.py analyze --root <folder> --semantic-gap 5    # override gap cl
 `--force` redoes positions that are already finished. This is the quickest way
 to try tracking parameters on a single movie before committing the plate.
 
+## Reusing the tracks from an older analysis
+
+Re-analyzing a plate that an older cellaap version already processed: instead
+of running trackpy, each position takes its tracks from that run's
+`*_analysis.xlsx`, so the same cells are followed and only the measurement
+changes. This is the default (`--reuse-tracks`); `--no-reuse-tracks` turns it
+off and tracks everything from scratch.
+
+What comes from the old file is **which cell is which and where it was** —
+`particle`, `frame`, `x`, `y`, `label`, `area`. Everything else is recomputed
+by the current code on the current segmentation: the semantic label, the
+dead/mitotic classification, every fluorescence number, the background and
+flat-field correction, and the summary. The old run's measurement columns
+(`GFP`, `GFP_bkg_corr`, `offset`, its own `dead_flag` and `mitotic`) are
+dropped on load, so nothing stale can survive into the new workbook.
+
+It is per position. A folder with no legacy analysis file is tracked normally,
+so a plate can be part re-analysis and part fresh — `check` reports the split:
+
+```
+tracks:    22 position(s) reuse the tracks from a previous analysis, 2 tracked from scratch
+           ! 20250621_cycb_E11_s3_phs: no legacy analysis file in 20250621_cycb_E11_s3_phs_HeLa_focal_1800_0.25_inference
+```
+
+Positions missing an inference folder are segmented first, exactly as usual;
+`submit` puts them in the GPU array and everything else straight into a CPU-only
+analysis array.
+
+### The old files are moved, not overwritten
+
+Before the first write, the legacy `*_analysis.xlsx` and `*_summary.xlsx` are
+moved into `<inference_dir>/legacy/` with a README saying what they are. Two
+reasons: the old and new analysis files can share a name, and then the first
+save would overwrite the very coordinates the run is reading; and a legacy
+`*_summary.xlsx` left in place looks like a finished analysis, which would make
+every position on the plate report `done` and skip. A re-run reads the stashed
+copy, so the reuse is repeatable.
+
+### How the semantic label is derived
+
+Not from the semantic value at the centroid. A concave or crescent-shaped mask
+does not contain its own centroid, so the lookup lands on background or on the
+neighbouring cell; and where two cells touch, the segmentation writes their
+**sum** (199 = 99 + 100 for an interphase cell overlapping a mitotic one),
+which no single-pixel lookup can decode.
+
+Instead each detection is scored over its own instance mask: the fraction of
+the cell's pixels carrying the mitotic value, called mitotic above 0.5. On real
+data that fraction is nearly binary — mean 0.998 for detections a centroid
+calls mitotic, 0.000 for the rest — so the threshold does no real work.
+
+Measured over a 24-position plate (3.9M detections), the mask rule disagrees
+with a centroid lookup on ~0.03% of rows, and **always** by finding a mitotic
+cell the centroid missed, never the reverse. After the median smoothing that
+follows, the mitotic track set is identical either way. The rule is there for
+robustness on crowded fields, not to change results.
+
+The legacy `semantic` column is deliberately not reused: it was already
+median-filtered, against a different non-mitotic baseline (99 rather than 1),
+and smoothing an already-smoothed trace is not idempotent.
+
+### Which label identifies the cell
+
+The `label` from the old file, not a fresh lookup at the centroid. It is
+verifiable — the mask it names has exactly the pixel count the file recorded as
+`area` — whereas the centroid is not. On the reference plate the two disagree on
+0.05% of rows and the file's label is right in every one of them; a third of
+those centroids land on background, where a fresh lookup would give label 0 and
+measure nothing at all.
+
+A label that is **absent** from its frame is the real failure case — it means
+the segmentation is not the one the old table was built from. Those rows fall
+back to the centroid for both label and semantic value, and the run says so
+loudly in the log and in the summary's `corrections` sheet.
+
+### Provenance
+
+The summary's `corrections` sheet gains a `tracks reused from a previous
+analysis` row naming the source file, the track and detection counts, the
+resolved mitotic value, and the discrepancy counts (centroid/mask disagreements,
+centroids outside their own mask, masks whose size differs from the recorded
+area, labels absent from their frame). The sheet is written only to this run's
+summary — the stashed legacy one is left exactly as it was.
+
+Switching between `--reuse-tracks` and `--no-reuse-tracks` is part of the
+analysis parameter fingerprint, so a position finished under one mode reports
+`stale` under the other and is re-run rather than silently keeping the other
+mode's numbers.
+
 ## Signal correction
 
 Two corrections are applied, and they are estimated in different places

@@ -361,6 +361,10 @@ class Task:
     # finished positions stale rather than silently leaving them uncorrected
     # under the old settings.
     correction_params: dict = dc_field(default_factory=dict)
+    # Take the tracks from a legacy *_analysis.xlsx in the inference folder
+    # instead of running trackpy. Per-position: a folder with no legacy file
+    # falls back to tracking, so a plate can be part re-analysis, part fresh.
+    reuse_tracks: bool = True
 
     @property
     def stem(self) -> str:
@@ -384,7 +388,11 @@ class Task:
                 "inference_dir": self.inference_dir.name,
                 # Changing how the signal is corrected has to re-run the
                 # analysis, the same as changing the cell type would.
-                "correction": dict(self.correction_params)}
+                "correction": dict(self.correction_params),
+                # Reused tracks and freshly tracked ones are different results
+                # from the same folder, so switching the mode makes a finished
+                # position stale rather than leaving the other mode's numbers.
+                "reuse_tracks": bool(self.reuse_tracks)}
 
 
 def discover_positions(root: Path, pattern: str = "*phs.tif") -> list[Position]:
@@ -748,7 +756,8 @@ def correction_params(args) -> dict:
 
 
 def build_tasks(root: Path, positions: list[Position], rows: list[PlateRow],
-                autodetect_channels: bool = True, correction: dict | None = None
+                autodetect_channels: bool = True, correction: dict | None = None,
+                reuse_tracks: bool = True
                 ) -> tuple[list[Task], list[MapWell], list[str]]:
     """Join positions to platemap rows. Returns (tasks, map_wells, warnings).
 
@@ -838,6 +847,7 @@ def build_tasks(root: Path, positions: list[Position], rows: list[PlateRow],
             conf_threshold=threshold, analysis_cell_type=analysis_cell_type,
             channels=channels, mapped=mapped, root=root,
             correction_params=dict(correction or {}),
+            reuse_tracks=reuse_tracks,
         ))
 
     # A row covering a whole plate row (B01-B12) when only three wells were
@@ -913,8 +923,22 @@ def inference_outputs_present(task: Task) -> bool:
 
 
 def analysis_outputs_present(task: Task) -> bool:
+    """Whether THIS pipeline's summary is on disk for this position.
+
+    In reuse mode the folder also holds the previous run's summary, under a
+    prefix the current code would never compose. Globbing for any
+    `*_summary.xlsx` would count that one and report the position finished
+    before it has been re-analyzed at all, so our own name is checked instead
+    - it is derivable from the instance file without reading anything.
+    """
     d = task.inference_dir
-    return d.is_dir() and any(p.stat().st_size > 0 for p in d.glob("*_summary.xlsx"))
+    if not d.is_dir():
+        return False
+    own = own_output_names(task)
+    if task.reuse_tracks and own:
+        summary = d / own[1]
+        return summary.exists() and summary.stat().st_size > 0
+    return any(p.stat().st_size > 0 for p in d.glob("*_summary.xlsx"))
 
 
 def outputs_mtime(task: Task, stage: str) -> float | None:
@@ -988,6 +1012,12 @@ def stage_status(root: Path, task: Task, stage: str) -> str:
 
     if state is None:
         if not present:
+            return "pending"
+        # Reuse mode re-analyzes exactly the folders a previous version already
+        # finished, so "there are outputs here" says nothing about whether this
+        # pipeline has run. Without a marker of its own it has not, and
+        # adopting the old run's summary would skip the whole plate.
+        if stage == "analysis" and task.reuse_tracks:
             return "pending"
         # Adoption is for folders produced before markers existed. It becomes a
         # trap when a position was killed mid-run: the kill writes no marker, so
@@ -1414,8 +1444,235 @@ def cmd_infer(args) -> int:
 # Stage 2: analysis (img-env, CPU)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Reusing the tracks from a legacy analysis
+#
+# Re-analyzing an experiment that an old cellaap version already processed: the
+# tracks are taken from that run's `*_analysis.xlsx` rather than recomputed, so
+# the same cells are followed and only the measurement changes. Everything
+# downstream - the dead/mitotic call, the fluorescence measurement, the
+# background and flat-field correction, the summary - is the current code
+# running on the current segmentation.
+#
+# Two things about those files are not derivable from the current naming.
+# First, the analysis file's prefix is whatever the old version happened to
+# write (`20250621_cycb__0.3B11_s2_analysis.xlsx` where this pipeline would
+# compose `20250621_cycb_B11_s2_analysis.xlsx`), so it is found by glob and
+# told apart from our own output by name. Second, its `semantic` column has
+# already been median-filtered against a different non-mitotic baseline, so it
+# is re-derived from the segmentation here and smoothed exactly once - running
+# _label_semantic over an already-filtered trace is not idempotent.
+# ---------------------------------------------------------------------------
+
+# What is carried over from the legacy table. A whitelist, not a blacklist: the
+# old file also holds that run's measurements (GFP, GFP_bkg_corr, an `offset`
+# column of unrecorded provenance) and its own dead/mitotic verdicts, and every
+# one of those is about to be recomputed. Anything not named here is dropped,
+# so a stale number cannot survive into the new workbook under a column name
+# nothing overwrites.
+LEGACY_REQUIRED = ("frame", "x", "y", "area", "label", "particle")
+LEGACY_OPTIONAL = ("eccentricity", "bbox-0", "bbox-1", "bbox-2", "bbox-3")
+
+# Fraction of a cell's own mask that must carry the mitotic value for the
+# detection to be called mitotic. The measurement is close to binary - a cell's
+# mask is typically >99% one class or the other - so anything from 0.1 to 0.7
+# gives the same answer; 0.5 is the honest middle.
+MITOTIC_MASK_FRACTION = 0.5
+
+LEGACY_STASH_DIRNAME = "legacy"
+
+LEGACY_STASH_NOTE = """\
+Output of the cellaap version that analyzed this folder before it was
+re-analyzed with reused tracks (pipeline.py analyze --reuse-tracks).
+
+The track coordinates in *_analysis.xlsx here are the INPUT to that re-analysis:
+the same cells were followed, and everything else - the dead/mitotic call, the
+fluorescence measurement, the background and flat-field correction, the summary
+- was recomputed by the current code. The new workbooks are in the folder above.
+
+These files are moved rather than copied so that nothing globbing the inference
+folder for *_analysis.xlsx or *_summary.xlsx can pick up the old run by
+accident. They are not read again once the re-analysis has written its own
+analysis file, and are kept only as the record of what was there before.
+"""
+
+
+def own_output_names(task: Task) -> tuple[str, str] | None:
+    """The `*_analysis.xlsx` / `*_summary.xlsx` names OUR run will write.
+
+    cellaap_analysis composes both from the instance file's stem, so they are
+    predictable from a directory listing alone - no stack is read. That is what
+    lets a legacy workbook be told from ours when the two sit in one folder
+    under different prefixes.
+    """
+    d = task.inference_dir
+    if not d.is_dir():
+        return None
+    instance = next((p for p in d.glob("*.tif") if "instance" in p.name), None)
+    semantic = next((p for p in d.glob("*.tif") if "semantic" in p.name), None)
+    if instance is None or semantic is None:
+        return None
+    stub = STUB_RE.search(semantic.name)
+    if stub is None:
+        return None
+    stub = stub.group()
+    expt = instance.name.split(stub)[0]
+    return f"{expt}{stub}_analysis.xlsx", f"{expt}{stub}_summary.xlsx"
+
+
+def legacy_stash_dir(task: Task) -> Path:
+    return task.inference_dir / LEGACY_STASH_DIRNAME
+
+
+def find_legacy_analysis(task: Task) -> Path | None:
+    """The previous run's `*_analysis.xlsx` for this position, if there is one.
+
+    Looks in the stash first, so a second run reads the same file the first one
+    did rather than mistaking our own output for the legacy one. `*_analysis`
+    only - the suffixed files augment_dead_label writes (`*_analysis_dead.xlsx`)
+    are a derived product of a run, not the run itself.
+    """
+    stub = task.pos.stub
+    stashed = sorted(legacy_stash_dir(task).glob(f"*{stub}_analysis.xlsx"))
+    if stashed:
+        return stashed[0]
+
+    own = own_output_names(task)
+    own_analysis = own[0] if own else None
+    found = [p for p in sorted(task.inference_dir.glob(f"*{stub}_analysis.xlsx"))
+             if p.name != own_analysis and p.stat().st_size > 0]
+    if not found:
+        return None
+    if len(found) > 1:
+        die(f"{task.stem}: {len(found)} candidate legacy analysis files in "
+            f"{task.inference_dir.name} ({', '.join(p.name for p in found)}). "
+            f"Leave one and move the rest aside.")
+    return found[0]
+
+
+def stash_legacy_outputs(task: Task, analysis: Path) -> list[Path]:
+    """Move the legacy analysis/summary pair into `<inference_dir>/legacy/`.
+
+    Called once the legacy table is in memory and before anything writes, for
+    two reasons. The old and new analysis files can share a name - they do
+    whenever the old prefix happens to match - and then measure_signal's first
+    save would overwrite the very file the coordinates came from, leaving no
+    way to re-run. And a legacy `*_summary.xlsx` left in place is picked up by
+    analysis_outputs_present as a finished analysis, which would make every
+    position on the plate report done and skip.
+    """
+    if analysis.parent == legacy_stash_dir(task):
+        return []                       # already stashed by an earlier run
+    stash = legacy_stash_dir(task)
+    stash.mkdir(parents=True, exist_ok=True)
+    note = stash / "README.txt"
+    if not note.exists():
+        note.write_text(LEGACY_STASH_NOTE)
+
+    moved = []
+    summary = analysis.with_name(analysis.name.replace("_analysis.", "_summary."))
+    for src in (analysis, summary):
+        if not src.exists():
+            continue
+        dest = stash / src.name
+        if dest.exists():
+            continue
+        shutil.move(str(src), str(dest))
+        moved.append(dest)
+    return moved
+
+
+def mask_semantic_values(instance, semantic, frames, labels, defaults,
+                         threshold: float = MITOTIC_MASK_FRACTION):
+    """Each detection's semantic label, read over its whole instance mask.
+
+    The obvious rule - read the semantic frame at the centroid - is wrong for
+    two kinds of cell. A concave or crescent-shaped mask does not contain its
+    own centroid, so the lookup lands on background or on the neighbour; and
+    where two cells touch, the segmentation writes their SUM (199 = 99 + 100
+    for an interphase cell overlapping a mitotic one), which no lookup can
+    decode. Both show up as isolated wrong frames in a track.
+
+    So each detection is scored over its own mask instead: the fraction of the
+    cell's pixels carrying the mitotic value. On real data that fraction is
+    close to binary - mean 0.998 for the detections a centroid calls mitotic
+    and 0.000 for the rest - so the threshold does no real work and the rule
+    disagrees with the centroid on ~0.03% of rows, always by finding a mitotic
+    cell the centroid missed and never the other way round.
+
+    Returns (values, mask_px, diagnostics). `values` goes into
+    `tracked.semantic` and is then smoothed by _label_semantic exactly as a
+    freshly tracked table is; `mask_px` is each detection's mask size, which
+    the caller checks against the area the previous run recorded.
+    """
+    import numpy as np
+
+    frames = np.asarray(frames, dtype=np.int64)
+    labels = np.asarray(labels, dtype=np.int64)
+
+    # Resolve which value means mitotic against the segmentation itself, the
+    # same way _label_semantic does against the table - different cellaap
+    # versions write 100 or 101, and guessing wrong finds no mitosis at all.
+    top = int(semantic.max())
+    if top > 4095:
+        raise ValueError(f"semantic segmentation holds values up to {top}; this "
+                         f"is not a class map and cannot be scored over masks")
+    width = top + 1
+    occurs = np.zeros(width, dtype=np.int64)
+    for f in range(len(semantic)):
+        occurs += np.bincount(semantic[f].reshape(-1), minlength=width)
+    present = [v for v in defaults.mitotic_semantic_values
+               if v <= top and occurs[v] > 0]
+    if len(present) != 1:
+        raise ValueError(
+            f"cannot tell which semantic value means mitotic: "
+            f"{defaults.mitotic_semantic_values} against a segmentation whose "
+            f"values reach {top} (matched {present}). Set "
+            f"analysis_pars.mitotic_semantic_values for this dataset.")
+    mitotic_value = present[0]
+
+    # Per frame, the histogram of semantic values under each instance label, in
+    # one bincount over label*width + value. Doing it per detection instead
+    # would compare a full 1024x1024 frame per row - hundreds of thousands of
+    # passes over the stack for a single position.
+    counts = np.zeros((len(frames), width), dtype=np.int64)
+    for f in np.unique(frames):
+        lab = instance[f].reshape(-1).astype(np.int64)
+        val = semantic[f].reshape(-1).astype(np.int64)
+        n = int(lab.max()) + 1
+        hist = np.bincount(lab * width + val,
+                           minlength=n * width).reshape(n, width)
+        rows = np.flatnonzero(frames == f)
+        inside = labels[rows] < n
+        counts[rows[inside]] = hist[labels[rows[inside]]]
+
+    mask_px = counts.sum(axis=1) - counts[:, 0]      # value 0 is background
+    mitotic_px = counts[:, mitotic_value]
+    fraction = mitotic_px / np.maximum(mask_px, 1)
+    is_mitotic = (mask_px > 0) & (fraction > threshold)
+
+    # Non-mitotic rows keep the most common real value under the mask rather
+    # than a sentinel, so tracked.semantic still reads as segmentation output.
+    # _label_semantic collapses all of them to 1 anyway.
+    other = counts.copy()
+    other[:, 0] = 0
+    other[:, mitotic_value] = 0
+    values = np.where(other.any(axis=1), other.argmax(axis=1), 1)
+    values[is_mitotic] = mitotic_value
+
+    diagnostics = {
+        "mitotic_value": int(mitotic_value),
+        "mask_fraction_threshold": float(threshold),
+        "rows": int(len(frames)),
+        "rows_mitotic": int(is_mitotic.sum()),
+        "rows_empty_mask": int((mask_px == 0).sum()),
+    }
+    return values, mask_px, diagnostics
+
+
 def write_corrections_sheet(session, task: Task, root: Path,
-                            corrections: list[dict] | None = None) -> None:
+                            corrections: list[dict] | None = None,
+                            reuse: dict | None = None) -> None:
     """Append a `corrections` sheet to this position's summary workbook.
 
     The summary is the file that outlives the run, so the provenance of the
@@ -1462,6 +1719,38 @@ def write_corrections_sheet(session, task: Task, root: Path,
                      "frames_sampled": "", "background_model": "",
                      "model_switch_reason": "", "surface_file": ""})
 
+    if reuse:
+        rows.append({
+            "correction": "tracks reused from a previous analysis",
+            "channel": "", "applied": "yes",
+            "flatfield_from": reuse.get("source", ""),
+            "flatfield_centre_edge": "",
+            "background_counts": f"{reuse.get('tracks', '')} tracks, "
+                                 f"{reuse.get('detections', '')} detections",
+            "background_drift_percent": "",
+            "dilation_used_px": "",
+            "unusable_block_fraction": "",
+            "frames_sampled": "",
+            "background_model": f"mitotic value {reuse.get('mitotic_value', '')} "
+                                f"over >{reuse.get('mask_fraction_threshold', '')} "
+                                f"of each mask",
+            "model_switch_reason": "; ".join(filter(None, [
+                f"{reuse['centroid_semantic_disagree']} row(s) where the mask "
+                f"rule and a centroid lookup disagree"
+                if reuse.get("centroid_semantic_disagree") else "",
+                f"{reuse['centroid_outside_mask']} row(s) whose centroid falls "
+                f"outside their own mask"
+                if reuse.get("centroid_outside_mask") else "",
+                f"{reuse['mask_area_mismatch']} mask(s) whose size differs from "
+                f"the area recorded by the previous run"
+                if reuse.get("mask_area_mismatch") else "",
+                f"WARNING: {reuse['labels_absent_from_frame']} label(s) absent "
+                f"from their frame, fell back to the centroid lookup"
+                if reuse.get("labels_absent_from_frame") else "",
+            ])) or "no discrepancies",
+            "surface_file": "",
+        })
+
     legacy = {"background": session.background_map_present,
               "intensity": session.intensity_map_present}
     for role, present in legacy.items():
@@ -1485,8 +1774,24 @@ def write_corrections_sheet(session, task: Task, root: Path,
             "`surface_file` is the background this position actually "
             "subtracted, saved at grid resolution; read it with "
             "signal_correction.read_background_stack().")
+    if reuse:
+        note += (" The tracks in this run were NOT recomputed: they come from "
+                 f"{reuse['source']}, written by the cellaap version that "
+                 "analyzed this folder before. Which cells were followed, and "
+                 "where, is that run's; the semantic label, the dead/mitotic "
+                 "call, every fluorescence number and this correction are the "
+                 "current code's. The old workbooks are in "
+                 f"{LEGACY_STASH_DIRNAME}/.")
 
-    for summary in sorted(task.inference_dir.glob("*_summary*.xlsx")):
+    # Only our own summary. A legacy `*_summary.xlsx` under a different prefix
+    # is a record of the previous run, and annotating it with this run's
+    # corrections would misattribute them.
+    own = own_output_names(task)
+    if own and (task.inference_dir / own[1]).exists():
+        summaries = [task.inference_dir / own[1]]
+    else:
+        summaries = sorted(task.inference_dir.glob("*_summary*.xlsx"))
+    for summary in summaries:
         try:
             # Replace on a re-run so the sheet never accumulates stale rows,
             # then append the note through openpyxl - a second to_excel call
@@ -1601,6 +1906,148 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
     return records
 
 
+def load_legacy_tracks(session, task: Task, analysis: Path) -> dict:
+    """Put the previous run's tracks on `session.tracked`, in place of tracking.
+
+    Stands in for `track_centroids`, and leaves the session in the same state
+    it would: a table sorted by particle and frame with a fresh index, the
+    semantic columns smoothed, the dead/mitotic probabilities filled in, the
+    frame shape remembered for the border test, and the phase stack dropped.
+
+    What is taken from the file is the track membership and the coordinates -
+    which cell is which, and where it was. Everything else is recomputed here,
+    because everything else is what the re-analysis is for.
+    """
+    import numpy as np
+    import pandas as pd
+    from dead_classifier import classify_dead, rows_to_classify
+
+    sheets = pd.read_excel(analysis, sheet_name=None, index_col=0)
+    # 'cell_data' in files this pipeline wrote, 'Sheet1' in the old ones.
+    cell = sheets["cell_data" if "cell_data" in sheets else list(sheets)[0]]
+    log(f"  reusing tracks from {analysis.name} "
+        f"({len(cell)} detections, sheet {'cell_data' if 'cell_data' in sheets else list(sheets)[0]!r})")
+
+    missing = [c for c in LEGACY_REQUIRED if c not in cell.columns]
+    if missing:
+        raise RuntimeError(f"{analysis.name} has no {missing} column(s); it "
+                           f"cannot be used as a track source")
+
+    keep = list(LEGACY_REQUIRED) + [c for c in LEGACY_OPTIONAL if c in cell.columns]
+    dropped = [c for c in cell.columns if c not in keep]
+    tracked = cell[keep].copy()
+    for column in ("frame", "x", "y", "label", "particle"):
+        tracked[column] = tracked[column].astype(int)
+    # track_centroids leaves the table in this order with a fresh index, and
+    # _label_semantic smooths each track over its rows in frame order.
+    tracked = tracked.sort_values(["particle", "frame"]).reset_index(drop=True)
+    session.tracked = tracked
+    if dropped:
+        log(f"    dropped {len(dropped)} column(s) from the old run "
+            f"({', '.join(map(str, dropped[:8]))}{' ...' if len(dropped) > 8 else ''})")
+
+    instance = session.stacks["instance"]
+    semantic = session.stacks["semantic"]
+    n_frames = instance.shape[0]
+    late = tracked.frame >= n_frames
+    if late.any():
+        raise RuntimeError(
+            f"{analysis.name} references frame {int(tracked.frame.max())} but the "
+            f"segmentation in {task.inference_dir.name} has {n_frames} frames; "
+            f"the two are not from the same acquisition")
+
+    # The legacy label is the authority on which mask belongs to which track:
+    # it is verifiable against the segmentation, since the mask it names has
+    # exactly the pixel count the file recorded as `area`. The centroid is not
+    # - a concave cell does not contain its own centroid - so where the two
+    # disagree the label is kept and the centroid ignored. A label that is
+    # absent from its frame is the real failure (the segmentation is not the
+    # one this table was built from) and falls back to the centroid lookup,
+    # which is the only evidence left.
+    values, mask_px, diag = mask_semantic_values(
+        instance, semantic, tracked.frame.to_numpy(), tracked.label.to_numpy(),
+        session.defaults)
+
+    frames = tracked.frame.to_numpy(int)
+    xs, ys = tracked.x.to_numpy(int), tracked.y.to_numpy(int)
+    centroid_label = instance[frames, xs, ys]
+    centroid_semantic = semantic[frames, xs, ys]
+
+    orphan = mask_px == 0
+    area_mismatch = int((mask_px != tracked.area.to_numpy())[~orphan].sum())
+    label_disagree = int((centroid_label != tracked.label.to_numpy()).sum())
+    if orphan.any():
+        # There was no mask to score, so both the label and the semantic value
+        # fall back to the centroid - the only evidence left once the table
+        # names a cell the segmentation does not contain.
+        tracked.loc[orphan, "label"] = centroid_label[orphan]
+        values[orphan] = centroid_semantic[orphan]
+        log(f"  ! {int(orphan.sum())} row(s) name an instance label that is "
+            f"absent from their frame; label and semantic fell back to the "
+            f"centroid lookup. The segmentation in {task.inference_dir.name} "
+            f"may not be the one {analysis.name} was built from")
+
+    semantic_disagree = int(((centroid_semantic == diag["mitotic_value"])
+                             != (values == diag["mitotic_value"])).sum())
+
+    tracked["semantic"] = values
+    # Resolved against the segmentation already; setting it here keeps
+    # _label_semantic from resolving it a second time against the table.
+    session.defaults.mitotic_mask_value = diag["mitotic_value"]
+    session._label_semantic()
+
+    log(f"  mask-rule semantic: mitotic value {diag['mitotic_value']}, "
+        f"{diag['rows_mitotic']}/{diag['rows']} detections mitotic; "
+        f"{semantic_disagree} disagree with the centroid lookup, "
+        f"{label_disagree} row(s) have a centroid outside their own mask, "
+        f"{area_mismatch} mask(s) differ in size from the recorded area")
+
+    # Remembered for the border test in summarize_data, exactly as
+    # track_centroids does.
+    session.frame_shape = tuple(instance.shape[-2:])
+
+    # The old file carries a dead_flag but no probabilities, and summarize_data
+    # dates the death from the probability trace, so the classifier is re-run
+    # over the same rows it would score in a fresh analysis.
+    n_to_classify = len(rows_to_classify(
+        session.tracked, session.defaults.mitotic_semantic_values,
+        session.defaults.post_peak_frames))
+    log(f"  classifying {n_to_classify} detections (mitotic + "
+        f"{session.defaults.post_peak_frames} frames after each episode)...")
+    label_df = classify_dead(session.stacks["phase"], instance, session.tracked,
+                             session.defaults.dead_classifier_bundle,
+                             mitotic_values=session.defaults.mitotic_semantic_values,
+                             post_peak_frames=session.defaults.post_peak_frames)
+    session.tracked["mitotic_proba"] = np.nan
+    session.tracked["dead_proba"] = np.nan
+    session.tracked["dead_flag"] = 0
+    session.tracked.loc[label_df.index, "mitotic_proba"] = label_df.mitotic_proba
+    session.tracked.loc[label_df.index, "dead_proba"] = label_df.dead_proba
+    session.tracked.loc[label_df.index, "dead_flag"] = label_df.dead_flag
+
+    # Same reason as track_centroids: the classifier is the only consumer of
+    # the full-resolution phase stack, and it is ~3.8 GB sitting next to the
+    # channel stack measure_signal loads next.
+    session.stacks.pop("phase", None)
+
+    tracks = int(session.tracked.particle.nunique())
+    mitotic = int(session.tracked[session.tracked.mitotic == 1].particle.nunique())
+    log(f"  {tracks} tracks reused, {mitotic} of them mitotic")
+
+    return {
+        "source": analysis.name,
+        "detections": int(len(session.tracked)),
+        "tracks": tracks,
+        "tracks_mitotic": mitotic,
+        "columns_dropped": ", ".join(map(str, dropped)),
+        "centroid_semantic_disagree": semantic_disagree,
+        "centroid_outside_mask": label_disagree,
+        "mask_area_mismatch": area_mismatch,
+        "labels_absent_from_frame": int(orphan.sum()),
+        **diag,
+    }
+
+
 def run_analysis_one(session, task: Task, semantic_gap: int | None,
                      args=None) -> None:
     """Track, measure, correct and summarize one inference folder."""
@@ -1616,12 +2063,31 @@ def run_analysis_one(session, task: Task, semantic_gap: int | None,
 
     # The session object is reused across positions when this runs locally,
     # and summarize_data/measure_signal would otherwise see the previous
-    # position's frames.
-    for attr in ("summaryDF", "tracked"):
+    # position's frames. frame_shape is on the list because the reuse path and
+    # track_centroids both set it, and a stale one silently moves the border
+    # test onto the wrong frame size.
+    for attr in ("summaryDF", "tracked", "frame_shape"):
         if hasattr(session, attr):
             delattr(session, attr)
 
-    session.track_centroids(session.defaults.track_mode, save_flag=True)
+    # Reuse is per position: a folder the old version never analyzed has no
+    # track source, so it is tracked from scratch and reported as such rather
+    # than failing the plate.
+    legacy = find_legacy_analysis(task) if task.reuse_tracks else None
+    if legacy is not None:
+        reuse = load_legacy_tracks(session, task, legacy)
+        # Only once the table is in memory: the two workbooks can share a name,
+        # and then the first save would overwrite the coordinates we just read.
+        for moved in stash_legacy_outputs(task, legacy):
+            log(f"    moved {moved.name} to "
+                f"{LEGACY_STASH_DIRNAME}/ before writing the new one")
+    else:
+        if task.reuse_tracks:
+            log(f"  no legacy analysis file in {task.inference_dir.name}; "
+                f"tracking this position from scratch")
+        reuse = None
+        session.track_centroids(session.defaults.track_mode, save_flag=True)
+
     for channel in task.channels:
         if channel not in session.paths:
             log(f"  ! no {channel} stack for this position; not measured")
@@ -1637,7 +2103,7 @@ def run_analysis_one(session, task: Task, semantic_gap: int | None,
     corrections = apply_signal_correction(session, task, args) if args else []
 
     session.summarize_data(True)
-    write_corrections_sheet(session, task, task.root, corrections)
+    write_corrections_sheet(session, task, task.root, corrections, reuse)
 
 
 def cmd_analyze(args) -> int:
@@ -1705,7 +2171,8 @@ def load_tasks_for_run(root: Path, args) -> list[Task]:
     rows = read_platemap(mapfile)
     positions = discover_positions(root, args.pattern)
     tasks, map_wells, warnings = build_tasks(
-        root, positions, rows, correction=correction_params(args))
+        root, positions, rows, correction=correction_params(args),
+        reuse_tracks=getattr(args, "reuse_tracks", True))
 
     if getattr(args, "tasks", None):
         wanted = [ln.strip() for ln in Path(args.tasks).read_text().splitlines()
@@ -1779,7 +2246,8 @@ def cmd_check(args) -> int:
     if not positions:
         die(f"no files matching {args.pattern} in {root}")
     tasks, map_wells, warnings = build_tasks(
-        root, positions, rows, correction=correction_params(args))
+        root, positions, rows, correction=correction_params(args),
+        reuse_tracks=getattr(args, "reuse_tracks", True))
 
     problems: list[str] = []
     for task in tasks:
@@ -1844,6 +2312,19 @@ def cmd_check(args) -> int:
     log("")
     log(f"inference: {fmt_counts(counts['inference'])}")
     log(f"analysis:  {fmt_counts(counts['analysis'])}")
+    if args.reuse_tracks:
+        reused, fresh = [], []
+        for task in tasks:
+            (reused if find_legacy_analysis(task) else fresh).append(task)
+        log(f"tracks:    {len(reused)} position(s) reuse the tracks from a "
+            f"previous analysis, {len(fresh)} tracked from scratch")
+        for t in fresh[:10]:
+            log(f"           ! {t.stem}: no legacy analysis file in "
+                f"{t.inference_dir.name}")
+        if len(fresh) > 10:
+            log(f"           ! ... and {len(fresh) - 10} more")
+    else:
+        log("tracks:    --no-reuse-tracks; every position is tracked from scratch")
     if any(not t.mapped for t in tasks):
         log(f"* well not in the platemap; defaulted to {DEFAULT_CELLTYPE}")
 
@@ -1907,7 +2388,8 @@ def cmd_status(args) -> int:
     rows = read_platemap(platemap_path(root))
     positions = discover_positions(root, args.pattern)
     tasks, map_wells, _ = build_tasks(
-        root, positions, rows, correction=correction_params(args))
+        root, positions, rows, correction=correction_params(args),
+        reuse_tracks=getattr(args, "reuse_tracks", True))
 
     records = []
     for task in tasks:
@@ -3043,7 +3525,8 @@ def cmd_submit(args) -> int:
     rows = read_platemap(platemap_path(root))
     positions = discover_positions(root, args.pattern)
     tasks, map_wells, warnings = build_tasks(
-        root, positions, rows, correction=correction_params(args))
+        root, positions, rows, correction=correction_params(args),
+        reuse_tracks=getattr(args, "reuse_tracks", True))
     if not tasks:
         die("the platemap leaves nothing to run")
 
@@ -3121,6 +3604,8 @@ def cmd_submit(args) -> int:
         analysis_args += f" \\\n    --semantic-gap {args.semantic_gap}"
     if args.force_analysis:
         analysis_args += " \\\n    --force"
+    if not args.reuse_tracks:
+        analysis_args += " \\\n    --no-reuse-tracks"
 
     def write_tasks(filename: str, group: list[Task]) -> str:
         (jobdir / filename).write_text("".join(f"{t.stem}\n" for t in group))
@@ -3334,6 +3819,12 @@ def build_parser() -> argparse.ArgumentParser:
         # These live on every subcommand on purpose. They go into the analysis
         # stage's parameter fingerprint, so if `check` and `analyze` disagreed
         # about their defaults every finished position would report stale.
+        sp.add_argument("--reuse-tracks", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="take each position's tracks from the legacy "
+                             "*_analysis.xlsx in its inference folder instead "
+                             "of running trackpy; positions without one are "
+                             "tracked normally (default: %(default)s)")
         sp.add_argument("--correction-dilation", type=int, default=121,
                         metavar="PX",
                         help="how far from a cell the background is measured, "
