@@ -54,6 +54,7 @@ import getpass
 import json
 import os
 import re
+import resource
 import shlex
 import shutil
 import socket
@@ -219,6 +220,20 @@ def log(msg: str = "") -> None:
 def die(msg: str) -> "NoReturn":  # type: ignore[valid-type]
     print(f"ERROR: {msg}", file=sys.stderr, flush=True)
     raise SystemExit(2)
+
+
+def peak_rss_bytes() -> int:
+    """Peak resident set size of this process, in bytes.
+
+    Under SLURM one array task is one position in its own process, so this is
+    that position's peak. Run locally over a whole plate it is the high-water
+    mark of the process so far, which over-reports every position after the
+    heaviest one - `report` says so rather than pretending otherwise.
+
+    ru_maxrss is kilobytes on Linux and bytes on macOS.
+    """
+    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(raw) if sys.platform == "darwin" else int(raw) * 1024
 
 
 def now() -> str:
@@ -875,6 +890,10 @@ def write_state(root: Path, stage: str, task: Task, status: str,
         "params": task.params(stage),
         "host": socket.gethostname(),
         "slurm_job": os.environ.get("SLURM_JOB_ID", ""),
+        "peak_rss_bytes": peak_rss_bytes(),
+        # True when this process handled one position only, which is what makes
+        # peak_rss_bytes attributable to it. False for a local sequential run.
+        "rss_is_exclusive": bool(os.environ.get("SLURM_ARRAY_TASK_ID")),
         "outputs": outputs or [],
         "error": error,
     }
@@ -898,19 +917,88 @@ def analysis_outputs_present(task: Task) -> bool:
     return d.is_dir() and any(p.stat().st_size > 0 for p in d.glob("*_summary.xlsx"))
 
 
+def outputs_mtime(task: Task, stage: str) -> float | None:
+    """When this stage's outputs were last written, or None if there are none."""
+    d = task.inference_dir
+    if not d.is_dir():
+        return None
+    if stage == "inference":
+        files = [p for p in d.glob("*.tif")
+                 if ("semantic" in p.name or "instance" in p.name)
+                 and p.stat().st_size > 0]
+    else:
+        files = [p for p in d.glob("*_summary.xlsx") if p.stat().st_size > 0]
+    return max((p.stat().st_mtime for p in files), default=None)
+
+
+# Populated once per root per process by killed_index(). stage_status consults
+# it for every position that looks adoptable, and re-walking the job
+# directories each time would turn `check` into a filesystem crawl.
+_KILLED_INDEX: dict = {}
+
+
+def killed_index(root: Path) -> dict:
+    """{(stage, stem): when SLURM last killed it} for this folder.
+
+    Only kills that destroy work in progress count - a walltime or memory kill,
+    a lost node - not a `scancel`, which is usually the user replacing one
+    submit with another and says nothing about the outputs.
+    """
+    key = str(root)
+    if key in _KILLED_INDEX:
+        return _KILLED_INDEX[key]
+
+    index: dict = {}
+    for jobdir in job_dirs(root):
+        for r in scan_job_dir(root, jobdir, with_logs=False):
+            if (r["kind"] not in ("timeout", "oom", "node_fail", "preempted")
+                    or not r["position"]):
+                continue
+            when = None
+            m = CANCEL_AT_RE.search(r["evidence"])
+            if m:
+                try:
+                    when = datetime.fromisoformat(m.group(1))
+                except ValueError:
+                    when = None
+            if when is None:
+                try:
+                    when = datetime.fromtimestamp(
+                        (pipeline_dir(root) / r["out"]).stat().st_mtime)
+                except OSError:
+                    continue
+            k = (r["stage"], r["position"])
+            if k not in index or when > index[k]:
+                index[k] = when
+    _KILLED_INDEX[key] = index
+    return index
+
+
 def stage_status(root: Path, task: Task, stage: str) -> str:
     """One of: done, stale, failed, pending.
 
     `stale` means the stage finished, but under parameters the platemap no
     longer asks for - it will be re-run. A finished folder with no marker (an
-    old batch_* run) is adopted as done rather than redone.
+    old batch_* run) is adopted as done rather than redone, unless SLURM killed
+    the position after those outputs were written - see below.
     """
     present = (inference_outputs_present(task) if stage == "inference"
                else analysis_outputs_present(task))
     state = read_state(root, stage, task.stem)
 
     if state is None:
-        return "done" if present else "pending"
+        if not present:
+            return "pending"
+        # Adoption is for folders produced before markers existed. It becomes a
+        # trap when a position was killed mid-run: the kill writes no marker, so
+        # an older run's outputs are still sitting there and the position looks
+        # finished. That is backwards - the killed work is exactly what needs
+        # re-running - so outputs older than the kill do not count as done.
+        killed_at = killed_index(root).get((stage, task.stem))
+        written = outputs_mtime(task, stage)
+        if killed_at and written and written < killed_at.timestamp():
+            return "pending"
+        return "done"
     if state.get("status") == "done":
         if not present:
             return "pending"      # marker without outputs: something removed them
@@ -1840,6 +1928,852 @@ def cmd_status(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Report: what a run actually did, read back out of the logs
+#
+# `status` answers "what is finished?" by looking at state markers and outputs.
+# That misses the one failure the markers cannot record: a task killed by SLURM
+# for exceeding its walltime is SIGKILLed, so it never writes a marker, and the
+# position reads `pending` - indistinguishable from one that was never
+# submitted. The only record is the job's .out file. This command reads those,
+# joins them back to positions through the frozen task lists, and says plainly
+# which stacks were cut off and what to do about it.
+# ---------------------------------------------------------------------------
+
+# How SLURM ends a task, in the words it uses in the .out file. Order matters:
+# a walltime kill is reported as a cancellation, so TIME LIMIT has to be tested
+# before the generic CANCELLED or every timeout would be filed as a manual
+# scancel.
+SLURM_SIGNATURES = (
+    ("timeout",   re.compile(r"DUE TO TIME LIMIT", re.I)),
+    ("oom",       re.compile(r"oom[-_ ]kill|Out Of Memory|Exceeded job memory", re.I)),
+    ("preempted", re.compile(r"DUE TO PREEMPTION", re.I)),
+    ("node_fail", re.compile(r"NODE_FAIL|DUE TO NODE FAILURE", re.I)),
+    ("cancelled", re.compile(r"CANCELLED AT .*\*\*\*", re.I)),
+    ("env_error", re.compile(r"could not activate .*conda environment", re.I)),
+    ("traceback", re.compile(r"^Traceback \(most recent call last\)", re.M)),
+)
+
+# What each kind means for the user, and whether the work is recoverable by
+# simply asking for more of something.
+SIGNATURE_HELP = {
+    "timeout":   ("killed at the walltime limit", "raise the time limit"),
+    "oom":       ("killed for exceeding its memory request", "raise the memory"),
+    "preempted": ("preempted off the node", "just resubmit"),
+    "node_fail": ("lost to a node failure", "just resubmit"),
+    "cancelled": ("cancelled (scancel, or a failed dependency)", "resubmit if unintended"),
+    "env_error": ("died before python started - conda activate failed", "fix the environment"),
+    "traceback": ("raised a python exception", "read the traceback"),
+}
+
+CANCEL_AT_RE = re.compile(r"CANCELLED AT (\S+)")
+ARRAY_OUT_RE = re.compile(r"^(?P<name>.+)_(?P<jobid>\d+)_(?P<index>\d+)\.out$")
+PLAIN_OUT_RE = re.compile(r"^(?P<name>.+)_(?P<jobid>\d+)\.out$")
+LOG_STAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}T[\d:]+)\]", re.M)
+# The line every stage writes when it picks a position up. Position logs
+# are APPENDED across attempts, so a log can hold several of these and only
+# the last one before a given cancellation belongs to that run.
+LOG_START_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2}T[\d:]+)\] (?:inference|analysis) \d+/\d+:", re.M)
+SBATCH_DIRECTIVE_RE = re.compile(r"^#SBATCH --(?P<key>[a-z-]+)=(?P<value>.+)$", re.M)
+
+# job-name suffix -> (stage, frozen task list). submit builds these names, so
+# they are the link from a .out file back to a position when jobids.json is
+# absent (scripts written but submitted by hand).
+JOBNAME_SUFFIXES = (
+    ("_ana0", "analysis", "tasks_ready.txt"),
+    ("_inf", "inference", "tasks.txt"),
+    ("_ana", "analysis", "tasks.txt"),
+    ("_flat", "flatfield", ""),
+)
+
+
+def parse_walltime(value: str) -> int | None:
+    """SLURM walltime to seconds. Accepts D-HH:MM:SS, HH:MM:SS, MM:SS, MM."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    days = 0
+    if "-" in value:
+        head, _, value = value.partition("-")
+        try:
+            days = int(head)
+        except ValueError:
+            return None
+    parts = value.split(":")
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return None
+    if len(parts) == 3:
+        h, m, s = nums
+    elif len(parts) == 2:
+        h, m, s = 0, nums[0], nums[1]
+    elif len(parts) == 1:
+        h, m, s = 0, nums[0], 0
+    else:
+        return None
+    return days * 86400 + h * 3600 + m * 60 + s
+
+
+def fmt_duration(seconds) -> str:
+    if seconds is None:
+        return "?"
+    seconds = int(round(float(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def job_dirs(root: Path) -> list[Path]:
+    """Submit directories, oldest first. The name is a timestamp, so sorting
+    by name is sorting by time."""
+    base = pipeline_dir(root) / "jobs"
+    return sorted((d for d in base.glob("*") if d.is_dir()), key=lambda d: d.name)
+
+
+def sbatch_request(path: Path) -> dict:
+    """The resources a generated sbatch script asked for."""
+    if not path.exists():
+        return {}
+    text = path.read_text(errors="replace")
+    got = {m.group("key"): m.group("value").strip()
+           for m in SBATCH_DIRECTIVE_RE.finditer(text)}
+    return {
+        "time": got.get("time", ""),
+        "mem": got.get("mem") or got.get("mem-per-gpu", ""),
+        "cpus": got.get("cpus-per-task", ""),
+    }
+
+
+def read_tail(path: Path, limit: int = 200_000) -> str:
+    """The end of a log. Capped because a chatty position can write megabytes
+    and only the end carries the outcome."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            if size > limit:
+                fh.seek(size - limit)
+            return fh.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def classify_slurm_out(path: Path) -> tuple[str, str]:
+    """(kind, evidence line) for one SLURM .out file, or ("", "")."""
+    text = read_tail(path)
+    if not text:
+        return "", ""
+    for kind, pattern in SLURM_SIGNATURES:
+        m = pattern.search(text)
+        if not m:
+            continue
+        # Quote the line the match landed on - that is the evidence, and it is
+        # what the user would have gone looking for by hand.
+        start = text.rfind("\n", 0, m.start()) + 1
+        end = text.find("\n", m.start())
+        line = text[start:end if end != -1 else len(text)].strip()
+        return kind, line
+    return "", ""
+
+
+def position_log_span(root: Path, stage: str, stem: str) -> tuple[str, str, bool]:
+    """(first stamp, last stamp, looks finished) from a per-position log.
+
+    Every stage opens its log with `[<iso>] <stage> i/N: <stem>` and writes a
+    closing `[<iso>] ... in Ns` only on success, so a log with one stamp and no
+    closing line is a position that started and never came back.
+    """
+    path = pipeline_dir(root) / "logs" / stage / f"{stem}.log"
+    if not path.exists():
+        return [], "", False
+    text = read_tail(path)
+    stamps = LOG_STAMP_RE.findall(text)
+    if not stamps:
+        return [], "", False
+    opens = list(LOG_START_RE.finditer(text))
+    # Only the stretch after the final opening line describes the latest
+    # attempt; searching the whole file would let a run that succeeded this
+    # morning mark this evening's kill as finished.
+    tail = text[opens[-1].end():] if opens else text
+    finished = bool(re.search(r"\] .* in \d+s", tail)) or "Traceback" in tail
+    return [m.group(1) for m in opens], stamps[-1], finished
+
+
+def scan_job_dir(root: Path, jobdir: Path, with_logs: bool = True) -> list[dict]:
+    """One record per SLURM .out file in a submit directory.
+
+    `with_logs=False` skips reading the per-position logs and the sbatch
+    scripts, which is most of the I/O. killed_index only needs the verdict, and
+    it runs inside stage_status, so it takes the cheap path.
+    """
+    logdir = jobdir / "slurm"
+    if not logdir.is_dir():
+        return []
+
+    try:
+        jobids = json.loads((jobdir / "jobids.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        jobids = {}
+    # job id -> stage, when submit actually submitted. Authoritative when
+    # present; the job-name suffix is the fallback.
+    by_jobid = {str(v): k for k, v in jobids.items()
+                if k != "submitted" and v}
+
+    tasks_cache: dict[str, list[str]] = {}
+
+    def task_list(filename: str) -> list[str]:
+        if filename not in tasks_cache:
+            path = jobdir / filename
+            # splitlines(), not split(): a stem can contain a space
+            # ("20250213_HT1080 pPS18_A08_s1_phs"), and splitting on whitespace
+            # shatters it into two entries and misaligns every array index
+            # after it against the wrong position.
+            tasks_cache[filename] = ([ln.strip() for ln in
+                                      path.read_text().splitlines() if ln.strip()]
+                                     if path.exists() else [])
+        return tasks_cache[filename]
+
+    records = []
+    for out in sorted(logdir.glob("*.out")):
+        m = ARRAY_OUT_RE.match(out.name) or PLAIN_OUT_RE.match(out.name)
+        if not m:
+            continue
+        name = m.group("name")
+        jobid = m.group("jobid")
+        index = int(m.groupdict().get("index") or -1) if "index" in m.groupdict() else -1
+
+        stage, tasks_file = "", ""
+        for suffix, st, tf in JOBNAME_SUFFIXES:
+            if name.endswith(suffix):
+                stage, tasks_file = st, tf
+                break
+        # jobids.json distinguishes the two analysis arrays, which share a
+        # suffix family; prefer it when we have it.
+        mapped = by_jobid.get(jobid, "")
+        if mapped == "analysis_ready":
+            stage, tasks_file = "analysis", "tasks_ready.txt"
+        elif mapped in ("inference", "analysis", "flatfield"):
+            stage = "inference" if mapped == "inference" else (
+                "analysis" if mapped == "analysis" else "flatfield")
+            if mapped != "flatfield" and not tasks_file:
+                tasks_file = "tasks.txt"
+
+        stem = ""
+        if tasks_file and index >= 0:
+            stems = task_list(tasks_file)
+            if index < len(stems):
+                stem = stems[index]
+
+        kind, evidence = classify_slurm_out(out)
+        sbatch_name = {"inference": "infer.sbatch", "analysis": "analyze.sbatch",
+                       "flatfield": "flatfield.sbatch"}.get(stage, "")
+        if stage == "analysis" and tasks_file == "tasks_ready.txt":
+            sbatch_name = "analyze_ready.sbatch"
+
+        starts, last, finished = ([], "", False)
+        if with_logs and stem and stage in ("inference", "analysis"):
+            starts, last, finished = position_log_span(root, stage, stem)
+
+        records.append({
+            "job": jobdir.name, "jobid": jobid, "index": index,
+            "stage": stage or "?", "position": stem,
+            "kind": kind, "evidence": evidence,
+            "out": str(out.relative_to(pipeline_dir(root))),
+            "request": (sbatch_request(jobdir / sbatch_name)
+                        if with_logs and sbatch_name else {}),
+            "log_starts": starts,
+            "log_started": starts[-1] if starts else "",
+            "log_last": last, "log_finished": finished,
+        })
+    return records
+
+
+def marker_state(root: Path, stage: str, stem: str) -> str:
+    """What the state marker says, ignoring the platemap. `report` must work on
+    a folder whose platemap has since been edited or broken, so it cannot go
+    through stage_status()."""
+    st = read_state(root, stage, stem)
+    if st is None:
+        return "no marker"
+    return st.get("status", "?")
+
+
+def stage_durations(root: Path, stage: str) -> list[tuple[str, float]]:
+    """(position, seconds) for every position whose marker says done."""
+    d = pipeline_dir(root) / "state" / stage
+    out = []
+    for path in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            st = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if st.get("status") == "done" and st.get("duration_s") is not None:
+            try:
+                out.append((st.get("stem", path.stem), float(st["duration_s"])))
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def killed_runtime(record: dict) -> str:
+    """How long a walltime-killed task actually ran.
+
+    Measured, not assumed: the position log's opening stamp against the time
+    in SLURM's `CANCELLED AT ...` line. Worth the trouble because it separates
+    a task that genuinely used its whole limit - raise the limit - from one
+    that sat idle on a wedged filesystem and got reaped, where a bigger limit
+    changes nothing. Falls back to the requested walltime, which is the upper
+    bound.
+    """
+    asked = parse_walltime(record.get("request", {}).get("time", ""))
+    m = CANCEL_AT_RE.search(record.get("evidence", ""))
+    starts = record.get("log_starts") or []
+    if m and starts:
+        try:
+            killed_at = datetime.fromisoformat(m.group(1))
+            # The run this cancellation ended is the last one that began before
+            # it. Taking the first opening line instead reports the age of the
+            # log rather than the length of the run - on a position retried
+            # three times that reads as nine hours under a two-hour limit.
+            began = [datetime.fromisoformat(s) for s in starts]
+            began = [b for b in began if b <= killed_at]
+            if began:
+                measured = (killed_at - began[-1]).total_seconds()
+                # A task cannot outlive its own limit. If the arithmetic says
+                # otherwise the log and the .out belong to different runs, so
+                # report the limit and flag it rather than print a nonsense
+                # number with a straight face.
+                if asked is None or measured <= asked * 1.1:
+                    return fmt_duration(measured)
+        except ValueError:
+            pass
+    return f"{fmt_duration(asked)}?" if asked else "?"
+
+
+def fmt_bytes(n) -> str:
+    """Bytes as GB/MB, or '-' when we simply do not know."""
+    if n in (None, "", 0):
+        return "-"
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "-"
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{int(n)} B"
+
+
+def parse_sacct_mem(value: str) -> int | None:
+    """sacct MaxRSS ('4194304K', '3.91G', '512M') to bytes."""
+    value = (value or "").strip()
+    if not value or value in ("", "0"):
+        return None
+    mult = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}.get(value[-1].upper())
+    try:
+        return int(float(value[:-1]) * mult) if mult else int(float(value))
+    except ValueError:
+        return None
+
+
+def sacct_memory(jobids: set) -> dict:
+    """{'<jobid>_<index>': peak bytes} from sacct, or {} if it is not available.
+
+    Only source of per-position memory for runs that happened before markers
+    started recording it. sacct reports MaxRSS against the `.batch`/`.extern`
+    steps rather than the job row, so the steps are folded back onto their
+    parent by taking the largest.
+    """
+    if not jobids or not shutil.which("sacct"):
+        return {}
+    try:
+        out = subprocess.run(
+            ["sacct", "-j", ",".join(sorted(jobids)), "-P", "-n",
+             "--format=JobID,MaxRSS"],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode != 0:
+        return {}
+
+    peaks: dict = {}
+    for line in out.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        jobid, maxrss = parts[0].strip(), parts[1].strip()
+        base = jobid.split(".")[0]          # 123_4.batch -> 123_4
+        mem = parse_sacct_mem(maxrss)
+        if mem is None:
+            continue
+        peaks[base] = max(peaks.get(base, 0), mem)
+    return peaks
+
+
+def adopted_inference(root: Path, stem: str) -> bool:
+    """Segmentation outputs on disk for this stem, under any parameters.
+
+    Deliberately not `inference_outputs_present`, which needs a Task and so a
+    platemap; `report` has to work on a folder whose platemap has since been
+    edited, moved or broken.
+    """
+    for d in root.glob(f"{stem}_*_inference"):
+        if d.is_dir() and any(
+                p.stat().st_size > 0 for kind in ("semantic", "instance")
+                for p in d.glob(f"*{kind}*.tif")):
+            return True
+    return False
+
+
+def position_table(root: Path, records: list[dict], use_sacct: bool = False) -> list[dict]:
+    """One row per position per stage pair, joining markers to SLURM verdicts.
+
+    The position list is the union of every state marker and every entry in the
+    scanned task lists, so a position that was submitted and killed before it
+    could write anything still appears - which is the whole point.
+    """
+    # SLURM verdict per (stage, position), and the job id that carried it.
+    verdict: dict = {}
+    for r in records:
+        if r["position"] and r["stage"] in ("inference", "analysis"):
+            key = (r["stage"], r["position"])
+            if r["kind"] or key not in verdict:
+                verdict[key] = r
+
+    positions: set = set()
+    for r in records:
+        if r["position"]:
+            positions.add(r["position"])
+    for stage in ("inference", "analysis"):
+        d = pipeline_dir(root) / "state" / stage
+        for path in sorted(d.glob("*.json")) if d.is_dir() else []:
+            positions.add(path.stem)
+
+    sacct = {}
+    if use_sacct:
+        ids = {f"{r['jobid']}_{r['index']}" if r["index"] >= 0 else r["jobid"]
+               for r in records if r["jobid"]}
+        sacct = sacct_memory(ids)
+
+    rows = []
+    for stem in sorted(positions):
+        row = {"position": stem}
+        for stage in ("inference", "analysis"):
+            st = read_state(root, stage, stem) or {}
+            rec = verdict.get((stage, stem))
+            kind = rec["kind"] if rec else ""
+
+            # Marker and SLURM verdict can both exist and disagree - a position
+            # killed on one submit and finished on the next carries both. Neither
+            # wins by rank; the later one wins, which needs their timestamps.
+            kill_at = marker_at = None
+            if rec:
+                m = CANCEL_AT_RE.search(rec.get("evidence", ""))
+                if m:
+                    try:
+                        kill_at = datetime.fromisoformat(m.group(1))
+                    except ValueError:
+                        pass
+            if st.get("finished"):
+                try:
+                    marker_at = datetime.fromisoformat(st["finished"])
+                except ValueError:
+                    pass
+            marker_wins = bool(marker_at and (kill_at is None or marker_at >= kill_at))
+
+            if st.get("status") == "done" and marker_wins:
+                state, secs = "ok", st.get("duration_s")
+            elif kind == "timeout":
+                state, secs = "TIMEOUT", None
+            elif kind == "oom":
+                state, secs = "OOM", None
+            elif kind in ("cancelled", "preempted", "node_fail", "env_error"):
+                state, secs = kind.upper(), None
+            elif st.get("status") == "done":
+                state, secs = "ok", st.get("duration_s")
+            elif st.get("status") == "failed":
+                state, secs = "failed", st.get("duration_s")
+            elif rec and rec.get("log_started") and not rec.get("log_finished"):
+                state, secs = "running?", None
+            elif stage == "inference" and adopted_inference(root, stem):
+                # Outputs on disk with no marker: a folder segmented by the old
+                # batch scripts, or before markers existed. `status` adopts these
+                # as done rather than redoing them, so saying `pending` here
+                # would contradict it.
+                state, secs = "adopted", None
+            else:
+                state, secs = "pending", None
+
+            if secs is None and state == "TIMEOUT" and rec:
+                measured = killed_runtime(rec)
+                secs = parse_walltime(rec["request"].get("time", "")) \
+                    if measured.endswith("?") else None
+                row[f"{stage}_time"] = measured
+            else:
+                row[f"{stage}_time"] = fmt_duration(secs) if secs is not None else "-"
+
+            mem = st.get("peak_rss_bytes")
+            source = "marker"
+            if not mem and rec:
+                key = (f"{rec['jobid']}_{rec['index']}" if rec["index"] >= 0
+                       else rec["jobid"])
+                mem = sacct.get(key)
+                source = "sacct" if mem else ""
+            row[f"{stage}_state"] = state
+            row[f"{stage}_mem"] = fmt_bytes(mem)
+            row[f"{stage}_mem_bytes"] = mem or ""
+            row[f"{stage}_mem_source"] = source if mem else ""
+            row[f"{stage}_rss_exclusive"] = st.get("rss_is_exclusive", "")
+        rows.append(row)
+    return rows
+
+
+def write_report_txt(root: Path, rows: list[dict], path: Path,
+                     use_sacct: bool) -> None:
+    """The position-wise table, as a plain fixed-width text file."""
+    width = max([len(r["position"]) for r in rows] + [len("position")])
+    width = min(width, 60)
+
+    ok = {s: sum(1 for r in rows if r[f"{s}_state"] == "ok")
+          for s in ("inference", "analysis")}
+    lost = {s: sum(1 for r in rows if r[f"{s}_state"] in
+                   ("TIMEOUT", "OOM", "CANCELLED", "PREEMPTED", "NODE_FAIL",
+                    "ENV_ERROR"))
+            for s in ("inference", "analysis")}
+
+    lines = [
+        "Position-wise run report",
+        f"root:      {root}",
+        f"generated: {now()}",
+        f"positions: {len(rows)}",
+        "",
+        f"{'':<{width}}   {'inference':<26}  {'analysis':<26}",
+        f"{'position':<{width}}   {'state':<9}{'time':<9}{'memory':<8}  "
+        f"{'state':<9}{'time':<9}{'memory':<8}",
+        "-" * (width + 3 + 26 + 2 + 26),
+    ]
+    for r in rows:
+        name = r["position"]
+        if len(name) > width:
+            name = name[:width - 1] + "…"
+        lines.append(
+            f"{name:<{width}}   "
+            f"{r['inference_state']:<9}{r['inference_time']:<9}{r['inference_mem']:<8}  "
+            f"{r['analysis_state']:<9}{r['analysis_time']:<9}{r['analysis_mem']:<8}")
+
+    lines += [
+        "-" * (width + 3 + 26 + 2 + 26),
+        f"{'ok':<{width}}   {ok['inference']:<26}  {ok['analysis']:<26}",
+        f"{'lost to slurm':<{width}}   {lost['inference']:<26}  {lost['analysis']:<26}",
+        "",
+        "states",
+        "  ok         finished and recorded a state marker",
+        "  adopted     segmentation already on disk with no marker - `status`",
+        "             treats these as done rather than redoing them",
+        "  failed     ran to a python exception; traceback in pipeline/logs/",
+        "  TIMEOUT    killed at the walltime limit - no marker was written, so",
+        "             `status` calls this position `pending`",
+        "  OOM        killed for exceeding its memory request",
+        "  CANCELLED  scancel, or a dependency that could not be satisfied",
+        "  running?   log opened, never closed, no marker and no slurm verdict",
+        "  pending    no evidence it has run",
+        "",
+        "time",
+        "  measured from the state marker, or for a TIMEOUT from the position",
+        "  log's first timestamp against slurm's cancellation time",
+        "",
+        "memory",
+        "  peak resident set size. Recorded in the state marker from the run",
+        "  itself; runs from before that was added show '-' unless --sacct is",
+        "  given and sacct still has the job. A '-' means not measured, never",
+        "  zero. Under slurm one array task is one position, so the figure is",
+        "  that position's; a plate run locally in one process reports the",
+        "  high-water mark to that point instead.",
+    ]
+    if not use_sacct:
+        lines += ["", "  (--sacct was not used; it can recover memory for older runs)"]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def cmd_report(args) -> int:
+    root = Path(args.root).resolve()
+    pdir = pipeline_dir(root)
+    if not pdir.is_dir():
+        die(f"no {PIPELINE_DIRNAME}/ under {root}; nothing has been run here")
+
+    dirs = job_dirs(root)
+    if args.job:
+        dirs = [d for d in dirs if d.name == args.job]
+        if not dirs:
+            die(f"no job directory named {args.job} under {pdir / 'jobs'}")
+    elif not args.all_jobs:
+        dirs = dirs[-1:]
+
+    log(f"Run report for {root}")
+    log(f"Generated {now()}")
+    if dirs:
+        scope = "all submits" if args.all_jobs else "most recent submit"
+        log(f"Reading {len(dirs)} job director{'y' if len(dirs) == 1 else 'ies'} "
+            f"({scope}): {', '.join(d.name for d in dirs)}")
+    else:
+        log("No submit directories - reporting from the per-position logs and "
+            "state markers only.")
+
+    records = [r for d in dirs for r in scan_job_dir(root, d)]
+
+    # ---- the headline: work lost to the walltime -------------------------
+    # One position retried three times is three timeout records, and scanning
+    # every submit finds all of them. Collapse to one row per position, keeping
+    # the largest limit that has been tried - that is what the next one has to
+    # beat.
+    attempts: dict = {}
+    for r in (r for r in records if r["kind"] == "timeout"):
+        key = (r["stage"], r["position"])
+        prev = attempts.get(key)
+        if prev is None or ((parse_walltime(r["request"].get("time", "")) or 0)
+                            > (parse_walltime(prev["request"].get("time", "")) or 0)):
+            attempts[key] = r
+    # A position killed on Monday and finished on Tuesday is history, not work
+    # to do. Only the ones with no `done` marker still need anything.
+    killed = [r for (stage, stem), r in sorted(attempts.items())
+              if marker_state(root, stage, stem) != "done"]
+    recovered = [r for (stage, stem), r in sorted(attempts.items())
+                 if marker_state(root, stage, stem) == "done"]
+
+    log("")
+    log("=" * 78)
+    if killed:
+        log(f"CUT OFF BY THE WALLTIME LIMIT - {len(killed)} position(s) still unfinished")
+        log("=" * 78)
+        log("These were killed mid-run, so they wrote no state marker and")
+        log("`status` reports them as `pending`, not `failed`. Nothing is")
+        log("corrupt; the work simply did not finish.")
+        if recovered:
+            log("")
+            log(f"({len(recovered)} more hit the limit on an earlier attempt and have")
+            log(" since completed - listed at the end of this section, nothing to do.)")
+        log("")
+        log(f"  {'stage':<10} {'position':<44} {'largest limit tried':<20} ran for")
+        log(f"  {'-' * 10} {'-' * 44} {'-' * 20} {'-' * 9}")
+        for r in sorted(killed, key=lambda r: (r["stage"], r["position"])):
+            log(f"  {r['stage']:<10} {(r['position'] or '(unmapped)'):<44} "
+                f"{r['request'].get('time', '?'):<20} {killed_runtime(r)}")
+        if any(killed_runtime(r).endswith("?") for r in killed):
+            log("")
+            log("  (a `?` in `ran for` means the position log had no opening")
+            log("   timestamp to measure against)")
+        log("")
+        log("  Full logs:")
+        for r in sorted(killed, key=lambda r: r["out"])[:args.max_logs]:
+            log(f"    {PIPELINE_DIRNAME}/{r['out']}")
+        if len(killed) > args.max_logs:
+            log(f"    ... and {len(killed) - args.max_logs} more")
+
+        # What to actually run. The limit that was too small is the one to
+        # raise, and only the stages that were actually killed need it.
+        by_stage = {}
+        for r in killed:
+            asked = parse_walltime(r["request"].get("time", "")) or 0
+            by_stage[r["stage"]] = max(by_stage.get(r["stage"], 0), asked)
+        flags = []
+        for stage, asked in sorted(by_stage.items()):
+            flag = {"inference": "--infer-time", "analysis": "--analysis-time",
+                    "flatfield": "--maps-time"}.get(stage)
+            if flag:
+                doubled = max(asked * 2, 3600)
+                h, rem = divmod(int(doubled), 3600)
+                flags.append(f"{flag} {h//24}-{h%24:02d}:{rem//60:02d}:00")
+        # STUB_RE is the parser the rest of the pipeline uses for this; picking
+        # the stub apart with string splits breaks on the first stem whose
+        # naming differs.
+        found = {m.group(0) for m in
+                 (STUB_RE.search(r["position"]) for r in killed) if m}
+        stubs = " ".join(sorted(found))
+        log("")
+        log("  To finish them, raise the limit and resubmit just these:")
+        log("")
+        log(f"    python pipeline.py submit --root {sh(root)} \\")
+        log(f"        --stem {stubs} \\")
+        log(f"        {' '.join(flags)} --sbatch")
+        log("")
+        log("  Without --stem the whole plate is considered, which re-runs")
+        log("  anything the platemap has since made stale as well - correct,")
+        log("  but a great deal more work than these positions need.")
+        if recovered:
+            log("")
+            log("  Hit the limit earlier but have since completed - no action:")
+            for r in recovered:
+                log(f"    {r['stage']:<10} {r['position']}")
+    else:
+        log("CUT OFF BY THE WALLTIME LIMIT - none outstanding")
+        log("=" * 78)
+        if recovered:
+            log(f"{len(recovered)} position(s) hit the limit on an earlier attempt and")
+            log("have since completed; nothing is outstanding:")
+            for r in recovered:
+                log(f"  {r['stage']:<10} {r['position']}")
+        elif dirs:
+            log("No task in the scanned job directories hit its time limit.")
+        else:
+            log("There are no submit directories to scan, so nothing here can")
+            log("prove a walltime kill either way. A plate run by hand cannot")
+            log("be cut off by SLURM, but one submitted from another checkout")
+            log("keeps its .out files there, not here.")
+
+    # ---- everything else SLURM ended for us ------------------------------
+    other = [r for r in records if r["kind"] and r["kind"] != "timeout"]
+    if other:
+        groups: dict[str, list[dict]] = {}
+        for r in other:
+            groups.setdefault(r["kind"], []).append(r)
+        log("")
+        log("=" * 78)
+        log(f"OTHER TASKS SLURM OR PYTHON ENDED - {len(other)} task(s)")
+        log("=" * 78)
+        for kind, rs in sorted(groups.items()):
+            what, remedy = SIGNATURE_HELP.get(kind, (kind, ""))
+            log(f"  {kind} - {what} ({remedy}): {len(rs)}")
+            for r in sorted(rs, key=lambda r: (r["stage"], r["position"]))[:args.max_logs]:
+                log(f"    {r['stage']:<10} {r['position'] or '(unmapped)'}")
+                if r["evidence"]:
+                    log(f"      {r['evidence'][:150]}")
+                log(f"      {PIPELINE_DIRNAME}/{r['out']}")
+            if len(rs) > args.max_logs:
+                log(f"    ... and {len(rs) - args.max_logs} more")
+
+    # ---- started and never came back, with no SLURM verdict --------------
+    # A task whose .out has no signature but whose position log opens and never
+    # closes is the same lost work by a different route: the node went away, or
+    # the run is still going right now.
+    stalled = [r for r in records
+               if not r["kind"] and r["position"] and r["log_started"]
+               and not r["log_finished"]
+               and marker_state(root, r["stage"], r["position"]) == "no marker"]
+    if stalled:
+        log("")
+        log("=" * 78)
+        log(f"STARTED BUT NEVER FINISHED - {len(stalled)} task(s)")
+        log("=" * 78)
+        log("The position log opens and stops, with no marker and no SLURM")
+        log("verdict. Either still running, or the job vanished without")
+        log("writing one. Check `squeue` before resubmitting.")
+        for r in sorted(stalled, key=lambda r: (r["stage"], r["position"])):
+            log(f"  {r['stage']:<10} {r['position']:<40} last log line "
+                f"{r['log_last'] or '?'}")
+
+    # ---- python-level failures, from the markers -------------------------
+    failed = []
+    for stage in ("inference", "analysis"):
+        d = pdir / "state" / stage
+        for path in sorted(d.glob("*.json")) if d.is_dir() else []:
+            try:
+                st = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if st.get("status") == "failed":
+                failed.append((stage, st))
+    if failed:
+        log("")
+        log("=" * 78)
+        log(f"FAILED WITH AN EXCEPTION - {len(failed)} position(s)")
+        log("=" * 78)
+        log("These ran to a python error and recorded it, so they are `failed`")
+        log("in `status` and will be retried by the next submit.")
+        for stage, st in failed:
+            last = (st.get("error", "").strip().splitlines() or ["?"])[-1]
+            log(f"  {stage:<10} {st.get('stem', '?')}")
+            log(f"    {last[:150]}")
+            log(f"    {PIPELINE_DIRNAME}/logs/{stage}/{st.get('stem', '?')}.log")
+
+    # ---- what did finish, and how close to the limit ---------------------
+    log("")
+    log("=" * 78)
+    log("COMPLETED, AND HOW MUCH HEADROOM IS LEFT")
+    log("=" * 78)
+    all_dirs = job_dirs(root)
+    for stage, candidates in (("inference", ("infer.sbatch",)),
+                              ("analysis", ("analyze.sbatch",
+                                            "analyze_ready.sbatch"))):
+        runs = stage_durations(root, stage)
+        if not runs:
+            log(f"  {stage:<10} nothing recorded as done")
+            continue
+        slowest_pos, slowest = max(runs, key=lambda kv: kv[1])
+        median = sorted(v for _, v in runs)[len(runs) // 2]
+        line = (f"  {stage:<10} {len(runs)} done, median {fmt_duration(median)}, "
+                f"slowest {fmt_duration(slowest)} ({slowest_pos})")
+        # The newest submit need not contain this stage's script - a plate that
+        # was already segmented gets an analysis array and no infer.sbatch - so
+        # walk back until one turns up. Falling through to another stage's
+        # script would compare against the wrong limit entirely.
+        limit = None
+        for d in reversed(all_dirs):
+            for name in candidates:
+                limit = parse_walltime(sbatch_request(d / name).get("time", ""))
+                if limit:
+                    break
+            if limit:
+                break
+        if limit:
+            used = 100 * slowest / limit
+            line += f" - {used:.0f}% of the {fmt_duration(limit)} limit"
+        log(line)
+        # A completed run that used most of its limit is the next timeout.
+        if limit and slowest > 0.8 * limit:
+            log(f"             ! the slowest position used {100*slowest/limit:.0f}% "
+                f"of its walltime; the next plate will lose positions here")
+
+    log("")
+    log("=" * 78)
+    log("HOW THE PLATE STANDS NOW")
+    log("=" * 78)
+    for stage in ("inference", "analysis"):
+        d = pdir / "state" / stage
+        counts: dict[str, int] = {}
+        for path in sorted(d.glob("*.json")) if d.is_dir() else []:
+            try:
+                st = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            s = st.get("status", "?")
+            counts[s] = counts.get(s, 0) + 1
+        log(f"  {stage:<10} {fmt_counts(counts) if counts else 'no markers yet'}")
+    if killed:
+        log("")
+        log(f"  Remember: the {len(killed)} walltime-killed task(s) above are NOT")
+        log("  in these counts. They have no marker, so `status` calls them")
+        log("  `pending` - the same word it uses for work never submitted.")
+
+    if args.txt is not None:
+        out = Path(args.txt) if args.txt != "-" else pdir / "report.txt"
+        rows = position_table(root, records, use_sacct=args.sacct)
+        write_report_txt(root, rows, out, use_sacct=args.sacct)
+        log("")
+        log(f"Wrote {out}  ({len(rows)} position(s))")
+
+    if args.csv:
+        out = Path(args.csv) if args.csv != "-" else pdir / "report.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["job", "jobid", "index", "stage", "position", "kind",
+                  "evidence", "out", "log_started", "log_last", "log_finished"]
+        with open(out, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for r in records:
+                writer.writerow(r)
+        log("")
+        log(f"Wrote {out}")
+
+    return 1 if killed or other else 0
+
+
+# ---------------------------------------------------------------------------
 # Correction maps
 # ---------------------------------------------------------------------------
 
@@ -2083,6 +3017,21 @@ def cmd_submit(args) -> int:
             f"pass --allow-unmapped to run them as {DEFAULT_CELLTYPE}.")
     for w in dict.fromkeys(warnings):
         log(f"  ! {w}")
+
+    # --stem narrows the plate before anything else looks at it, so the arrays
+    # carry only what was asked for. Same matching as `infer`/`analyze`: a full
+    # stem, a position stub (B12_s5), or a whole well.
+    if args.stem:
+        wanted = set(args.stem)
+        tasks = [t for t in tasks if t.stem in wanted or t.pos.well in wanted
+                 or t.pos.stub in wanted]
+        if not tasks:
+            die(f"no position matched --stem {' '.join(args.stem)}")
+        unmatched = wanted - {t.stem for t in tasks} - {t.pos.well for t in tasks} \
+            - {t.pos.stub for t in tasks}
+        for u in sorted(unmatched):
+            log(f"  ! --stem {u} matched no position")
+        log(f"--stem: {len(tasks)} position(s) selected")
 
     if args.all_positions or args.force_analysis:
         selected = tasks
@@ -2393,6 +3342,32 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also write a per-position CSV (default: pipeline/status.csv)")
     sp.set_defaults(func=cmd_status)
 
+    sp = common(sub.add_parser(
+        "report",
+        help="human-readable run report from the SLURM and position logs",
+        description="Reads the .out files SLURM wrote, joins them back to "
+                    "positions through the frozen task lists, and reports what "
+                    "each task did - in particular which stacks were killed at "
+                    "the walltime limit, which `status` cannot tell you because "
+                    "a killed task never writes a state marker."))
+    sp.add_argument("--job", metavar="STAMP",
+                    help="one submit directory by name (default: the most recent)")
+    sp.add_argument("--all-jobs", action="store_true",
+                    help="scan every submit directory, not just the last")
+    sp.add_argument("--max-logs", type=int, default=12, metavar="N",
+                    help="log paths to list per section (default: %(default)s)")
+    sp.add_argument("--csv", nargs="?", const="-", default=None,
+                    help="also write a per-task CSV (default: pipeline/report.csv)")
+    sp.add_argument("--txt", nargs="?", const="-", default=None,
+                    metavar="PATH",
+                    help="write the position-wise table - state, run time and "
+                         "peak memory for each stage - as plain text "
+                         "(default: pipeline/report.txt)")
+    sp.add_argument("--sacct", action="store_true",
+                    help="ask sacct for peak memory of runs whose markers "
+                         "predate memory recording (cluster only)")
+    sp.set_defaults(func=cmd_report)
+
     sp = common(sub.add_parser("infer", help="run segmentation (GPU env)"))
     sp.add_argument("--map", help="platemap to use (default: <root>/platemap.csv)")
     sp.add_argument("--tasks", help="frozen task list from submit")
@@ -2456,6 +3431,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="re-analyze every position, including ones already "
                          "analyzed (for a change the platemap cannot see, such "
                          "as an edit to analysis_pars.py)")
+    sp.add_argument("--stem", nargs="+", metavar="POSITION",
+                    help="submit only these positions - a full stem, a stub "
+                         "like B12_s5, or a whole well. Everything else on the "
+                         "plate is left alone.")
     sp.add_argument("--all-positions", action="store_true",
                     help="include positions that are already finished")
     sp.add_argument("--allow-unmapped", action="store_true",

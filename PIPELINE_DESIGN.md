@@ -427,6 +427,23 @@ not redone. Folders produced by the old `batch_inference*.py` scripts are
 therefore usable immediately, which is what makes this adoptable mid-experiment
 rather than something that starts by recomputing a month of GPU time.
 
+Adoption and the walltime blind spot (§5, below) intersect badly, and the
+result was silent for as long as it existed. Both cases are "outputs on disk,
+no marker": one is a folder from before markers existed, the other is a
+position SLURM killed while an *earlier* run's outputs were still lying there.
+Read the same way, the killed position looks finished — so it was skipped by
+every later submit, forever, and it was skipped precisely because it had
+failed. Observed on a real plate: three positions killed twice each, and an
+ordinary submit selected the 51 that had succeeded and none of the 3 that had
+not.
+
+The two cases separate on a timestamp. Outputs written *before* the most recent
+kill are the wreckage of a run that did not finish, and are now `pending`;
+outputs written *after* it must have come from something that ran later, and
+are still adopted. `killed_index()` builds the position-to-kill map once per
+folder per process, from the same `.out` files `report` reads, and only
+positions that would otherwise be adopted ever consult it.
+
 **Parameters, not content hashes.** Staleness compares the small set of values
 that actually change the output — model, confluency, threshold for inference;
 cell type, channels and source folder for analysis. Hashing the input stacks
@@ -476,6 +493,74 @@ Each position gets `pipeline/logs/<stage>/<position>.log`, appended to, in
 addition to the SLURM `.out` file. Logs keyed by position rather than by array
 task id are what make a failure two weeks later findable: you know the well,
 not the job number.
+
+### The blind spot the markers cannot cover, and `report`
+
+The state model in the table above has one hole, and it is structural rather
+than an oversight: **every row of it assumes the task got to run its own
+`finally`.** A task killed by SLURM for exceeding its walltime does not. It
+receives SIGKILL, writes nothing, and leaves the marker directory exactly as it
+found it — so `stage_status` sees no marker and no outputs and returns
+`pending`, the same answer it gives for a position that was never submitted.
+
+That is the worst possible failure to render invisible. It is silent, it is
+*more* likely now that the walltime defaults are sized to a typical position
+rather than the worst one (§4), and the natural reading of `pending` — "the
+queue has not got to it yet" — is exactly wrong. Someone waiting for a plate to
+finish would wait forever.
+
+Nothing inside the process can fix this; a SIGKILL is not catchable. The record
+exists only outside it, in the job's `.out` file, where SLURM writes
+`CANCELLED AT ... DUE TO TIME LIMIT`. So `report` is a second reader over the
+same run, working from the logs rather than the markers:
+
+* `.out` files are joined back to positions through the **frozen task lists** —
+  the same files that make `aftercorr` correct (§4). Array index *N* means the
+  same position to `report` that it meant to SLURM, even if the folder or the
+  platemap changed since.
+* The runtime of a killed task is *measured*, from the position log's opening
+  stamp against SLURM's cancellation time, not inferred from the limit. A task
+  that used 39 of its 40 minutes needs a larger limit; one reaped after four
+  needs a different fix, and the limit is a red herring.
+* Completed positions are reported as a fraction of the walltime they were
+  given, so a stage brushing its ceiling is visible *before* the plate that
+  finally exceeds it.
+
+Two alternatives were considered and rejected. Polling `sacct` would be
+authoritative, but it only works on a login node with the job ids still in
+SLURM's accounting window, and the point is to be able to read a folder months
+later from anywhere. Writing a "started" marker before the work and clearing it
+after would let `status` alone infer a kill, but it doubles the writes per
+position, and a marker that means "started or died" is ambiguous in exactly the
+case that matters — a position genuinely running right now.
+
+`report` writes nothing but its optional CSV and text table. Keeping it
+read-only is what makes it safe to run against a plate whose jobs are still
+queued.
+
+### Recording memory, and why the marker is the right place
+
+Run time was always in the marker; peak memory was not, and there was nowhere
+else to get it. SLURM knows, but only through `sacct`, only from a login node,
+and only while the job stays in the accounting window — useless for reading a
+folder back months later, which is the case this whole design optimizes for.
+
+So `write_state` now records `resource.getrusage(RUSAGE_SELF).ru_maxrss`
+alongside the duration. It costs one syscall at the end of work that took
+minutes, and it travels with the plate.
+
+The figure is only attributable to a position when the process handled exactly
+one, which is true under SLURM (one array task = one position) and false for a
+local sequential run, where ru_maxrss is the high-water mark of the whole
+process. Rather than record a number whose meaning depends on how it was
+launched, the marker also stores `rss_is_exclusive`, and `report` says which it
+is. Recording a per-position delta instead was rejected: peak RSS is monotonic,
+so the delta of a position that peaked below an earlier one is zero, which reads
+as "measured, and tiny" rather than "not separable".
+
+`--sacct` remains for markers written before this existed. It is opt-in because
+it shells out, needs the cluster, and is the slow path; when `sacct` is absent
+the flag degrades to no memory rather than an error.
 
 ---
 

@@ -21,7 +21,12 @@ $EDITOR /scratch/ajitj_root/ajitj99/ajitj/20251025/platemap.csv
 python pipeline.py check  --root /scratch/ajitj_root/ajitj99/ajitj/20251025
 python pipeline.py submit --root /scratch/ajitj_root/ajitj99/ajitj/20251025 --sbatch
 python pipeline.py status --root /scratch/ajitj_root/ajitj99/ajitj/20251025
+python pipeline.py report --root /scratch/ajitj_root/ajitj99/ajitj/20251025
 ```
+
+`status` says what finished. `report` reads the SLURM logs and says what did
+not — in particular which stacks were cut off at the walltime limit, which
+`status` cannot see.
 
 `--root` is the folder holding the `*phs.tif` stacks. Everything the pipeline
 writes goes under it.
@@ -241,6 +246,7 @@ Common overrides (full list under `submit --help`):
 | `--gpu-partition` / `--cpu-partition` | `gpu` / `standard` | |
 | `--infer-env` / `--analysis-env` | `cellaap-env` / `img-env` | conda envs |
 | `--job-name` | the root folder name | suffixed `_inf` and `_ana` |
+| `--stem` | — | submit only these positions: a full stem, a stub like `B12_s5`, or a whole well |
 | `--allow-unmapped` | off | run wells missing from the platemap as HeLa |
 | `--analysis-only` | off | submit no GPU job at all; refuses if a position has no inference folder |
 | `--force-analysis` | off | re-analyze every position, including ones already analyzed |
@@ -269,6 +275,35 @@ Two flags cover the rest:
 python pipeline.py submit --root <folder> --analysis-only --force-analysis --sbatch
 ```
 
+### Re-running only what was lost
+
+`report` names the positions SLURM cut off; `--stem` submits exactly those and
+leaves the rest of the plate alone:
+
+```bash
+python pipeline.py submit --root <folder> \
+    --stem B12_s12 B12_s2 B12_s5 \
+    --analysis-time 0-04:00:00 --sbatch
+```
+
+`report` prints this command already filled in. Without `--stem` the whole plate
+is considered, which is correct but re-runs everything the platemap has since
+made stale as well — on a 54-position plate that was 51 positions of needless
+work to redo 3.
+
+A killed position is picked up by an ordinary submit too, because a walltime
+kill writes no state marker and the position reads `pending`. There is one case
+where that was not true and now is, worth knowing about because it was silent:
+
+> **Outputs left over from an earlier run no longer count as finished if SLURM
+> killed the position after they were written.** A folder with outputs and no
+> marker is normally *adopted* as done — that is what makes folders from the old
+> `batch_*` scripts usable. But a position killed mid-run also has no marker,
+> and the previous run's `*_summary.xlsx` is still sitting there, so the killed
+> position looked finished and was skipped by every subsequent submit. Outputs
+> older than the kill are now treated as `pending`; outputs newer than it are
+> still adopted, since something must have written them afterwards.
+
 ## 5. `status` — where things stand
 
 ```bash
@@ -288,6 +323,123 @@ and where the full log is. The CSV has one row per position with well, cell
 type, treatment, model, channels, both stage states, run times and the
 inference folder name — it is the thing to hand to a plotting notebook or to
 skim when a plate looks odd.
+
+## 6. `report` — what the run actually did
+
+```bash
+python pipeline.py report --root <folder>
+python pipeline.py report --root <folder> --all-jobs   # every submit, not just the last
+python pipeline.py report --root <folder> --csv        # also writes pipeline/report.csv
+```
+
+`status` reads state markers. `report` reads the **logs** — the `.out` files
+SLURM wrote, joined back to positions through the frozen task lists — and it
+exists because of one blind spot the markers cannot cover:
+
+> **A task killed for exceeding its walltime is SIGKILLed, so it never writes a
+> marker.** `status` therefore reports it as `pending`: the same word it uses
+> for a position that was never submitted. Nothing distinguishes the two except
+> the job's `.out` file.
+
+That is the first thing `report` prints, and the reason to run it after every
+plate:
+
+```
+==============================================================================
+CUT OFF BY THE WALLTIME LIMIT - 2 task(s)
+==============================================================================
+These were killed mid-run, so they wrote no state marker and
+`status` reports them as `pending`, not `failed`. Nothing is
+corrupt; the work simply did not finish.
+
+  stage      position                          asked for   ran for   state now
+  ---------- --------------------------------- ----------- --------- ----------
+  inference  20251009_HeLa_G03_s8_phs          0-00:40:00  39m52s    no marker
+  inference  20251009_HeLa_G03_s9_phs          0-00:40:00  39m52s    no marker
+
+  To finish them, raise the limit and resubmit. Positions that
+  already finished are skipped, so this only re-runs what died:
+
+    python pipeline.py submit --root <folder> --infer-time 0-01:20:00 --sbatch
+```
+
+`ran for` is **measured**, not the limit restated: the position log's opening
+timestamp against SLURM's `CANCELLED AT`. That distinction matters, because a
+task that used 39 of its 40 minutes needs a bigger limit, while one reaped after
+four minutes was stuck on something else and a bigger limit changes nothing.
+
+The remaining sections, each omitted when empty:
+
+| section | what it means |
+| --- | --- |
+| **Other tasks SLURM or python ended** | OOM kills, preemption, node failures, `scancel`, a conda activation that failed before python started, and tracebacks — each with the log line that proves it |
+| **Started but never finished** | the position log opens and stops, with no marker and no SLURM verdict: either still running, or the job vanished. Check `squeue` before resubmitting |
+| **Failed with an exception** | from the state markers — these *are* `failed` in `status` and the next submit retries them |
+| **Completed, and how much headroom is left** | per stage: how many finished, median and slowest runtime, and the slowest as a percentage of the walltime that was requested |
+| **How the plate stands now** | marker counts, with a reminder that walltime-killed tasks are not in them |
+
+The headroom section is the one to read when nothing has failed *yet*:
+
+```
+  inference  13 done, median 12m09s, slowest 16m43s (..._A08_s1_phs) - 42% of the 40m00s limit
+  analysis   28 done, median 41m10s, slowest 57m30s (..._B08_s2_phs) - 96% of the 1h00m limit
+             ! the slowest position used 96% of its walltime; the next plate will lose positions here
+```
+
+A stage that is already brushing its limit will start losing positions as soon
+as a plate gets denser, and this says so before it happens rather than after.
+
+### The position-wise table
+
+```bash
+python pipeline.py report --root <folder> --txt          # pipeline/report.txt
+python pipeline.py report --root <folder> --txt out.txt  # somewhere else
+python pipeline.py report --root <folder> --txt --sacct  # recover memory for older runs
+```
+
+One row per position, both stages side by side — state, run time and peak
+memory — as a plain text file:
+
+```
+                                    inference                   analysis
+position                            state    time     memory    state    time     memory
+------------------------------------------------------------------------------------------
+20250213_HT1080 pPS18_A08_s1_phs    ok       16m43s   4.1 GB    ok       7m51s    9.8 GB
+20250213_HT1080 pPS18_A08_s2_phs    ok       11m58s   4.0 GB    TIMEOUT  59m48s   -
+20250213_HT1080 pPS18_B08_s1_phs    ok       10m00s   3.9 GB    OOM      -        -
+------------------------------------------------------------------------------------------
+ok                                  3                          1
+lost to slurm                       0                          2
+```
+
+The file carries its own legend, so it stands on its own when mailed to someone
+or dropped next to the data.
+
+**States** are `ok`, `failed`, `TIMEOUT`, `OOM`, `CANCELLED`, `running?` and
+`pending`. A SLURM kill outranks the marker: a position carrying a `done` marker
+from an earlier attempt still reads `TIMEOUT` if that is what happened in the
+run being reported on.
+
+**Time** comes from the state marker, or — for a `TIMEOUT`, which has no marker
+— from the position log's first timestamp against SLURM's cancellation time.
+
+**Memory** is peak resident set size, recorded into the state marker by the run
+itself. Three things worth knowing:
+
+* Positions analyzed before this was added show `-`. `--sacct` recovers them
+  from SLURM accounting, on a login node, while the job ids are still in the
+  accounting window. Without sacct available the flag degrades quietly.
+* `-` means *not measured*, never zero.
+* Under SLURM one array task is one position, so the figure belongs to that
+  position. A plate run locally in one process reports the high-water mark of
+  the process to that point instead, which over-reports every position after
+  the heaviest; the marker records which case it was.
+
+`report` exits non-zero when it found tasks that SLURM or python ended, the same
+convention `check` uses, so `report && echo clean` is a usable gate.
+
+Everything is read-only: `report` opens logs and state files and writes nothing
+except the optional CSV.
 
 ---
 
@@ -309,6 +461,8 @@ skim when a plate looks odd.
     ├── superseded/                                   <- maps built from a well later swapped away
     ├── logs/{inference,analysis,flatfield}/*.log     <- one log per position
     ├── status.csv                                    <- written by `status --csv`
+    ├── report.csv                                    <- written by `report --csv`
+    ├── report.txt                                    <- written by `report --txt`
     └── jobs/20251025_142233/
         ├── platemap.csv  tasks.txt  tasks_ready.txt  <- frozen at submit time
         ├── infer.sbatch  flatfield.sbatch             <- only when needed
@@ -469,13 +623,23 @@ command or resubmit — only the failed positions run again.
 search radius for that cell type in `analysis_pars.py`, or drop the cell type
 to a `vanilla` track mode. Then `--force` the affected positions.
 
-**The analysis array died at the walltime limit.** The default is one hour per
-position, which is the typical cost; a dense position can take several times
-that. Resubmit with `--analysis-time 0-06:00:00` (or more); finished positions
-are skipped, so it picks up where it stopped rather than starting over.
+**A stage died at the walltime limit.** Run `report` — it names the positions,
+says how long each actually ran before it was killed, and prints the resubmit
+command with a raised limit:
 
-**The inference array died at the walltime limit.** Same story with
-`--infer-time`; the default is 40 minutes per position.
+```bash
+python pipeline.py report --root <folder>
+```
+
+The defaults are 40 min per inference position and 1 h per analysis position,
+which are typical costs; a dense position can take several times that. Finished
+positions are skipped on resubmit, so it picks up where it stopped rather than
+starting over.
+
+**`status` says `pending` for positions you know were submitted.** That is what
+a walltime kill looks like: the task was SIGKILLed before it could write a state
+marker, and `status` cannot tell "killed" from "never ran". `report` reads the
+SLURM `.out` files and can.
 
 **Out of memory in analysis.** The zoomed instance mask is the big allocation.
 Resubmit with `--analysis-mem 48g`.
