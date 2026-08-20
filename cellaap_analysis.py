@@ -12,6 +12,96 @@ from analysis_pars import analysis_pars
 from cellaap_utils import *
 from dead_classifier import classify_dead, rows_to_classify
 
+# Fraction of a cell's own mask that must carry the mitotic value for the
+# detection to be called mitotic. The measurement is close to binary - a cell's
+# mask is typically >99% one class or the other - so anything from 0.1 to 0.7
+# gives the same answer; 0.5 is the honest middle.
+MITOTIC_MASK_FRACTION = 0.5
+
+
+def mask_semantic_values(instance, semantic, frames, labels, defaults,
+                         threshold: float = MITOTIC_MASK_FRACTION):
+    """Each detection's semantic label, read over its whole instance mask.
+
+    The obvious rule - read the semantic frame at the centroid - is wrong for
+    two kinds of cell. A concave or crescent-shaped mask does not contain its
+    own centroid, so the lookup lands on background or on the neighbour; and
+    where two cells touch, the segmentation writes their SUM (199 = 99 + 100
+    for an interphase cell overlapping a mitotic one), which no lookup can
+    decode. Both show up as isolated wrong frames in a track.
+
+    So each detection is scored over its own mask instead: the fraction of the
+    cell's pixels carrying the mitotic value. On real data that fraction is
+    close to binary - mean 0.998 for the detections a centroid calls mitotic
+    and 0.000 for the rest - so the threshold does no real work.
+
+    Returns (values, mask_px, diagnostics). `values` goes into
+    `tracked.semantic` and is then smoothed by `_label_semantic` exactly as a
+    centroid-derived column was; `mask_px` is each detection's mask size.
+    """
+    frames = np.asarray(frames, dtype=np.int64)
+    labels = np.asarray(labels, dtype=np.int64)
+
+    # Resolve which value means mitotic against the segmentation itself, the
+    # same way _label_semantic does against the table - different cellaap
+    # versions write 100 or 101, and guessing wrong finds no mitosis at all.
+    top = int(semantic.max())
+    if top > 4095:
+        raise ValueError(f"semantic segmentation holds values up to {top}; this "
+                         f"is not a class map and cannot be scored over masks")
+    width = top + 1
+    occurs = np.zeros(width, dtype=np.int64)
+    for f in range(len(semantic)):
+        occurs += np.bincount(semantic[f].reshape(-1), minlength=width)
+    present = [v for v in defaults.mitotic_semantic_values
+               if v <= top and occurs[v] > 0]
+    if len(present) != 1:
+        raise ValueError(
+            f"cannot tell which semantic value means mitotic: "
+            f"{defaults.mitotic_semantic_values} against a segmentation whose "
+            f"values reach {top} (matched {present}). Set "
+            f"analysis_pars.mitotic_semantic_values for this dataset.")
+    mitotic_value = present[0]
+
+    # Per frame, the histogram of semantic values under each instance label, in
+    # one bincount over label*width + value. Doing it per detection instead
+    # would compare a full 1024x1024 frame per row - hundreds of thousands of
+    # passes over the stack for a single position.
+    counts = np.zeros((len(frames), width), dtype=np.int64)
+    for f in np.unique(frames):
+        lab = instance[f].reshape(-1).astype(np.int64)
+        val = semantic[f].reshape(-1).astype(np.int64)
+        n = int(lab.max()) + 1
+        hist = np.bincount(lab * width + val,
+                           minlength=n * width).reshape(n, width)
+        rows = np.flatnonzero(frames == f)
+        inside = labels[rows] < n
+        counts[rows[inside]] = hist[labels[rows[inside]]]
+
+    mask_px = counts.sum(axis=1) - counts[:, 0]      # value 0 is background
+    mitotic_px = counts[:, mitotic_value]
+    fraction = mitotic_px / np.maximum(mask_px, 1)
+    is_mitotic = (mask_px > 0) & (fraction > threshold)
+
+    # Non-mitotic rows keep the most common real value under the mask rather
+    # than a sentinel, so tracked.semantic still reads as segmentation output.
+    # _label_semantic collapses all of them to 1 anyway.
+    other = counts.copy()
+    other[:, 0] = 0
+    other[:, mitotic_value] = 0
+    values = np.where(other.any(axis=1), other.argmax(axis=1), 1)
+    values[is_mitotic] = mitotic_value
+
+    diagnostics = {
+        "mitotic_value": int(mitotic_value),
+        "mask_fraction_threshold": float(threshold),
+        "rows": int(len(frames)),
+        "rows_mitotic": int(is_mitotic.sum()),
+        "rows_empty_mask": int((mask_px == 0).sum()),
+    }
+    return values, mask_px, diagnostics
+
+
 class analysis:
     
     def __init__(self, root_folder: Path, plotting_only: False):
@@ -254,13 +344,22 @@ class analysis:
         # This drops the old index and uses serial numbers
         self.tracked.reset_index(inplace=True)
 
-        semantic_label = []
-        for i in np.arange(len(self.tracked)):
-            semantic_label.append(self.stacks["semantic"][self.tracked.loc[i,"frame"],
-                                                      self.tracked.loc[i,"x"],  
-                                                      self.tracked.loc[i,"y"]])
-
-        self.tracked["semantic"] = semantic_label
+        # Scored over each detection's whole instance mask rather than at its
+        # centroid: a concave mask need not contain its own centroid, and
+        # touching cells are written as the SUM of their classes (199 = 99 +
+        # 100), which no single-pixel lookup can decode. This costs about a
+        # second more per position than the lookup it replaces - its cost is
+        # per pixel where the lookup's was per detection - which is nothing
+        # against the rest of the stage. It is for robustness, not speed.
+        values, _, sem_diag = mask_semantic_values(
+            self.stacks["instance"], self.stacks["semantic"],
+            self.tracked["frame"].to_numpy(), self.tracked["label"].to_numpy(),
+            self.defaults)
+        self.tracked["semantic"] = values
+        self.quality["semantic_from_masks"] = sem_diag
+        if sem_diag["rows_empty_mask"]:
+            print(f'{sem_diag["rows_empty_mask"]} detection(s) had no pixels '
+                  f'under their instance label; semantic left non-mitotic')
 
         self._label_semantic()
 
