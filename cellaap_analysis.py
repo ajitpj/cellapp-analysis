@@ -19,6 +19,87 @@ from dead_classifier import classify_dead, rows_to_classify
 MITOTIC_MASK_FRACTION = 0.5
 
 
+def _resolve_semantic_classes(occurs, defaults):
+    """Which values in this segmentation are classes, and which one is mitotic.
+
+    cellaap writes one value per class - 0 background, 1 or 99 interphase, 100
+    or 101 mitotic, depending on version - but where two masks overlap it
+    writes their SUM: 1 + 100 = 101, 100 + 100 = 200, 100 + 101 = 201. A sum is
+    not a class. The pixel belongs to two cells at once and says nothing about
+    either, so everything outside the class set is treated as background: the
+    sums, and any stray value a deeper pile-up produces (1 + 1 + 100 = 102).
+
+    There are only ever three class values, so they are identified rather than
+    filtered: background, the mitotic value, and the commonest value left,
+    which is interphase - a field is mostly interphase, and a contact rim is
+    thinner than the cells it lies between.
+
+    The mitotic value comes from analysis_pars.mitotic_semantic_values, which
+    lists what the different cellaap versions write. When more than one of
+    those occurs, a sum is told from a class by arithmetic and by rarity: a sum
+    is the total of two other present values that are each more common than it
+    is. That separates the two datasets that look alike from the outside - 101
+    alongside a much larger 1 and 100 is a contact rim, while 101 alongside 100
+    with no 1 present cannot be built from anything else and is a class in its
+    own right.
+
+    Takes the value histogram of the whole stack. Returns (mitotic_value, keep)
+    where keep is a Boolean mask over the value axis, True for the three class
+    values and False for everything else.
+    """
+    present = np.flatnonzero(occurs)
+    present = present[present > 0]
+
+    candidates = [v for v in defaults.mitotic_semantic_values
+                  if v < len(occurs) and occurs[v] > 0]
+    if not candidates:
+        raise ValueError(
+            f"none of {defaults.mitotic_semantic_values} occurs in this "
+            f"semantic segmentation, whose values are "
+            f"{sorted(int(v) for v in present)}. Set "
+            f"analysis_pars.mitotic_semantic_values for this dataset, "
+            f"otherwise no mitotic events will be detected.")
+
+    def is_sum(v):
+        parts = present[present < v]
+        parts = parts[occurs[parts] > occurs[v]]
+        return bool(np.isin(v - parts, parts).any())
+
+    real = [v for v in candidates if not is_sum(v)]
+    if not real:
+        raise ValueError(
+            f"every candidate mitotic value {candidates} looks like the sum of "
+            f"two overlapping masks rather than a class of its own (pixel "
+            f"counts {[int(occurs[v]) for v in candidates]}). Set "
+            f"analysis_pars.mitotic_semantic_values for this dataset.")
+    if len(real) == 1:
+        mitotic_value = real[0]
+    else:
+        # Both candidates are classes in their own right, so this dataset uses
+        # both. The mitotic one is the minority - a field is mostly interphase
+        # - unless analysis_pars names it outright.
+        if defaults.mitotic_mask_value in real:
+            mitotic_value = defaults.mitotic_mask_value
+        else:
+            mitotic_value = min(real, key=lambda v: occurs[v])
+        print(f"semantic values {real} are all listed as mitotic (pixel counts "
+              f"{[int(occurs[v]) for v in real]}); reading {mitotic_value} as "
+              f"the mitotic class. Set analysis_pars.mitotic_mask_value if "
+              f"that is wrong.")
+
+    keep = np.zeros(len(occurs), dtype=bool)
+    keep[0] = True                                  # background
+    keep[mitotic_value] = True
+    # Interphase is the commonest value left that is not itself a sum. The
+    # guard matters where mitotic cells crowd together: the region two of them
+    # share can outweigh what is left of either, and without it that sum would
+    # be promoted to a class and both cells scored on it.
+    others = [v for v in present if v != mitotic_value and not is_sum(v)]
+    if others:
+        keep[max(others, key=lambda v: occurs[v])] = True
+    return int(mitotic_value), keep
+
+
 def mask_semantic_values(instance, semantic, frames, labels, defaults,
                          threshold: float = MITOTIC_MASK_FRACTION):
     """Each detection's semantic label, read over its whole instance mask.
@@ -35,6 +116,14 @@ def mask_semantic_values(instance, semantic, frames, labels, defaults,
     close to binary - mean 0.998 for the detections a centroid calls mitotic
     and 0.000 for the rest - so the threshold does no real work.
 
+    Overlap sums count as background (see _resolve_semantic_classes), which
+    keeps them out of the denominator as well as the numerator. Left in the
+    denominator they would dilute an overlapped cell below the threshold: two
+    touching mitotic cells write 100 + 100 = 200 across the whole region they
+    share, and both would read as interphase. Each cell is judged on the
+    pixels that belong to it alone; a detection with no such pixels left is
+    the only one dropped, and it is counted in the diagnostics.
+
     Returns (values, mask_px, diagnostics). `values` goes into
     `tracked.semantic` and is then smoothed by `_label_semantic` exactly as a
     centroid-derived column was; `mask_px` is each detection's mask size.
@@ -42,9 +131,11 @@ def mask_semantic_values(instance, semantic, frames, labels, defaults,
     frames = np.asarray(frames, dtype=np.int64)
     labels = np.asarray(labels, dtype=np.int64)
 
-    # Resolve which value means mitotic against the segmentation itself, the
-    # same way _label_semantic does against the table - different cellaap
-    # versions write 100 or 101, and guessing wrong finds no mitosis at all.
+    # Resolve which values are classes and which one means mitotic against the
+    # segmentation itself, the same way _label_semantic does against the table
+    # - different cellaap versions write 100 or 101, and guessing wrong finds
+    # no mitosis at all - while telling a class apart from the sum two
+    # overlapping masks write.
     top = int(semantic.max())
     if top > 4095:
         raise ValueError(f"semantic segmentation holds values up to {top}; this "
@@ -53,15 +144,7 @@ def mask_semantic_values(instance, semantic, frames, labels, defaults,
     occurs = np.zeros(width, dtype=np.int64)
     for f in range(len(semantic)):
         occurs += np.bincount(semantic[f].reshape(-1), minlength=width)
-    present = [v for v in defaults.mitotic_semantic_values
-               if v <= top and occurs[v] > 0]
-    if len(present) != 1:
-        raise ValueError(
-            f"cannot tell which semantic value means mitotic: "
-            f"{defaults.mitotic_semantic_values} against a segmentation whose "
-            f"values reach {top} (matched {present}). Set "
-            f"analysis_pars.mitotic_semantic_values for this dataset.")
-    mitotic_value = present[0]
+    mitotic_value, keep = _resolve_semantic_classes(occurs, defaults)
 
     # Per frame, the histogram of semantic values under each instance label, in
     # one bincount over label*width + value. Doing it per detection instead
@@ -77,6 +160,16 @@ def mask_semantic_values(instance, semantic, frames, labels, defaults,
         rows = np.flatnonzero(frames == f)
         inside = labels[rows] < n
         counts[rows[inside]] = hist[labels[rows[inside]]]
+
+    # Overlap sums are background as far as the score is concerned. Zeroing
+    # their columns here is the same as zeroing those pixels in the stack, but
+    # without copying it - a value the mask never counts is a value the mask
+    # never saw.
+    before = counts.sum(axis=1)
+    counts[:, ~keep] = 0
+    dropped_row = before - counts.sum(axis=1)
+    dropped_px = int(dropped_row.sum())
+    rows_with_dropped = int((dropped_row > 0).sum())
 
     mask_px = counts.sum(axis=1) - counts[:, 0]      # value 0 is background
     mitotic_px = counts[:, mitotic_value]
@@ -98,6 +191,10 @@ def mask_semantic_values(instance, semantic, frames, labels, defaults,
         "rows": int(len(frames)),
         "rows_mitotic": int(is_mitotic.sum()),
         "rows_empty_mask": int((mask_px == 0).sum()),
+        "overlap_values": {int(v): int(occurs[v])
+                           for v in np.flatnonzero(~keep) if occurs[v]},
+        "overlap_px_in_masks": dropped_px,
+        "rows_with_overlap_px": rows_with_dropped,
     }
     return values, mask_px, diagnostics
 
@@ -357,6 +454,14 @@ class analysis:
             self.defaults)
         self.tracked["semantic"] = values
         self.quality["semantic_from_masks"] = sem_diag
+        # The value resolved against the segmentation is the one the rest of
+        # the analysis must use, so _label_semantic has nothing left to guess.
+        self.defaults.mitotic_mask_value = sem_diag["mitotic_value"]
+        if sem_diag["overlap_values"]:
+            print(f'semantic values {sorted(sem_diag["overlap_values"])} are '
+                  f'sums written where masks overlap; treated as background '
+                  f'({sem_diag["overlap_px_in_masks"]} px inside masks, '
+                  f'affecting {sem_diag["rows_with_overlap_px"]} detection(s))')
         if sem_diag["rows_empty_mask"]:
             print(f'{sem_diag["rows_empty_mask"]} detection(s) had no pixels '
                   f'under their instance label; semantic left non-mitotic')
@@ -425,17 +530,24 @@ class analysis:
         if self.defaults.mitotic_mask_value not in observed:
             present = [v for v in self.defaults.mitotic_semantic_values
                        if v in observed]
-            if len(present) == 1:
-                print(f"mitotic_mask_value={self.defaults.mitotic_mask_value} is "
-                      f"absent from this segmentation; using {present[0]} instead "
-                      f"(observed values {sorted(observed)}).")
-                self.defaults.mitotic_mask_value = present[0]
-            else:
+            if not present:
                 raise ValueError(
                     f"mitotic_mask_value={self.defaults.mitotic_mask_value} does not "
                     f"occur in the semantic segmentation, which contains {sorted(observed)}. "
                     f"Set analysis_pars.mitotic_mask_value to the mitotic value for "
                     f"this dataset, otherwise no mitotic events will be detected.")
+            # On the tracking path mask_semantic_values has already resolved
+            # this and left only class values in the column. An analysis file
+            # written before it did can still hold both - a real class and the
+            # sum of two overlapping masks - so take the rarer, which is the
+            # mitotic class either way: a field is mostly interphase, and a
+            # contact rim is thinner still.
+            chosen = min(present,
+                         key=lambda v: int((self.tracked.semantic == v).sum()))
+            print(f"mitotic_mask_value={self.defaults.mitotic_mask_value} is "
+                  f"absent from this segmentation; using {chosen} instead "
+                  f"(observed values {sorted(observed)}).")
+            self.defaults.mitotic_mask_value = chosen
 
         # remove 0's and 2's, and fill gaps in the semantic vector.
         mask_value = self.defaults.mitotic_mask_value
