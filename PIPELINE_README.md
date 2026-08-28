@@ -492,10 +492,19 @@ python pipeline.py infer   --root <folder> --stem 20251009_..._G03_s8_phs
 conda activate img-env
 python pipeline.py analyze --root <folder> --stem G03_s8       # one position
 python pipeline.py analyze --root <folder> --semantic-gap 5    # override gap closing
+python pipeline.py analyze --root <folder> --frame-interval 4  # override the metadata
 ```
 
 `--force` redoes positions that are already finished. This is the quickest way
 to try tracking parameters on a single movie before committing the plate.
+
+`--frame-interval` is in **minutes** and is only needed when the acquisition
+metadata is wrong or missing. Otherwise the interval is read from the
+`Time interval:` line of the `*_metadata.txt` files beside the image stacks,
+and `analyze` refuses the position rather than guessing. It matters more than
+it looks: the interval converts `min_mitotic_duration` (30 min) into frames, so
+it decides what counts as a mitotic episode at all. Both flags pass through
+`submit` to the generated cluster command.
 
 ## Signal correction
 

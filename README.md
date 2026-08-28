@@ -59,7 +59,22 @@ The main parameters relate to trackpy configuration:
                 "adaptive" (could be used for cells that move)
 4. min_track_length = 10: Only cells tracked for > 10 timepoints are analyzed.
 5. memory = 1: tracking memory in timepoints
-6. min_mitotic_duration = 3: (unrelated to trackpy); mitotic events smaller than 3 timepoints are filtered out.
+6. min_mitotic_duration = 30 **minutes** (unrelated to trackpy); mitotic
+   events shorter than this are filtered out. It is held in minutes and
+   converted to frames against the acquisition's own interval, so the number of
+   frames it becomes depends on the experiment: 7 frames at 4 min/frame,
+   3 at 10.
+7. frame_interval — **no default**. Read from the microscope's metadata
+   (`*_metadata.txt`, the `Time interval:` line) by `files()` and
+   `from_analysis_file()`, validated, and recorded in the output's
+   `parameters` sheet. Pass `frame_interval=` to either to override it when
+   the metadata is wrong. It used to be hard-coded to 10, which silently made
+   `min_mitotic_duration` 12 minutes rather than 30 on any 4 min/frame
+   acquisition.
+8. semantic_gap_closing = 3 **frames**, and deliberately *not* converted by
+   the frame interval. It closes single-frame flicker in the segmentation's
+   output, and a classifier error is one frame wide whether frames are 4 or 10
+   minutes apart.
 
 Be careful when using the "predictive" tracking mode. It's very powerful, but can be computationally costly if the tracking memory>1 and max. pixel movement is > 25. This will lead to trackpy exceeding the max. number of nodes in one or more subnetworks. Currenlty, trackpy just exits on this error, which can be problematic when analysis is being done in batch mode. If you come across this issue, gradually decrease the max. pixel movement parameter to get under this error.
 
@@ -71,7 +86,7 @@ Be careful when using the "predictive" tracking mode. It's very powerful, but ca
 
 **Step 3:** Use the **measure_signal** function to measure the fluorescence from the specified channel. The channel string must match the channel name in the file names. The "id = -1" will make the function measure data for all cells that went through a complete mitosis during the time lapse. Optionally, one can provide a list with cell numbers (development only). Thus, cells that remained in interphase throughout the experiment are not measured. Their tracks are still reported.
 
-**Step 4:** Use the **summarize_data** function to create the summary Excel file that lists the average signals measured for all channels, duraion of mitosis, and the correction factors to account for background and excitation intensity variation. Before computing the summary measurements, **gaps in the semantic label vector are filled by "closing" with a footprint (semantic_footprint) of width min_mitotic_duration = 3, so only gaps < 3 frames are filled. The median filter and the closing are applied per particle, over that track's own frames in frame order** — run over the whole table they would bleed across track boundaries, letting the end of one cell's trace close a gap at the start of the next.
+**Step 4:** Use the **summarize_data** function to create the summary Excel file that lists the average signals measured for all channels, duraion of mitosis, and the correction factors to account for background and excitation intensity variation. Before computing the summary measurements, **gaps in the semantic label vector are filled by "closing" with a footprint (semantic_footprint) of width semantic_gap_closing = 3 frames, so only short gaps are filled. The median filter and the closing are applied per particle, over that track's own frames in frame order** — run over the whole table they would bleed across track boundaries, letting the end of one cell's trace close a gap at the start of the next.
 ### How a cell is summarized
 
 Two rules, applied per track.
@@ -124,6 +139,8 @@ directly; the other frame counts are durations.
 | `dead_cell_score` | mitotic frames the classifier flagged dead |
 | `fate_label` | see the table above |
 | `death_frame` | frame of the death call; `NaN` if the cell survives |
+| `obs_window_after_entry` | frames from mitotic entry to the end of the track — how long the cell *could* have been watched in mitosis |
+| `duration_censored` | the track ends while the cell is still mitotic, mid-movie, so its duration is a **lower bound** |
 | `<channel>`… | mean signal over `corrected_frames_in_mitosis` |
 
 `sem_frames_in_mitosis` minus `corrected_frames_in_mitosis` is the time the
@@ -136,8 +153,8 @@ from a cell already called dead.
 
 ### What never reaches the summary
 
-Six filters act before or during summarization. They are separate mechanisms,
-worth checking in this order when a cell you expect is missing:
+Eight filters act before or during summarization. They are separate
+mechanisms, worth checking in this order when a cell you expect is missing:
 
 | filter | where | control |
 |---|---|---|
@@ -146,8 +163,14 @@ worth checking in this order when a cell you expect is missing:
 | already mitotic on the track's first frame | `summarize_data` | — |
 | starts late in the movie and is mitotic at once | `summarize_data` | `late_track_start_fraction`, `early_mitosis_frames` |
 | still mitotic on the movie's last frame | `summarize_data` | — |
-| no mitotic run ≥ 3 frames | `summarize_data` | `min_mitotic_duration_in_frames` |
-| interphase death (see above) | `summarize_data` | `min_mitotic_duration_in_frames` |
+| no mitotic run ≥ `min_mitotic_duration` | `summarize_data` | `min_mitotic_duration`, `frame_interval` |
+| interphase death (see above) | `summarize_data` | `min_mitotic_duration`, `frame_interval` |
+| too little of the track left after mitotic entry | `summarize_data` | `min_window_factor`, `reference_track_fraction`, `reference_duration_frames` |
+| track opened late in the movie | `summarize_data` | `max_track_start_fraction` |
+
+The last two are the spurious-track filter, described in [its own
+section](#filtering-tracks-whose-duration-cannot-be-trusted) below. Both are
+switched off together with `exclude_short_window_tracks = False`.
 
 The first is the one that surprises: a cell that rounds up, dies and loses its
 track inside 10 frames is discarded at tracking and cannot be recovered
@@ -188,6 +211,67 @@ tracks = exp_analysis.measure_signal('Texas_Red', save_flag = False, id = -1)
 tracks = exp_analysis.measure_signal('Cy5', save_flag = True, id = -1) #as needed
 summary = exp_analysis.summarize_data(True)
 ```
+
+### Filtering tracks whose duration cannot be trusted
+
+Two things put a spuriously short mitosis in the summary, and neither is
+visible in the duration itself.
+
+**A track watched only briefly after mitotic entry cannot show a long
+mitosis**, whatever the cell does. At an observation window of 50 frames, 96%
+of tracks report a short mitosis — including ones that began at frame 0 and
+were tracked cleanly for hundreds of frames. This is censoring, not a bad
+track, but the number it produces is not a duration.
+
+**Trackpy opens fresh particles late in the movie on fragments in crowded
+areas.** Holding the window fixed, tracks starting in the last two thirds of
+the movie report a short mitosis 24–63% of the time against 2–9% for the rest
+— a step, not a gradient. These are the high-`particle`, short-track,
+short-mitosis rows.
+
+So `summarize_data` requires, per track:
+
+```
+obs_window_after_entry >= min_window_factor * D
+track_start_frame      <= max_track_start_fraction * n_frames
+```
+
+where `D`, the reference mitotic duration, is **measured from the data**: the
+median duration of tracks followed for `reference_track_fraction` of the movie.
+It has to be measured rather than set, because no constant serves both a
+mitotic arrest (median ~4 h) and an unperturbed control (~40 min) — and neither
+does a constant scaled only by the frame interval. The same factors calibrate
+themselves to each:
+
+| dataset | reference `D` | → min window | max start | tracks kept |
+|---|---|---|---|---|
+| CycB OE, 542 frames @ 4 min | 230 fr (15.3 h) | 150 fr | 180 | 213 / 254 |
+| unperturbed, 269 frames @ 4 min | 11 fr (44 min) | 8 fr | 89 | 144 / 156 |
+
+Across the whole arrest plate this keeps 69% of tracks, retains 99% of the
+well-observed ones, drops the fraction reporting an implausibly short mitosis
+from 22.5% to 1.9% (against 2.4% among the well-observed tracks), and leaves
+the ranking between wells intact. On the unperturbed plate the same rule keeps
+85% and moves neither well's median — which is the point: an artifact filter
+should reshape a contaminated distribution and stay out of the way otherwise.
+It follows that this filter does little for short-mitosis experiments, where a
+3-frame flicker and a real 10-frame mitosis are genuinely hard to tell apart.
+
+**Censoring is reported, not excluded.** `duration_censored` marks a track that
+ends while the cell is still mitotic. Dropping those costs a fifth of the data,
+moves the median by 0.2 h and makes the short-mitosis rate slightly *worse* — a
+censored duration is still a real mitosis watched for a while, unlike the ones
+the window test removes.
+
+`self.quality["track_filter"]` records what was calibrated and cut: the
+reference set size, `D`, both thresholds, and the row counts before and after.
+Worth a look on any position where the yield surprises you.
+
+**Per-position calibration.** `summarize_data` runs one position at a time, so
+`D` is measured per position and the threshold varies about ±20% across a
+plate. That is noise — positions in a well share their biology. Set
+`defaults.reference_duration_frames` to pin one value plate-wide if it matters.
+A position with fewer than 20 reference tracks skips the filter and says so.
 
 ### Mitotic vs dead discrimination
 
@@ -250,14 +334,62 @@ from the new labels, since the summary is derived entirely from them. Use
 `--suffix` to write copies instead (both files take the suffix), and
 `--cell-type` to pick the `analysis_pars` defaults for the rebuilt summary.
 
-The same path is available directly for re-summarizing an analysis file
-without redoing tracking or signal measurement — no image stacks are read, so
-it takes seconds rather than the better part of an hour:
+`--frame-interval` overrides what the acquisition metadata claims, for the
+rebuilt summary.
+
+#### Re-summarizing an analysis file
+
+`from_analysis_file` rebuilds a summary from a saved `*_analysis.xlsx` without
+redoing tracking or signal measurement — no image stacks are read, so it takes
+seconds rather than the better part of an hour. This is the way to try new
+filter settings.
 
 ```python
+from pathlib import Path
 from cellaap_analysis import analysis
-analysis.from_analysis_file(path_to_analysis_xlsx, cell_type="hela").summarize_data(True)
+
+f = Path('/path/to/..._inference/..._analysis.xlsx')
+analysis.from_analysis_file(f).summarize_data(True)
 ```
+
+`summarize_data(True)` writes `*_summary.xlsx` beside the analysis file; pass
+`False` to just get the DataFrame back. Add `suffix='_test'` to write
+`*_summary_test.xlsx` and leave the existing one alone — worth doing for a
+first look.
+
+The frame interval comes from the acquisition metadata automatically. To
+override it, or to compare against the unfiltered summary:
+
+```python
+from pathlib import Path
+from cellaap_analysis import analysis
+
+f = Path('/path/to/..._inference/..._analysis.xlsx')
+a = analysis.from_analysis_file(f, frame_interval=4)
+a.defaults.exclude_short_window_tracks = False   # to compare unfiltered
+a.summarize_data(True, suffix='_nofilter')
+print(a.quality['track_filter'].T)
+```
+
+A whole folder at once:
+
+```python
+from pathlib import Path
+from cellaap_analysis import analysis
+
+root = Path('/path/to/20593')
+for d in sorted(root.glob('*_inference')):
+    for f in d.glob('*_analysis.xlsx'):
+        analysis.from_analysis_file(f).summarize_data(True, suffix='_test')
+```
+
+Two things to check when you do: `a.quality['track_filter']` shows exactly what
+was calibrated and cut, and the printed `minimum mitotic duration 30 min = N
+frames` line confirms the interval was picked up correctly.
+
+Note that **every summary written before the frame-interval fix used the wrong
+minimum mitotic duration**, so re-summarizing is worth doing across the board,
+not only where you want the new filter.
 
 **Quality metrics** — `summarize_data` records two, in `self.quality` and in the
 spreadsheet's "quality" sheet: a histogram of mitotic episodes per track, and

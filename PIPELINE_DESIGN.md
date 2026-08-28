@@ -579,6 +579,7 @@ knowing:
 | inference folder name | `<stem>_<model>_<confluency>_<threshold>_inference`, from `batch_inference_APJ.py` | old folders stop being adopted; `analysis.files()` finds channel stacks via the stub, so the folder must stay a sibling of the raw stacks |
 | output file names | `*_semantic.tif`, `*_instance.tif` (`files()` globs for the words) | completion detection breaks |
 | analysis API | `analysis(root, plotting_only)`, `.files()`, `.track_centroids()`, `.measure_signal()`, `.summarize_data()` | the analyze stage breaks loudly, which is fine |
+| acquisition metadata | `*_metadata.txt` beside the image stacks, carrying a `Time interval:<n> min` line, read by `cellaap_utils.read_frame_interval()` | `analyze` refuses the position rather than guessing an interval. Pass `--frame-interval` to proceed. See §13. |
 | map discovery | `_load_maps()` walks the whole root, matching `background\|intensity` and a channel name anywhere in the file name | the ledger name, the duplicate-map check and the stray-file check in `check` all exist because of this rule |
 | map naming | `create_correction_maps()` derives both the channel and the output name from the source stem (`..._<channel>.tif`) | `MapPair.output` would predict the wrong file, and "already built" would always be false |
 | tifffile API | `create_correction_maps()` used `tifffile.imsave`, an alias removed from recent releases | it raised `AttributeError` on any current install; fixed in `cellaap_analysis` (see below) rather than worked around here |
@@ -767,3 +768,129 @@ reproducing an earlier run by hand, and `check` warns when legacy `*_map.tif`
 files are still in a folder, because `cellaap_analysis` will keep loading them
 into `<ch>_bkg_corr`/`<ch>_int_corr` — harmless extra columns, but a different
 correction that must not be mixed with `<ch>_corrected`.
+
+
+## 13. The frame interval belongs to the acquisition, not to the defaults
+
+`analysis_pars.frame_interval` was a hard-coded `10`, and
+`min_mitotic_duration_in_frames` was derived from it as `30 // 10 = 3`. On any
+acquisition that was not 10 min/frame the derived value was silently wrong: at
+4 min/frame the minimum mitotic episode was 12 minutes, not the 30 the
+parameter named. Nothing failed, and nothing in the output said so — the
+`parameters` sheet faithfully recorded a `frame_interval` that had never been
+measured.
+
+The interval is a property of the experiment, so it is now read from the
+microscope's own metadata by `files()` and `from_analysis_file()`, and
+`analysis_pars` has no default for it at all. Three things follow from that
+choice:
+
+**It is validated, not trusted.** One acquisition in hand records
+`Time interval:-26 min`. A negative interval does not fail loudly; it makes
+`30 // -26 == -2`, and every run of mitotic frames then clears the minimum
+duration. `read_frame_interval` requires a finite positive value, requires the
+per-wavelength files to agree with each other, and raises naming the offending
+file. `--frame-interval` (and the `frame_interval=` argument) exists for
+exactly this case.
+
+**Unset is a hard error, not a fallback.** `require_frame_interval()` is called
+at the top of `summarize_data` and inside `_episodes`, so a parameters object
+built without an interval fails with a message saying how to set one, rather
+than surfacing as a `TypeError` on a `None` comparison deep in a loop.
+
+**`from_analysis_file` deliberately ignores the interval saved in the file it
+is reading.** Every analysis file written before this change carries the
+hard-coded 10, which was never a measurement. Reading it back would quietly
+restore the wrong minimum on exactly the re-summarizing path that constructor
+exists to serve. The metadata is the source; when it is unreadable, the caller
+is asked.
+
+### What is *not* converted, and why
+
+`semantic_gap_closing` stays in frames. The two parameters sat adjacent in
+`analysis_pars` under one comment, which made them look coupled, and they are
+not:
+
+* `min_mitotic_duration` is **biology**. Thirty minutes is thirty minutes; it
+  must be expressed in time and converted.
+* `semantic_gap_closing` corrects **per-frame classifier flicker**. A
+  mislabelled frame is one frame wide whether frames are 4 or 10 minutes
+  apart, so frames is already the right unit and converting it would introduce
+  an error rather than remove one.
+
+They are coupled by a constraint rather than a conversion. `medfilt` followed
+by `closing` can fuse sustained flicker into a run far longer than any of its
+parts — measured on real traces, 79% of tracks are untouched, but 7.7% have
+their longest episode inflated by ≥1.5×, and 2.0% carry an episode that exists
+*only* because of the smoothing. That last figure does not improve when the
+minimum duration is raised (2.0% at 3 frames, 2.0% at 7, 2.6% at 8), because
+the fabricated run grows with the length of the flicker. No duration threshold
+defends against it. This is recorded as a known limit, not fixed here.
+
+## 14. Filtering tracks whose duration cannot be trusted
+
+`summarize_data` excluded tracks on four grounds already, all of them local
+tests on a single track. Two more were needed, and they differ in kind: one is
+about how long the cell was *watched*, the other about how the track was born.
+
+**Observation window.** A track watched briefly after mitotic entry cannot show
+a long mitosis whatever the cell does. At a window of 50 frames, 96% of tracks
+report a short mitosis — including tracks that began at frame 0 and were
+followed cleanly for hundreds of frames. This is censoring, and it is the
+larger of the two effects.
+
+The threshold cannot be a constant, and this is the part that took measurement
+to see. A mitotic arrest has a median mitosis of ~4 h and an unperturbed
+control ~40 min — a factor of 24. A constant in frames obviously fails across
+those. So does a constant in **minutes**: the value the arrest needs (620 min)
+keeps 34% of the control's tracks. Scaling by the frame interval fixes the
+units and leaves the real problem, because the quantity the window must be
+compared against is the *mitotic duration*, not the sampling rate.
+
+So the reference duration is measured from the data: the median over tracks
+followed for `reference_track_fraction` of the movie, times
+`min_window_factor`. The same two constants then yield a 150-frame threshold on
+the arrest and 8 on the control.
+
+**Track birth.** Trackpy opens fresh particles late in the movie on fragments
+in crowded areas. Holding the window fixed, tracks starting in the last two
+thirds report a short mitosis 24–63% of the time against 2–9% for the rest — a
+step, not a gradient — so `max_track_start_fraction` cuts it as a fraction of
+the movie. This threshold equals `late_track_start_fraction` but is applied
+unconditionally rather than in conjunction with an early mitosis, so it
+subsumes that older test while enabled; the conjunction is kept for when it is
+not.
+
+### Why the filter runs on the finished summary
+
+It runs after the per-track loop rather than inside it, because the calibration
+needs the durations the loop produces. Computing them twice, or restructuring
+the loop into two passes, would duplicate the episode and death logic for no
+gain — the excluded rows cost only the channel means already computed for them.
+
+### What is reported rather than excluded
+
+`duration_censored` marks a track that ends while still mitotic, mid-movie.
+Excluding those was tried and rejected on measurement: it costs a fifth of the
+data, moves the median by 0.2 h, and makes the short-mitosis rate slightly
+*worse*. A censored duration is a real mitosis watched for a while; the tracks
+the window test removes were barely watched at all. Both it and
+`obs_window_after_entry` are written on every row whether or not the filter is
+enabled, so a reader can always see the exposure behind a duration.
+
+### Limits
+
+* **Calibration is per position.** `summarize_data` sees one position, so the
+  threshold varies about ±20% across a plate. That is noise, since positions in
+  a well share their biology; `reference_duration_frames` pins one value
+  plate-wide when it matters. Under 20 reference tracks the filter skips and
+  says so.
+* **It does little for short-mitosis experiments.** On the unperturbed plate it
+  keeps 85% of tracks and moves neither well's median. That is the correct
+  behaviour for an artifact filter, but it should not be mistaken for having
+  cleaned those data: when a 3-frame flicker and a real 10-frame mitosis are
+  nearly the same length, no duration-based rule separates them.
+* **The ground truth is itself biased.** A mitotic cell is round and bright and
+  tracks well, so long mitoses beget long tracks. The reference median is an
+  over-estimate, and 7.7% of reference tracks are themselves censored. Treat
+  agreement with it as a sanity check, not a target to close.
