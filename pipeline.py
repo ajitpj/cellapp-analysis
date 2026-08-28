@@ -1609,7 +1609,12 @@ def run_analysis_one(session, task: Task, semantic_gap: int | None,
     if not inference_outputs_present(task):
         raise RuntimeError(f"no inference output at {task.inference_dir}")
 
-    session.files(task.inference_dir, cell_type=task.analysis_cell_type)
+    # frame_interval=None lets files() read the acquisition metadata; the
+    # flag exists because that metadata is sometimes wrong (one dataset
+    # records "Time interval:-26 min"), and the interval sets the minimum
+    # mitotic duration, so a wrong value changes what counts as a mitosis.
+    session.files(task.inference_dir, cell_type=task.analysis_cell_type,
+                  frame_interval=getattr(args, "frame_interval", None))
     if semantic_gap:
         session.defaults.semantic_gap_closing = semantic_gap
         session.defaults.semantic_footprint = np.ones(semantic_gap)
@@ -3119,6 +3124,8 @@ def cmd_submit(args) -> int:
     analysis_args = pattern_arg
     if args.semantic_gap:
         analysis_args += f" \\\n    --semantic-gap {args.semantic_gap}"
+    if args.frame_interval:
+        analysis_args += f" \\\n    --frame-interval {args.frame_interval}"
     if args.force_analysis:
         analysis_args += " \\\n    --force"
 
@@ -3422,6 +3429,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true", help="redo finished positions")
     sp.add_argument("--semantic-gap", type=int, default=None,
                     help="override analysis_pars.semantic_gap_closing (frames)")
+    sp.add_argument("--frame-interval", type=float, default=None,
+                    help="minutes between frames; read from the acquisition "
+                         "metadata when omitted. Sets the minimum mitotic "
+                         "duration, so pass it when the metadata is wrong")
     sp.set_defaults(func=cmd_analyze)
 
     sp = common(sub.add_parser(
@@ -3461,6 +3472,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--infer-concurrent", type=int, default=d["infer_concurrent"])
     sp.add_argument("--analysis-concurrent", type=int, default=d["analysis_concurrent"])
     sp.add_argument("--semantic-gap", type=int, default=None,
+                    help="passed through to analyze")
+    sp.add_argument("--frame-interval", type=float, default=None,
                     help="passed through to analyze")
     sp.add_argument("--analysis-only", action="store_true",
                     help="submit no GPU job at all; refuses if any position "

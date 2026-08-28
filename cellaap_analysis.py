@@ -264,11 +264,14 @@ class analysis:
                     self.background_map_present = True
                     print(f"{name} used as the {channel_name} background map")
 
-    def files(self, cellaap_dir: Path, cell_type: str):
+    def files(self, cellaap_dir: Path, cell_type: str, frame_interval = None):
         '''
         Inputs:
         cellaap_dir: directory containing cellapp inference; must contain "instance" and "semantic" tif files
         cell_type: specify the cell type so appropriate default pars are set
+        frame_interval: minutes between frames. Read from the acquisition
+                        metadata in the data directory when omitted; pass it
+                        explicitly when that metadata is wrong or absent.
         '''
         # Process the path objects to retrieve the parent directories and suffixes
         try:
@@ -284,6 +287,21 @@ class analysis:
 
         # Set path names for existing channel files
         self.data_dir = self.cellaap_dir.parent
+
+        # The frame interval comes from the acquisition, not from the analysis
+        # defaults, so it is resolved here - once data_dir is known - rather
+        # than carried as a constant in analysis_pars. It decides what counts
+        # as a mitotic episode at all, so an explicit argument wins over the
+        # metadata, and unreadable metadata is fatal rather than silently
+        # replaced by a guess.
+        if frame_interval is None:
+            frame_interval = read_frame_interval(self.data_dir)
+            print(f"frame interval {frame_interval:g} min, from the "
+                  f"acquisition metadata in {self.data_dir.name}")
+        self.defaults.set_frame_interval(frame_interval)
+        print(f"minimum mitotic duration {self.defaults.min_mitotic_duration} "
+              f"min = {self.defaults.min_mitotic_duration_in_frames} frames")
+
         image_paths = list(self.data_dir.glob('*.tif')) + list(self.data_dir.glob('*.tiff'))
         image_paths = map(str, image_paths)
         valid_paths = [
@@ -579,7 +597,7 @@ class analysis:
 
     @classmethod
     def from_analysis_file(cls, analysis_xlsx: Path, cell_type: str = "hela",
-                           frame_shape=None):
+                           frame_shape=None, frame_interval=None):
         '''Build an object that can summarize a saved *_analysis.xlsx.
 
         Only what summarize_data reads is populated - no image stacks are
@@ -595,6 +613,15 @@ class analysis:
                         none of them, so this rarely matters here.
         frame_shape   : (rows, cols) at analysis scale, for the border test.
                         Inferred from the bounding boxes when omitted.
+        frame_interval: minutes between frames. Read from the acquisition
+                        metadata beside the image stacks when omitted.
+
+        The interval is deliberately NOT taken from the file's own parameters
+        sheet. Files written before this change carry the hard-coded 10 that
+        was never a measurement, and reading it back would quietly restore the
+        wrong minimum mitotic duration on exactly the re-summarizing path this
+        constructor exists for. The metadata is the source; when it is
+        unreadable this raises and asks for the value rather than guessing.
 
         semantic_smoothed and mitotic are derived only when absent. Deriving
         them from a file that already has them would median-filter an already
@@ -624,6 +651,13 @@ class analysis:
         self.expt_name = analysis_xlsx.name.split(self.name_stub)[0]
         if frame_shape is not None:
             self.frame_shape = frame_shape
+
+        # data_dir is where the image stacks and their metadata live: the
+        # inference folder's parent, the same directory files() reads.
+        self.data_dir = self.cellaap_dir.parent
+        if frame_interval is None:
+            frame_interval = read_frame_interval(self.data_dir)
+        self.defaults.set_frame_interval(frame_interval)
 
         missing = {"semantic", "particle", "frame", "x", "y", "area"} - set(cell.columns)
         if missing:
@@ -785,7 +819,7 @@ class analysis:
         frame before the episode - and needed an off-by-one correction.
         '''
         return [(s, e) for s, e in self._runs(sem)
-                if e - s >= self.defaults.min_mitotic_duration_in_frames]
+                if e - s >= self.defaults.require_frame_interval()]
 
     def _death_row(self, dead_proba):
         '''Row of the first frame at which the cell is called dead, or None.
@@ -815,6 +849,97 @@ class analysis:
                 continue                      # recovered: not a death
             return int(s)
         return None
+
+    def _filter_spurious_tracks(self, summary, movie_last, censored):
+        '''Drop tracks whose reported mitotic duration cannot be trusted.
+
+        Runs on the finished summary rather than inside the per-track loop,
+        because the calibration needs the durations the loop produces. Adds
+        two columns to every row, kept whether or not the filter is enabled:
+
+        obs_window_after_entry  frames from mitotic entry to the END OF THE
+                                TRACK - how long the cell could have been
+                                watched in mitosis, irrespective of what it
+                                did. It is fixed before the outcome is known,
+                                which is what makes it safe to filter on: it
+                                is exposure time, not a measurement.
+        duration_censored       the track ends while the cell is still mitotic,
+                                somewhere other than the last frame of the
+                                movie, so its duration is a LOWER BOUND. This
+                                is a flag only. Excluding on it costs a fifth
+                                of the data and does not improve the
+                                distribution (median moves 37.0 -> 37.2 h and
+                                the short-mitosis rate gets slightly worse),
+                                because a censored duration is still a real
+                                mitosis seen for a while - unlike the tracks
+                                the window test removes, which were barely
+                                seen at all.
+
+        Two tests, each anchored to the scale it is actually about:
+
+        * the window must be at least min_window_factor of the reference
+          mitotic duration, itself the median over tracks followed for
+          reference_track_fraction of the movie. Anchoring to the data rather
+          than to a constant is what lets one rule serve a mitotic arrest and
+          an unperturbed control - on the datasets this was built against the
+          same factor yields a 155-frame threshold for the first and 7 for the
+          second.
+        * the track must start within max_track_start_fraction of the movie.
+
+        Returns the filtered summary. The reference set is reported in
+        self.quality["track_filter"] so a later reader can see what the
+        thresholds were calibrated against, which matters because they move
+        with the data.
+        '''
+        n_frames = int(movie_last) + 1
+        summary = summary.copy()
+        summary["obs_window_after_entry"] = (
+            summary.track_start_frame + summary.track_length - 1
+            - summary.mitotic_start_frame + 1)
+        summary["duration_censored"] = summary.particle.map(censored).fillna(False)
+        if not self.defaults.exclude_short_window_tracks:
+            return summary          # columns still added, nothing excluded
+
+        reference = summary[summary.track_length
+                            >= self.defaults.reference_track_fraction * n_frames]
+        if self.defaults.reference_duration_frames is not None:
+            duration = float(self.defaults.reference_duration_frames)
+        elif len(reference) < 20:
+            print(f"only {len(reference)} tracks reach "
+                  f"{self.defaults.reference_track_fraction:.0%} of the movie; "
+                  f"too few to calibrate the spurious-track filter, so it is "
+                  f"skipped for this position. Set "
+                  f"defaults.reference_duration_frames to filter it anyway.")
+            return summary
+        else:
+            duration = float(reference.corrected_frames_in_mitosis.median())
+        min_window = max(int(np.ceil(self.defaults.min_window_factor * duration)),
+                         self.defaults.require_frame_interval())
+        max_start = int(self.defaults.max_track_start_fraction * n_frames)
+
+        keep = ((summary.obs_window_after_entry >= min_window)
+                & (summary.track_start_frame <= max_start))
+        self.quality["track_filter"] = pd.DataFrame([{
+            "n_frames": n_frames,
+            "n_reference_tracks": len(reference),
+            "reference_pinned": self.defaults.reference_duration_frames is not None,
+            "reference_duration_frames": duration,
+            "min_window_frames": min_window,
+            "max_track_start_frame": max_start,
+            "n_before": len(summary),
+            "n_after": int(keep.sum()),
+        }])
+
+        interval = self.defaults.frame_interval
+        print(f"spurious-track filter: reference duration "
+              f"{duration:.0f} frames ({duration * interval:.0f} min) from "
+              f"{len(reference)} tracks followed >= "
+              f"{self.defaults.reference_track_fraction * n_frames:.0f} frames")
+        print(f"  excluded {int((~keep).sum())} of {len(summary)} tracks "
+              f"(observation window < {min_window} frames after mitotic entry, "
+              f"or track starting after frame {max_start}); "
+              f"{int(keep.sum())} remain")
+        return summary[keep].reset_index(drop=True)
 
     def summarize_data(self, save_flag: True, suffix: str = ""):
         '''
@@ -904,6 +1029,11 @@ class analysis:
         Outputs -
         None
         '''
+        # Fail here rather than inside the per-track loop: every duration this
+        # function reports is scaled by the frame interval, and the episode
+        # test below depends on it.
+        self.defaults.require_frame_interval()
+
         # Select only those tracks where mitosis was observed
         idlist    = sorted(set(self.tracked[self.tracked.mitotic==1].particle))
 
@@ -943,6 +1073,10 @@ class analysis:
         starts_mitotic = set(edge.index[edge.first_sem == 1])
         ends_clipped = set(edge.index[(edge.last_frame == movie_last)
                                       & (edge.last_sem == 1)])
+        # Same test one frame short of the end: the track stops while the cell
+        # is still mitotic, so the duration is a lower bound. Reported as a
+        # column rather than excluded - see _filter_spurious_tracks.
+        censored = ((edge.last_sem == 1) & (edge.last_frame < movie_last))
         for ids, why in ((starts_mitotic, 'starting in mitosis (no entry '
                                           'observed; usually a daughter cell '
                                           'picked up mid-division)'),
@@ -1141,6 +1275,11 @@ class analysis:
         summary_storage = other_storage | signal_storage
         self.summaryDF = pd.DataFrame(summary_storage)
 
+        # The window and start tests run last: the first needs the durations
+        # computed above to calibrate itself against, and both add columns
+        # that describe rows the loop has already built.
+        self.summaryDF = self._filter_spurious_tracks(
+            self.summaryDF, movie_last, censored)
 
         if save_flag:
             out = self.cellaap_dir / Path(

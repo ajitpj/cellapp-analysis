@@ -5,7 +5,7 @@ import joblib
 
 class analysis_pars:
 
-    def __init__(self, cell_type = "hela"):
+    def __init__(self, cell_type = "hela", frame_interval = None):
         self.cell_types = ["hela", "u2os", "rpe1", "ht1080"]
 
         try:
@@ -26,11 +26,23 @@ class analysis_pars:
         self.max_cell_size = 4000
         self.min_cell_size = 250
 
-        # Median filter size for smoothing semantic label trace
+        # Shortest run of mitotic frames that counts as a mitosis. This is
+        # biology, so it is held in MINUTES and converted to frames against the
+        # acquisition's own interval by set_frame_interval. There is no default
+        # interval: it is a property of the experiment, and the 10 that used to
+        # sit here was silently wrong for datasets acquired at 4 min, which put
+        # this threshold at 12 minutes rather than 30.
         self.min_mitotic_duration = 30 # minutes
-        self.frame_interval = 10 #  time step in min
-        self.min_mitotic_duration_in_frames = self.min_mitotic_duration // self.frame_interval
+        self.frame_interval = None                   # min, from the metadata
+        self.min_mitotic_duration_in_frames = None   # set by set_frame_interval
+        if frame_interval is not None:
+            self.set_frame_interval(frame_interval)
 
+        # Smoothing of the semantic label trace, in FRAMES rather than minutes,
+        # and deliberately not converted by set_frame_interval. This closes
+        # single-frame flicker in the segmentation's output - a classifier
+        # error is one frame wide whether frames are 4 or 10 minutes apart - so
+        # unlike min_mitotic_duration it does not scale with the interval.
         # Must be odd so it can be centered symmetrically on each pixel; otherwise the operation will translate the peak
         self.semantic_gap_closing = 3 # number of frames
         self.semantic_footprint = np.ones(self.semantic_gap_closing)
@@ -54,6 +66,44 @@ class analysis_pars:
         # an early mitosis in a track that has been followed from the outset.
         self.late_track_start_fraction = 1 / 3
         self.early_mitosis_frames = 3
+
+        # Spurious-track filter (summarize_data). Two independent causes put a
+        # short "mitosis" in the summary, and they need different tests.
+        #
+        # A track that is only watched briefly after mitotic entry cannot show
+        # a long mitosis whatever the cell does - at an observation window of
+        # 50 frames, 96% of tracks report a short one regardless of how well
+        # they were tracked. So the window after entry must be long enough to
+        # contain a typical mitosis for this experiment. "Typical" is measured
+        # from the data rather than set here: a fixed threshold cannot serve
+        # both an arrest (median mitosis ~4 h) and an unperturbed control
+        # (~40 min), and neither can one scaled only by the frame interval.
+        # The reference is the median mitotic duration of tracks followed for
+        # reference_track_fraction of the movie, and the window must be at
+        # least min_window_factor of that.
+        #
+        # The other cause is trackpy opening a fresh particle late in the
+        # movie on a fragment in a crowded area, which no window test catches:
+        # holding the window fixed, tracks starting in the last two thirds of
+        # the movie report a short mitosis 24-63% of the time against 2-9% for
+        # the rest. That step is what max_track_start_fraction cuts, as a
+        # fraction of the movie so it does not depend on its length.
+        #
+        # Note this threshold is the same as late_track_start_fraction but is
+        # applied on its own rather than in conjunction with an early mitosis,
+        # so it subsumes that test while the filter is enabled. The conjunction
+        # is kept for when it is not.
+        # summarize_data runs one position at a time, so the reference duration
+        # is measured per position and the resulting threshold varies about
+        # +/-20% across a plate - noise, since positions in a well share their
+        # biology. Set reference_duration_frames to pin one value plate-wide
+        # (the median over the whole plate's reference tracks) when that
+        # variation matters; left None, each position calibrates itself.
+        self.exclude_short_window_tracks = True
+        self.reference_track_fraction = 0.75
+        self.reference_duration_frames = None
+        self.min_window_factor = 0.65
+        self.max_track_start_fraction = 1 / 3
 
         # Death call. A cell is dead from the first frame of the first run of
         # death_run_frames consecutive frames with P(dead) above the
@@ -97,3 +147,43 @@ class analysis_pars:
         self.dead_classifier_bundle = joblib.load(
             Path(__file__).parent / "models" / "dead_classifier_pooled.joblib")
         self.dead_classifier = self.dead_classifier_bundle["model"]
+
+    def set_frame_interval(self, minutes):
+        '''Record the acquisition's frame interval and convert the durations.
+
+        Kept separate from __init__ because the interval is discovered from the
+        data - `analysis.files` reads it out of the acquisition metadata once
+        it knows which folder the position lives in - while the parameters
+        object is built before that. Calling it again with a different value
+        re-derives cleanly, so a caller may override what the metadata claims.
+
+        min_mitotic_duration_in_frames keeps the floor of the old `//`: the
+        threshold is "at least this many frames", and rounding 30 min at 4
+        min/frame up to 8 rather than down to 7 would tighten it beyond what
+        changing the interval is meant to do. At 4 min/frame it becomes 7
+        frames where the hard-coded 10 gave 3.
+        '''
+        minutes = float(minutes)
+        if not np.isfinite(minutes) or minutes <= 0:
+            raise ValueError(f"frame_interval must be a positive number of "
+                             f"minutes, got {minutes}")
+        self.frame_interval = minutes
+        self.min_mitotic_duration_in_frames = max(
+            1, int(self.min_mitotic_duration // minutes))
+        return self
+
+    def require_frame_interval(self):
+        '''Fail with an actionable message rather than on a None comparison.
+
+        Everything that reads min_mitotic_duration_in_frames goes through here
+        first, so an unset interval is caught at the top of the stage that
+        needs it instead of surfacing as a TypeError deep inside _episodes.
+        '''
+        if self.frame_interval is None or self.min_mitotic_duration_in_frames is None:
+            raise ValueError(
+                "frame_interval is not set, so the minimum mitotic duration "
+                "cannot be converted to frames. Build the analysis through "
+                "analysis.files()/from_analysis_file (which read it from the "
+                "acquisition metadata), or call "
+                "defaults.set_frame_interval(minutes) yourself.")
+        return self.min_mitotic_duration_in_frames

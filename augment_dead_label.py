@@ -73,7 +73,8 @@ def _archive_existing(analysis_xlsx: Path) -> None:
 
 def augment_file(inference_dir: Path, model, suffix: str = "",
                  phase_offset: int = 0, post_peak_frames: int = 0,
-                 cell_type: str = "hela", archive: bool = False) -> None:
+                 cell_type: str = "hela", archive: bool = False,
+                 frame_interval = None) -> None:
     xlsx = sorted(inference_dir.glob("*_analysis.xlsx"))
     if not xlsx:
         print(f"{inference_dir.name}: no analysis file, skipping")
@@ -147,8 +148,9 @@ def augment_file(inference_dir: Path, model, suffix: str = "",
     # The summary is derived entirely from the labels just rewritten, so a
     # stale one next to a re-scored analysis file is worse than none. Rebuild
     # it from the file that was actually written.
-    summary = analysis.from_analysis_file(out, cell_type=cell_type
-                                          ).summarize_data(True, suffix=suffix)
+    summary = analysis.from_analysis_file(
+        out, cell_type=cell_type, frame_interval=frame_interval
+    ).summarize_data(True, suffix=suffix)
     print(f"{out.name.replace('_analysis', '_summary')}: {len(summary)} tracks "
           f"summarized")
 
@@ -178,6 +180,11 @@ def main():
     ap.add_argument("--cell-type", default="hela",
                     help="analysis_pars defaults used for the rebuilt summary "
                          "(default: hela)")
+    ap.add_argument("--frame-interval", type=float, default=None,
+                    help="minutes between frames; read from the acquisition "
+                         "metadata when omitted. Pass it when that metadata is "
+                         "wrong - it sets the minimum mitotic duration, so a "
+                         "wrong value changes which runs count as a mitosis")
     args = ap.parse_args()
 
     if not args.root_folder.is_dir():
@@ -198,7 +205,8 @@ def main():
         augment_file(folder, model, suffix=args.suffix,
                      phase_offset=args.phase_offset,
                      post_peak_frames=args.post_peak_frames,
-                     cell_type=args.cell_type, archive=args.archive)
+                     cell_type=args.cell_type, archive=args.archive,
+                     frame_interval=args.frame_interval)
 
 
 if __name__ == "__main__":

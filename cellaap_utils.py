@@ -12,6 +12,7 @@ dose-response curves and plotting them live in `cellaap_aggregate.py`, which is
 a notebook module and imports what it likes.
 """
 
+import re
 import numpy.typing as npt
 from skimage.filters import gaussian
 # from skimage.morphology import closing
@@ -19,7 +20,7 @@ import numpy as np
 import scipy.ndimage as ndi
 # from scipy.signal import medfilt
 import pandas as pd
-# from pathlib import Path
+from pathlib import Path
 
 __all__ = [
     "projection",
@@ -29,6 +30,7 @@ __all__ = [
     "window_stats",
     "calculate_signal",
     "calculate_displacement",
+    "read_frame_interval",
 ]
 
 
@@ -182,3 +184,69 @@ def calculate_displacement(coords: pd.DataFrame) -> pd.Series:
     #
 
     return pd.Series(displacement, index=coords.index)
+
+
+def read_frame_interval(folder, pattern: str = "*metadata*.txt") -> float:
+    """Minutes between frames, read from the acquisition metadata.
+
+    The interval is a property of the acquisition, not of the analysis, so it
+    is read from the microscope's own metadata rather than carried as a default
+    in `analysis_pars`. A wrong value is silent and expensive: it feeds
+    `min_mitotic_duration_in_frames`, so it decides what counts as a mitotic
+    episode at all, and every duration reported downstream is scaled by it.
+
+    The files are written one per wavelength (`*_w1_metadata.txt`, `_w2`, ...)
+    and carry a `Time interval:4 min` line. All of them are read and required to
+    agree - they describe one acquisition, so a disagreement means the folder
+    holds more than one and no single interval is correct.
+
+    The value is validated rather than trusted. Real acquisitions have written
+    `Time interval:-26 min` here, and a negative interval propagates quietly:
+    `30 // -26` is -2, which makes every run of mitotic frames long enough to
+    count as an episode. Anything not finite and positive raises, naming the
+    file, so the caller passes the interval in explicitly instead.
+
+    Inputs:
+    folder  : directory holding the metadata files, i.e. the one with the image
+              stacks in it (`analysis.data_dir`)
+    pattern : glob for the metadata files
+
+    Returns the interval in minutes. Raises ValueError/FileNotFoundError with
+    the offending file named.
+    """
+    folder = Path(folder)
+    files = sorted(folder.glob(pattern))
+    if not files:
+        raise FileNotFoundError(
+            f"no acquisition metadata matching {pattern!r} in {folder}; pass "
+            f"frame_interval explicitly")
+
+    found = {}
+    for f in files:
+        match = re.search(r"^Time interval:\s*(-?[\d.]+)\s*(\w*)",
+                          f.read_text(errors="replace"), re.MULTILINE)
+        if match is None:
+            continue
+        value, unit = float(match.group(1)), match.group(2).lower()
+        if unit.startswith("s"):            # seconds, occasionally written
+            value /= 60.0
+        elif unit and not unit.startswith("min"):
+            raise ValueError(f"{f.name} gives the time interval in {unit!r}, "
+                             f"which is not a unit this understands; pass "
+                             f"frame_interval explicitly")
+        if not np.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"{f.name} gives 'Time interval: {match.group(1)} "
+                f"{match.group(2)}', which is not a usable frame interval. "
+                f"The metadata is wrong; pass frame_interval explicitly.")
+        found[f.name] = value
+
+    if not found:
+        raise ValueError(
+            f"none of {[f.name for f in files]} in {folder} carries a "
+            f"'Time interval:' line; pass frame_interval explicitly")
+    if len(set(found.values())) > 1:
+        raise ValueError(
+            f"the metadata in {folder} disagrees about the frame interval "
+            f"({found}); pass frame_interval explicitly")
+    return next(iter(found.values()))
