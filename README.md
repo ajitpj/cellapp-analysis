@@ -411,7 +411,7 @@ this module. It lives in `cellaap_aggregate.py`, described in
 the plate layout from the same `platemap.csv` that `pipeline.py` ran the plate
 from rather than from a hand-written well list.
 
-**Step 6:** Use the **fit_model** function to fit a 4-parameter Hill model to binned data. The function expects input data as a dataframe with the first column containing the fluorescence signal and the second column containing the time in mitosis. For this model to work, the 0 dosage response must be defined as a positive value. This value must be obtained from a -rapamycin well or otherwise supplied. If it is unavailable, perform a rough background subtraction as shown below on a temporary basis.
+**Step 6:** Use the **fit_model** function to fit a 4-parameter Hill model to binned data. The function expects input data as a dataframe with the first column containing the fluorescence signal and the second column containing the time in mitosis. For this model to work, the 0 dosage response must be defined as a positive value. This value must be obtained from a -rapamycin well or otherwise supplied. If it is unavailable, perform a rough background subtraction as shown below on a temporary basis — or, better, use `agg.baseline_offsets(df, column, reference="zero")` and `agg.apply_baseline_offsets`, which take the zero from each position's dim population rather than from its single lowest cell (see [Aligning the zero](#aligning-the-zero-across-positions)).
 
 quant_fraction must a list that specifies the quantiles to be evaluated for the dosage. The bin range is based on the quantile values of the dosage values. Remember that the eSAC dosage distribution is asymmetric (it should be possible to fit it with a log-normal distribution). Therefore, the default quantile values (used below) are asymmetric.
 
@@ -486,33 +486,80 @@ missing from the platemap is reported and falls back to HeLa, with
 If the raw `*phs.tif` stacks have been archived, positions are recovered from
 the `*_inference` folder names instead, so a results-only folder still compiles.
 
-### The older well-list API
+### Aligning the zero across positions
 
-`create_wellmap_dict`, `compile_summaries`, `import_filter_data_for_wells` and
-`import_whole_expt_data` moved here from `cellaap_utils` unchanged in signature,
-so existing notebooks need only their import line updated:
+`signal_correction` measures each position's background from that position's
+own cell-free pixels, which is why `<ch>_corrected` beats the blank-well maps.
+It has one failure mode and it is systematic: there have to *be* cell-free
+pixels. As a field fills up the estimator backs its exclusion ring off the
+cells to keep enough blocks measurable, and the closer it measures to a cell
+the more of that cell's out-of-focus halo it counts as medium. The background
+comes out too high, the corrected signal too low, and the error grows with
+confluence — so it differs between positions in one well, between wells, and
+between days.
+
+The size of it on the 20260826 CycB plate: across the four A01 positions — one
+well, one treatment, no GFP induced — the **raw** floor spans 0.9 counts and
+the **corrected** floor spans 5.1, against a median signal of 23. One position
+(`C01_s6`, the densest on the plate) over-subtracts hard enough to put its
+dimmest cells at −300.
+
+A cell with no fluorophore reads the same number everywhere, because that
+number belongs to the microscope and not to the well. So the bottom of each
+position's distribution is a landmark that *should* line up, and how far it
+fails to is the residual background error, measured directly. Subtracting that
+per-position constant is the correction.
+
+Three calls, deliberately separate — nothing is applied until you have looked:
 
 ```python
-from cellaap_aggregate import create_wellmap_dict, import_whole_expt_data
-
-wellmap  = create_wellmap_dict(agg.read_platemap(root_folder))
-whole_df = import_whole_expt_data(wellmap, root_folder, expt_length=150, delta_t=10)
+offsets = agg.baseline_offsets(df, "GFP_corrected")      # measure. Changes nothing
+agg.plot_baseline_offsets(df, offsets)                   # look
+aligned = agg.apply_baseline_offsets(df, offsets)        # adds GFP_corrected_aligned
 ```
 
-They now understand the platemap's `well_ids` syntax — ranges (`B01-B06`)
-expand, `g3` normalizes to `G03` — and skip the `skip` and blank-media rows.
+`offsets` is an ordinary dataframe, one row per unit, that you can read, sort,
+edit or throw away. `floor` is where the unit's dim cells sit, `offset` is what
+will be subtracted, `floor_se` is the bootstrap error on the floor, and `flag`
+marks rows to look at — `few cells`, `outlier floor`, and `low tail` for a
+position that no single constant can repair. `plot_baseline_offsets` draws the
+signal before and after with the floors marked, plus the floors themselves with
+their error bars.
 
-One hazard remains in this path, and it is why `load_experiment` exists:
-`compile_summaries` matches a well id as a substring of the folder name, so if
-the platemap gives one site of a well its own row, that site is counted under
-**both** conditions. `agg.wellmap_from_platemap(root_folder)` returns the same
-mapping resolved to position stubs instead of wells, which fixes it while
-keeping the rest of the old call chain:
+| argument | |
+| --- | --- |
+| `by` | what a unit is. `"stem"` (default) is one imaging position, the level the background was estimated at; `"well"` pools a well's sites; `["experiment", "code"]` pools a condition per plate |
+| `estimator` | `"trimmed"` (default, the mean between the 2nd and 15th percentile), `"quantile"`, or `"mode"` for a unit that is mostly non-expressing |
+| `reference` | `"median"` (default) moves the units onto each other without claiming to know the absolute zero; `"zero"` puts every floor at 0; `"min"`; or a unit label, e.g. an untreated control well |
+| `within` | compute a separate reference inside each of these groups, which is how you choose what the alignment may touch |
 
-```python
-wellmap  = agg.wellmap_from_platemap(root_folder)
-whole_df = import_whole_expt_data(wellmap, root_folder, expt_length=150, delta_t=10)
-```
+`within` is the argument to think about. Left out, everything is put on one
+zero — the strongest correction, and the right one when every unit really
+should read the same at zero (repeats of a plate, or wells differing only in a
+drug that does not touch the reporter). `within="code"` aligns positions inside
+each condition and leaves the conditions where they are; reach for it whenever
+a treatment induces the reporter, since it cannot flatten the induction. On the
+20260826 plate it leaves the three condition medians within 0.2 counts while
+pulling the position-to-position spread of the two uninduced wells from 7.0 and
+5.0 counts down to 4.3 and 4.2. `within="experiment"` aligns each plate to its
+own median and leaves the plates' levels alone, for plates that are not
+expected to share a zero.
+
+Pooling several plates is the same call on the concatenated table.
+
+What it does **not** do. It removes an offset, so it cannot repair a position
+that is over-subtracted by different amounts in different parts of its own
+field — the `low tail` flag marks those, and they are to be dropped rather
+than aligned. It needs some genuinely dim cells in each unit: in a well where
+every cell expresses, the bottom of the distribution is a biological number and
+aligning on it flattens a real difference, which is the one way to do damage
+here. And it does not by itself make two experiments comparable, since a
+different exposure rescales the signal as well as shifting it.
+
+`correction_tools.surface_diagnostics(root)` says *why* a position's zero is
+off — how many blocks the estimator could measure, how wide an exclusion ring
+it held, how much its background appeared to drift. Over the ten uninduced
+positions of that plate the floor tracks all three (r = −0.83, −0.80, +0.79).
 
 ## Curating particles: `particle_browser.py`
 

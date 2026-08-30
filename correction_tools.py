@@ -42,6 +42,7 @@ __all__ = [
     "save_background_stack",
     "read_background_stack",
     "upsample_stack",
+    "surface_diagnostics",
     # applying a correction to numbers already measured
     "Surface",
     "correct_cell_table",
@@ -136,6 +137,93 @@ def upsample_stack(stack: npt.NDArray, shape: tuple[int, int]) -> npt.NDArray:
     if a.ndim == 2:
         return upsample(a, shape)
     return np.stack([upsample(f, shape) for f in a])
+
+
+def surface_diagnostics(root: str | Path, channel: str | None = None,
+                        subdir: str = "pipeline/state/surfaces"):
+    """What the background estimator had to work with, position by position.
+
+    Reads only the TIFF headers of the saved surfaces, so a whole plate costs
+    a fraction of a second and no image data is touched.
+
+    This is the companion to `cellaap_aggregate.baseline_offsets`: that measures
+    that a position's zero is off, this says why. The columns to read first are
+
+    ``usable_blocks``   fraction of the grid that had enough cell-free pixels
+                        to measure. It falls as the field fills up.
+    ``dilation_used``   how far from the cells the estimator managed to stay,
+                        widest and narrowest over the sampled frames. It backs
+                        off the requested value when a frame is too crowded,
+                        and every step down lets more out-of-focus halo into
+                        the background. That is the mechanism: the background
+                        comes out too high, so the corrected signal - and the
+                        position's zero with it - comes out too LOW.
+    ``drift_percent``   how much the mean background moved over the movie. The
+                        medium does drift, but tens of percent on a plate whose
+                        uncrowded positions drift 5% is cells accumulating, not
+                        medium.
+
+    On the 20260826 CycB plate, over the ten positions of the two wells with no
+    GFP induced, the three sort together exactly as that story predicts. The
+    D01 positions hold 121 px and drift 5-6%; the A01 positions fall to 60 or
+    30 px and drift 23-34%, and their floors are the low ones. Against
+    `cellaap_aggregate.baseline_offsets`' floor: r = -0.83 for the peak
+    background, -0.80 for the drift, +0.79 for the narrowest dilation held.
+
+    Read it only over positions expected to hold the same fluorophore. A well
+    that is genuinely brighter has a genuinely higher floor, and this table
+    cannot tell you which you are looking at - it tells you whether the
+    estimator was in trouble.
+
+    Parameters
+    ----------
+    root : path
+        The plate's root folder - the one holding `pipeline/`.
+    channel : str, optional
+        Only this channel's surfaces, e.g. `"GFP"`.
+    subdir : str
+        Where the pipeline put them, if it is not the default.
+
+    Returns
+    -------
+    DataFrame, one row per position and channel. Empty if the folder holds no
+    surfaces - a plate analyzed before they were written, or one whose
+    `pipeline/` directory was not copied along with the results.
+    """
+    import pandas as pd
+    import tifffile
+
+    folder = Path(root) / subdir
+    pattern = f"*_{channel}_bkg.tif" if channel else "*_bkg.tif"
+    rows = []
+    for path in sorted(folder.glob(pattern)):
+        with tifffile.TiffFile(path) as fh:
+            try:
+                meta = json.loads(fh.pages[0].description)
+            except Exception:
+                warnings.warn(f"{path.name} carries no readable metadata; skipped")
+                continue
+        diagnostics = meta.get("diagnostics", {})
+        stub = re.search(r"([A-H]\d{2})_s(\d+)", meta.get("stem", path.name))
+        dilation = diagnostics.get("dilation_used", [None, None])
+        rows.append({
+            "stem": meta.get("stem", ""),
+            "well": stub.group(1) if stub else "",
+            "position": f"s{int(stub.group(2))}" if stub else "",
+            "channel": meta.get("channel", ""),
+            "model": diagnostics.get("background_model", ""),
+            "usable_blocks": diagnostics.get("usable_block_fraction", float("nan")),
+            "dilation_min": min(dilation) if dilation else None,
+            "dilation_max": max(dilation) if dilation else None,
+            "drift_percent": diagnostics.get("background_drift_percent", float("nan")),
+            "background_min": (diagnostics.get("background_mean_range") or [None, None])[0],
+            "background_max": (diagnostics.get("background_mean_range") or [None, None])[-1],
+            "shape_centre_edge": diagnostics.get("background_shape_centre_edge",
+                                                 float("nan")),
+            "borrowed_from": ", ".join(diagnostics.get("shape_borrowed_from", [])),
+            "reason": diagnostics.get("background_model_reason", ""),
+        })
+    return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------

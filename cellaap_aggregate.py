@@ -11,18 +11,20 @@ That is the duplicated-truth problem the platemap exists to prevent, and it
 applies to compilation exactly as it applies to the two pipeline stages.
 
 Three things follow from reading the platemap rather than a hand-written well
-list, and each fixes a way the old well-list path quietly got the wrong answer:
+list, and each fixes a way a hand-written list quietly got the wrong answer:
 
-* **Well ranges and normalization.** `B01-B06` expands, `g3` becomes `G03`.
-  The old `create_wellmap_dict` split only on commas and whitespace, so a range
-  survived as the literal string `B01-B06` and matched no folder at all.
+* **Well ranges and normalization.** `B01-B06` expands and `g3` becomes `G03`,
+  through `pipeline.expand_well_token`. Splitting a `well_ids` cell on commas
+  and whitespace alone leaves a range as the literal string `B01-B06`, which
+  matches no folder at all.
 * **`skip` and blank-media rows drop out.** A `fluorobrite` well has no
-  celltype, transfection or drug, so it used to form a junk `('', '', '')`
-  group that then found no summaries, because blank wells are never segmented.
+  celltype, transfection or drug, so it forms a junk `('', '', '')` group that
+  then finds no summaries, because blank wells are never segmented.
 * **Position overrides stop double-counting.** With a `G03` row and a `G03_s9`
-  row under a different drug, matching the substring `_G03_` puts site 9 in
-  *both* groups. Precedence is resolved per position here, as the pipeline
-  resolves it, so each position lands in exactly one group.
+  row under a different drug, matching the substring `_G03_` against folder
+  names puts site 9 in *both* groups. Precedence is resolved per position
+  here, as the pipeline resolves it, so each position lands in exactly one
+  group.
 
 Entry points, in decreasing order of how much you have to say:
 
@@ -36,10 +38,17 @@ Entry points, in decreasing order of how much you have to say:
     groups    = agg.group_positions(positions)
     raw       = agg.compile_positions(groups[("HeLa", "pEN2", "DMSO")])
 
-The older well-list API (`create_wellmap_dict` -> `import_whole_expt_data`) is
-still here and still takes the same arguments, so existing notebooks need only
-their import line changed. It now understands the platemap's `well_ids` syntax,
-which it previously did not.
+A compiled table still carries one plate-level defect: every position had its
+background estimated on its own, so the positions do not share a zero. See
+"Aligning the zero across positions" below - `baseline_offsets` measures the
+disagreement, `plot_baseline_offsets` shows it, and `apply_baseline_offsets`
+removes it. Three steps rather than one, so the correction can be looked at
+before it is believed.
+
+The well-list API that predated `platemap_positions` - `create_wellmap_dict`,
+`wellmap_from_platemap`, `compile_summaries`, `import_filter_data_for_wells`
+and `import_whole_expt_data` - has been removed. `load_experiment` replaces the
+whole chain and resolves per-position precedence, which that path could not.
 
 This module imports matplotlib and seaborn at module scope. `cellaap_utils`
 deliberately does not: it is imported by `cellaap_analysis` and therefore by
@@ -49,6 +58,7 @@ every analysis array task on the cluster, and none of them plot.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,11 +81,10 @@ __all__ = [
     "filter_summary",
     "load_experiment",
     "read_platemap",
-    "create_wellmap_dict",
-    "wellmap_from_platemap",
-    "compile_summaries",
-    "import_filter_data_for_wells",
-    "import_whole_expt_data",
+    "baseline_floor",
+    "baseline_offsets",
+    "apply_baseline_offsets",
+    "plot_baseline_offsets",
     "export_to_excel_by_col",
     "fit_model",
     "sigmoid_4par",
@@ -316,7 +325,7 @@ def compile_positions(positions: list[PositionRef], suffix: str = "",
         df["transfection"] = pos.transfection
         df["drug"] = pos.drug
         df["code"] = pos.code
-        # Kept as the old compile_summaries defined it - the folder the root
+        # As the well-list API defined it before this one - the folder the root
         # sits in, which identifies the experiment when several are pooled.
         df["storage_location"] = str(pos.root.parent)
         frames.append(df)
@@ -364,9 +373,12 @@ def load_experiment(source, expt_length: int, delta_t: int | float,
                     filter_rows: bool = True, verbose: bool = True) -> pd.DataFrame:
     """A whole plate, compiled and filtered, from its platemap alone.
 
-    The one call that replaces `create_wellmap_dict` -> `import_whole_expt_data`:
+    The one call that compiles a plate:
 
         df = load_experiment(root, expt_length=150, delta_t=10)
+
+    Its output still has each position on its own zero; see "Aligning the zero
+    across positions" for putting them on a common one.
 
     Parameters
     ----------
@@ -418,14 +430,6 @@ def load_experiment(source, expt_length: int, delta_t: int | float,
     return whole
 
 
-# ---------------------------------------------------------------------------
-# The older well-list API
-#
-# Kept working because notebooks use it. The behaviour differences are all
-# fixes: well ranges expand, blank-media and skipped rows are dropped, and an
-# empty result is an empty DataFrame rather than an exception.
-# ---------------------------------------------------------------------------
-
 def read_platemap(source, platemap: Path | str | None = None) -> pd.DataFrame:
     """The platemap as a DataFrame.
 
@@ -442,193 +446,541 @@ def read_platemap(source, platemap: Path | str | None = None) -> pd.DataFrame:
     return pipeline.read_platemap_df(path)
 
 
-def create_wellmap_dict(imported_wellmap: pd.DataFrame,
-                        wellid_col_name: str = "well_ids") -> dict:
-    """Map (celltype, transfection, drug) -> list of well ids.
+# ---------------------------------------------------------------------------
+# Aligning the zero across positions
+#
+# `signal_correction` measures each position's background from that position's
+# own cell-free pixels, which is the right thing to do and is why
+# `<ch>_corrected` beats the blank-well maps. It has one failure mode, and it
+# is systematic:
+# there have to BE cell-free pixels. As a field fills up, the estimator backs
+# its exclusion ring off the cells (`_dilation_ladder`) to keep enough blocks
+# measurable, and the closer it measures to a cell the more of that cell's
+# out-of-focus halo it counts as medium. The background comes out too high, the
+# corrected signal too low, and the error grows with confluence - so it differs
+# between positions in one well, between wells, and between days.
+#
+# The size of it, on the 20260826 CycB plate. Across the four A01 positions -
+# one well, one treatment, no GFP induced, so their dim cells are the same
+# cells - the RAW floor spans 0.9 counts and the per-position-corrected floor
+# spans 5.1, against a median signal of 23. The correction added
+# between-position spread rather than removing it. Across the ten positions of
+# the two uninduced wells the floor tracks the estimator's difficulty
+# precisely: r = -0.83 against the position's peak background, -0.80 against
+# its apparent background drift, and +0.79 against how wide an exclusion ring
+# the estimator could hold (`correction_tools.surface_diagnostics` reports all
+# three). One position, C01_s6 - the densest on the plate, ring backed off from
+# 121 px to 30 - over-subtracts hard enough to put its dimmest cells at -300.
+#
+# What is done about it here is deliberately not a better background estimate -
+# that would have to happen back at the images. It is the observation that a
+# cell with no fluorophore reads the same number everywhere, because that
+# number is a property of the microscope and not of the well. So the bottom of
+# each position's distribution is a landmark that SHOULD line up, and how far
+# it fails to line up is the residual background error, directly measured.
+# Subtracting that per-position constant is the correction.
+#
+# The estimate and the subtraction are separate calls on purpose. The offsets
+# come back as an ordinary DataFrame that can be read, plotted, edited or
+# thrown away before anything touches the data.
+#
+# It removes an OFFSET and nothing else. Three things it therefore cannot do:
+#
+#   * fix a within-position error. C01_s6 above is over-subtracted by a
+#     different amount in different parts of the field and at different times;
+#     one constant cannot straighten that, and `plot_baseline_offsets` will
+#     still show it with a long low tail after alignment. Such a position is
+#     to be dropped, not aligned.
+#   * survive a unit with no dim cells in it. The floor is only a landmark
+#     where some of the cells really are at zero. In a well where every cell
+#     expresses, the bottom of the distribution is a biological number, and
+#     aligning on it flattens a real difference into nothing. This is the one
+#     way to do actual damage with these functions, which is why nothing is
+#     applied until you have looked.
+#   * make two experiments comparable on its own. A different exposure or
+#     laser power rescales the signal as well as shifting it; aligning the zero
+#     is necessary for pooling repeats but is not by itself sufficient.
+# ---------------------------------------------------------------------------
 
-    Takes the platemap as a DataFrame - see `read_platemap` - and groups its
-    rows. Wells are expanded with `pipeline.expand_well_token`, so the full
-    `well_ids` syntax works: single wells, comma/space lists, ranges within one
-    plate row (`B01-B06`), and exact positions (`G03_s9`). Casing and zero
-    padding are normalized, so `g3` and `G3` both become `G03`.
+# Between the 2nd and 15th percentile: high enough to clear the over-corrected
+# tail a crowded position leaves at the very bottom, low enough to stay inside
+# the non-expressing population. Averaging that band rather than reading one
+# order statistic is what makes it steady at the ~100 tracks a position has -
+# bootstrap SE 1.2 counts against 1.5 for a bare 5th percentile on the
+# 20260826 plate, and a smaller within-well spread on every well of it.
+BASELINE_TRIM = (0.02, 0.15)
 
-    Rows are dropped when `skip` is set or `role` names a blank-media well,
-    if those columns are present: neither was ever analyzed, so including them
-    only produces groups with no data behind them.
+# Reasons a unit's offset should be looked at before it is used.
+FLAG_FEW_CELLS = "few cells"
+FLAG_OUTLIER = "outlier floor"
+FLAG_LOW_TAIL = "low tail"
 
-    Returns
-    -------
-    dict
-        Keyed by (celltype, transfection, drug), values are ordered unique
-        well ids.
 
-    Notes
-    -----
-    A well-level entry matches every site in that well, so if the platemap also
-    gives one site of that well its own row, the site appears in both groups.
-    `platemap_positions` resolves that precedence properly; prefer it, or
-    `wellmap_from_platemap`, which returns positions rather than wells.
+def _half_sample_mode(values: np.ndarray, min_n: int = 8) -> float:
+    """Densest point of a distribution, by recursive half-sample shrinking.
+
+    Bickel & Fruehwirth's estimator: repeatedly keep the half of the sorted
+    sample that spans the smallest range. Unlike a histogram mode it needs no
+    bin width, and unlike a quantile it ignores the shape of the tails
+    entirely - which is what makes it the estimator to use when a unit holds a
+    large non-expressing population and a long bright one.
     """
-    for column in ("celltype", "transfection", "drug"):
-        if column not in imported_wellmap.columns:
-            raise KeyError(f"Required column not found in imported_wellmap: {column}")
-    if wellid_col_name not in imported_wellmap.columns:
-        raise KeyError(f"{wellid_col_name} column not found in imported_wellmap")
-
-    df = imported_wellmap
-    if "skip" in df.columns:
-        df = df[~df["skip"].map(lambda v: pipeline.as_bool("" if pd.isna(v) else v))]
-    if "role" in df.columns:
-        blank = df["role"].map(
-            lambda v: pipeline.ROLES.get(str("" if pd.isna(v) else v).strip().lower())
-            in pipeline.MAP_ROLES)
-        df = df[~blank]
-
-    def parse_wells(value) -> list[str]:
-        if isinstance(value, (list, tuple)):
-            tokens = [str(v) for v in value]
-        elif pd.isna(value):
-            return []
-        else:
-            tokens = re.split(r"[,;\s]+", str(value))
-        wells: list[str] = []
-        for token in tokens:
-            wells.extend(pipeline.expand_well_token(token))
-        return wells
-
-    wellmap_dict: dict = {}
-    for key, group in df.groupby(["celltype", "transfection", "drug"]):
-        wells: list[str] = []
-        for value in group[wellid_col_name]:
-            wells.extend(parse_wells(value))
-        seen = set()
-        wellmap_dict[key] = [w for w in wells if not (w in seen or seen.add(w))]
-
-    return wellmap_dict
+    x = np.sort(values)
+    while len(x) > min_n:
+        n = len(x)
+        half = n // 2
+        i = int(np.argmin(x[half:] - x[:n - half]))
+        x = x[i:i + half + 1]
+    return float(np.median(x))
 
 
-def wellmap_from_platemap(source, pattern: str = "*phs.tif",
-                          platemap: Path | str | None = None,
-                          verbose: bool = True) -> dict:
-    """`create_wellmap_dict`'s result, but resolved to positions on disk.
-
-    Same keys, but each value is a list of position stubs (`G03_s8`) that
-    actually exist, rather than well ids. That makes the mapping unambiguous:
-    a position appears under exactly one condition even when the platemap
-    overrides a single site, and wells with no data do not appear at all.
-
-    Feed it to `import_whole_expt_data` in place of `create_wellmap_dict`.
-    """
-    groups = group_positions(platemap_positions(
-        source, pattern=pattern, platemap=platemap, verbose=verbose))
-    return {key: [p.stub for p in members] for key, members in groups.items()}
-
-
-def compile_summaries(cellapp_expt, wells: list, suffix: str = "") -> pd.DataFrame:
-    """Concatenate the summary spreadsheets for a list of wells or positions.
+def baseline_floor(values, estimator: str = "trimmed", q: float = 0.05,
+                   trim: tuple[float, float] = BASELINE_TRIM) -> float:
+    """Where the dim cells of one unit sit: the landmark that should line up.
 
     Parameters
     ----------
-    cellapp_expt : cellaap_analysis.analysis | Path | str
-        The analysis session whose `root_folder` holds the inference folders,
-        or the folder itself.
-    wells : list
-        Well ids (`G03`) or position stubs (`G03_s8`). A well id matches every
-        site in that well.
-    suffix : str
-        Summary variant, as for `compile_positions`.
+    values : array-like
+        One unit's per-cell signal. NaNs are dropped.
+    estimator : {"trimmed", "quantile", "mode"}
+        ``trimmed``
+            mean of the values between the two `trim` quantiles. The default,
+            for the reasons on `BASELINE_TRIM`.
+        ``quantile``
+            the `q`-th percentile. One order statistic, so noisier, but it is
+            the number people already read off a boxplot and it makes the
+            offsets easy to check by eye.
+        ``mode``
+            `_half_sample_mode`. Use it when most cells in a unit are
+            non-expressing, so the peak of the distribution IS the zero;
+            it ignores both tails, including an over-corrected one.
 
     Returns
     -------
-    pandas.DataFrame
-        With `well`, `position` and `storage_location` added, as before. Empty
-        if `wells` is empty or nothing matched - the previous version raised
-        `UnboundLocalError` and `ValueError` respectively in those two cases.
+    float, or NaN for an empty unit.
     """
-    root = _resolve_root(cellapp_expt)
-    if not wells:
-        return pd.DataFrame()
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return float("nan")
+    if estimator == "quantile":
+        return float(np.quantile(v, q))
+    if estimator == "trimmed":
+        lo, hi = np.quantile(v, trim)
+        band = v[(v >= lo) & (v <= hi)]
+        return float(band.mean()) if band.size else float(hi)
+    if estimator == "mode":
+        return _half_sample_mode(v)
+    raise ValueError(f"unknown estimator {estimator!r}; expected 'trimmed', "
+                     f"'quantile' or 'mode'")
 
-    # Rebuilt per call rather than cached on the session: folders appear as a
-    # plate finishes, and a cached list from the first call goes stale.
-    folders = [f for f in sorted(root.glob("*_inference")) if f.is_dir()]
-    storage_location = str(root.parent)
 
-    frames = []
-    for well in wells:
-        needle = f"_{well}_"
-        matched = [f for f in folders if needle in f.name]
-        if not matched:
-            print(f"No inference folder found for {well}")
+def baseline_offsets(df: pd.DataFrame, column: str, by="stem",
+                     estimator: str = "trimmed", q: float = 0.05,
+                     trim: tuple[float, float] = BASELINE_TRIM,
+                     reference="median", within=None,
+                     min_cells: int = 20, n_boot: int = 200,
+                     seed: int = 0, flag_z: float = 3.0,
+                     max_tail_drop: float = 1.0) -> pd.DataFrame:
+    """Measure how far each unit's zero sits from the common one. **Step 1.**
+
+    Nothing is changed here. The result is a table you look at - and, when a
+    unit turns out to have no dim cells to measure, edit - before
+    `apply_baseline_offsets` uses it.
+
+    Parameters
+    ----------
+    df : DataFrame
+        A compiled summary, from `load_experiment` or `compile_positions`.
+    column : str
+        The signal to align, e.g. `"GFP_corrected"`. One channel per call; the
+        tables from two calls concatenate, since each carries a `signal` column.
+    by : str or sequence of str
+        What a unit is. `"stem"` (the default) is one imaging position, which
+        is the level the background was estimated at and therefore the level
+        the error lives at. `"well"` pools the sites of a well; `["experiment",
+        "code"]` pools a whole condition of a whole plate. Coarser units give a
+        steadier floor and leave more residual error behind.
+    estimator, q, trim
+        Passed to `baseline_floor`.
+    reference : {"median", "min", "zero"}, a unit label, or a number
+        The zero everything is moved onto.
+
+        ``median``  the median floor over units that clear `min_cells`. The
+                    default: it corrects the disagreement between units without
+                    claiming to know the absolute zero, so the plate's overall
+                    level - and any comparison against an earlier analysis of
+                    it - is left where it was.
+        ``min``     the lowest floor. Assumes the least-corrected unit is the
+                    most trustworthy, which is true when the errors are all
+                    over-subtraction of background.
+        ``zero``    put every floor at 0. Only when a genuinely non-expressing
+                    population is present in every unit; then the corrected
+                    number really is fluorophore, and dose-response fits that
+                    need a positive zero-dose value (see `fit_model`) can use
+                    it directly.
+        a label     align on one named unit, e.g. an untreated control well.
+                    Matched against the unit label - the `by` columns joined
+                    with `_` when there is more than one.
+        a number    that value, whatever the data say.
+    within : str or sequence of str, optional
+        Compute a separate reference inside each of these groups instead of one
+        for the whole table. This is how you choose what the alignment is
+        allowed to touch, and it is the argument to think about:
+
+        ``None``        one zero for everything. The strongest correction, and
+                        the right one when every unit really should read the
+                        same at zero - repeats of a plate, or wells that differ
+                        only in a drug that does not touch the reporter.
+        ``"code"``      align positions within each condition and leave the
+                        conditions where they are. The conservative choice, and
+                        the one to reach for when a treatment induces the
+                        reporter, because it cannot flatten the induction. On
+                        the 20260826 plate it leaves the three condition
+                        medians within 0.2 counts and pulls the
+                        position-to-position spread of the uninduced wells from
+                        7.0 and 5.0 counts down to 4.3 and 4.2.
+        ``"experiment"`` align each plate to its own median and leave the
+                        plates' levels alone - for plates that are NOT expected
+                        to share a zero, e.g. a changed exposure.
+    min_cells : int
+        Below this a unit is flagged `"few cells"`, and it is left out of a
+        `"median"` or `"min"` reference. Its offset is still computed.
+    n_boot : int
+        Bootstrap resamples behind `floor_se`. 0 skips it and returns NaN.
+    seed : int
+        Bootstrap seed, so the same table gives the same standard errors.
+    flag_z : float
+        Flag a unit `"outlier floor"` when its floor is this many robust SDs
+        (MAD-scaled, over the units in its `within` group) from the reference.
+    max_tail_drop : float
+        Flag a unit `"low tail"` when `tail_drop` exceeds this. See that column.
+
+    Returns
+    -------
+    DataFrame, one row per unit, with
+
+    ============== ==========================================================
+    `by` columns   the unit's identity, plus any `within` columns
+    signal         `column`, so tables for several channels concatenate
+    n_cells        rows behind the floor
+    floor          `baseline_floor` of this unit
+    floor_se       bootstrap standard error of `floor`
+    reference_floor the zero this unit is being moved onto
+    offset         `floor - reference_floor`: the excess baseline this unit
+                   carries. `apply_baseline_offsets` subtracts it.
+    z              `(floor - reference_floor)` in robust SDs of the floors
+    tail_drop      how far the unit's 1st percentile falls below its own
+                   floor, in interquartile ranges. This is the column that
+                   catches a position no constant can fix: on the 20260826
+                   plate every healthy position sits under 0.6 and the one
+                   broken one at 3.4
+    flag           `""`, or the reasons this row deserves a look, comma-joined
+    ============== ==========================================================
+
+    The call's settings are on `.attrs`, which is what lets
+    `apply_baseline_offsets` and `plot_baseline_offsets` be called with just
+    the table.
+    """
+    by = [by] if isinstance(by, str) else list(by)
+    within = ([] if within is None else
+              [within] if isinstance(within, str) else list(within))
+    missing = [c for c in by + within + [column] if c not in df.columns]
+    if missing:
+        raise KeyError(f"{df.__class__.__name__} has no column(s) "
+                       f"{', '.join(missing)}")
+
+    rng = np.random.default_rng(seed)
+    keys = by + [c for c in within if c not in by]
+
+    rows = []
+    for key, group in df.groupby(keys, sort=False, observed=True):
+        key = key if isinstance(key, tuple) else (key,)
+        v = group[column].to_numpy(dtype=float)
+        v = v[np.isfinite(v)]
+        floor = baseline_floor(v, estimator, q, trim)
+        se = float("nan")
+        if n_boot and v.size >= 5:
+            draws = [baseline_floor(rng.choice(v, v.size, replace=True),
+                                    estimator, q, trim)
+                     for _ in range(n_boot)]
+            se = float(np.std(draws))
+        rows.append(dict(zip(keys, key)) |
+                    {"signal": column, "n_cells": int(v.size),
+                     "floor": floor, "floor_se": se, "_values": v})
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise ValueError(f"no rows to measure a floor from in {column!r}")
+    out["label"] = out[by].astype(str).agg("_".join, axis=1)
+
+    # The reference, once per `within` group.
+    group_keys = [c for c in within if c in out.columns]
+    grouped = ([("", out)] if not group_keys
+               else list(out.groupby(group_keys, sort=False, observed=True)))
+    pieces = []
+    for _, block in grouped:
+        block = block.copy()
+        block["reference_floor"] = _baseline_reference(block, reference,
+                                                       min_cells)
+        block["offset"] = block["floor"] - block["reference_floor"]
+        # MAD over the floors of this block, as the yardstick for "far".
+        spread = float(np.median(np.abs(block["floor"]
+                                        - np.median(block["floor"])))) * 1.4826
+        block["z"] = (block["offset"] / spread if spread > 0
+                      else np.where(block["offset"] == 0, 0.0, np.inf))
+        pieces.append(block)
+    out = pd.concat(pieces, ignore_index=True)
+
+    # How far the very bottom of a unit falls below its own floor, in units of
+    # that unit's interquartile range. The one thing a constant offset cannot
+    # repair is a unit over-subtracted by different amounts in different parts
+    # of the field, and that shows up here and nowhere else: the floor moves a
+    # little, the tail underneath it collapses. On the 20260826 plate the
+    # healthy positions sit at 0.25-0.60 and the one broken position at 3.4.
+    tail_drop = []
+    for floor, v in zip(out["floor"], out["_values"]):
+        if v.size < 5:
+            tail_drop.append(float("nan"))
             continue
-        for folder in matched:
-            hits = sorted(folder.glob(f"*_summary{suffix}.xlsx"))
-            if not hits:
-                print(f"No summary file found for {folder.name}")
-                continue
-            df = pd.read_excel(hits[0], sheet_name=SUMMARY_SHEET)
-            # Read the well and site back out of the folder name rather than
-            # from `well`, which may be either a well id or a position stub.
-            # Otherwise a stub lands in the `well` column and the site is
-            # repeated: G03_s9 / s9.
-            stub = pipeline.STUB_RE.search(folder.name)
-            df["well"] = pipeline.normalize_well(stub.group("well")) if stub else well
-            df["position"] = f"s{int(stub.group('site'))}" if stub else ""
-            df["storage_location"] = storage_location
-            frames.append(df)
-            print(f"{stub.group(0) if stub else folder.name} loaded")
+        bottom, q1, q3 = np.quantile(v, [0.01, 0.25, 0.75])
+        iqr = float(q3 - q1)
+        tail_drop.append((floor - bottom) / iqr if iqr > 0 else float("nan"))
+    out["tail_drop"] = tail_drop
+    out["flag"] = [
+        ", ".join(f for f in (
+            FLAG_FEW_CELLS if n < min_cells else "",
+            FLAG_OUTLIER if np.isfinite(z) and abs(z) > flag_z else "",
+            FLAG_LOW_TAIL if np.isfinite(t) and t > max_tail_drop else "",
+        ) if f)
+        for n, z, t in zip(out["n_cells"], out["z"], out["tail_drop"])]
 
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+    out = out.drop(columns="_values")
+    order = (by + [c for c in within if c not in by] +
+             ["label", "signal", "n_cells", "floor", "floor_se",
+              "reference_floor", "offset", "z", "tail_drop", "flag"])
+    out = out[[c for c in order if c in out.columns]]
+    out.attrs.update({"column": column, "by": by, "within": within,
+                      "estimator": estimator, "q": q, "trim": tuple(trim),
+                      "reference": reference, "min_cells": min_cells,
+                      "flag_z": flag_z, "max_tail_drop": max_tail_drop})
+    return out
 
 
-def import_filter_data_for_wells(analysis_object, expt_label: str, expt_length: int,
-                                 delta_t: int, well_list: list) -> pd.DataFrame:
-    """Import the summaries for a list of wells, filter them, and tag them.
+def _baseline_reference(block: pd.DataFrame, reference, min_cells: int) -> float:
+    """The zero for one `within` group. See `baseline_offsets`'s `reference`."""
+    if isinstance(reference, (int, float)) and not isinstance(reference, bool):
+        return float(reference)
+    usable = block[block["n_cells"] >= min_cells]
+    if usable.empty:
+        usable = block
+    if reference == "median":
+        return float(np.median(usable["floor"]))
+    if reference == "min":
+        return float(np.min(usable["floor"]))
+    if reference == "zero":
+        return 0.0
+    hit = block[block["label"] == str(reference)]
+    if hit.empty:
+        raise ValueError(
+            f"reference {reference!r} is neither 'median', 'min', 'zero', a "
+            f"number, nor one of the units {sorted(block['label'])}")
+    return float(hit["floor"].iloc[0])
 
-    `compile_summaries` followed by `filter_summary`, with a `code` column set
-    to `expt_label`. See `filter_summary` for what the filters do.
+
+def apply_baseline_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
+                           column: str | None = None, by=None,
+                           suffix: str = "_aligned",
+                           columns=None,
+                           skip_flagged: bool = False) -> pd.DataFrame:
+    """Subtract the measured offsets. **Step 3** (step 2 is looking at them).
+
+    Adds `<column><suffix>`; the original column is never touched, so the two
+    can be plotted against each other and the alignment undone by dropping a
+    column.
+
+    Parameters
+    ----------
+    df, offsets
+        The compiled summary, and `baseline_offsets`' table for it. `column`
+        and `by` default to what that call used.
+    columns : sequence of str, optional
+        Extra columns to shift by the same offsets. The obvious use is a
+        per-cell standard deviation or a second summary of the same channel;
+        a column of a DIFFERENT channel has its own baseline error and needs
+        its own `baseline_offsets` call.
+    skip_flagged : bool
+        Treat a flagged unit's offset as 0 rather than applying it. The unit
+        stays in the table, uncorrected. Off by default: a flag is an
+        instruction to look, and if the look says the offset is wrong the row
+        should be edited or dropped rather than silently neutralized.
+
+    Returns
+    -------
+    A copy of `df`. A row whose unit has no offset gets NaN in the new column
+    and is reported - leaving it at its unaligned value would put two different
+    zeros in one column, which is the thing this exists to prevent.
     """
-    well_data = compile_summaries(analysis_object, well_list)
-    if well_data.empty:
-        return well_data
-    well_data = filter_summary(well_data, expt_length, delta_t)
-    well_data["code"] = expt_label
-    return well_data
+    column = column or offsets.attrs.get("column")
+    by = by or offsets.attrs.get("by")
+    if column is None or by is None:
+        raise ValueError("pass `column` and `by`; this offsets table carries "
+                         "no .attrs (a round trip through a spreadsheet drops "
+                         "them)")
+    by = [by] if isinstance(by, str) else list(by)
+    targets = [column] + [c for c in (columns or []) if c != column]
+
+    table = offsets[by + ["offset"]].copy()
+    if skip_flagged and "flag" in offsets.columns:
+        table.loc[offsets["flag"].astype(bool).to_numpy(), "offset"] = 0.0
+    if table.duplicated(by).any():
+        raise ValueError(f"the offsets table has more than one row per "
+                         f"{by}; is it two channels concatenated? Filter it "
+                         f"to one `signal` first")
+
+    out = df.merge(table, on=by, how="left", validate="many_to_one")
+    unmatched = out["offset"].isna()
+    if unmatched.any():
+        labels = sorted(out.loc[unmatched, by].astype(str)
+                        .agg("_".join, axis=1).unique())
+        warnings.warn(
+            f"{int(unmatched.sum())} row(s) in {len(labels)} unit(s) have no "
+            f"offset and are NaN in {column}{suffix}: "
+            f"{', '.join(labels[:5])}{' ...' if len(labels) > 5 else ''}")
+    for target in targets:
+        if target not in out.columns:
+            warnings.warn(f"{target!r} is not a column of this table; skipped")
+            continue
+        out[f"{target}{suffix}"] = out[target] - out["offset"]
+    return out.drop(columns="offset")
 
 
-def import_whole_expt_data(wellmap_dict: dict, analysis_object, expt_length: int,
-                           delta_t: int) -> pd.DataFrame:
-    """Import and concatenate every well group in a wellmap.
+def _strip_common_prefix(labels: list[str]) -> dict[str, str]:
+    """Shorten `20260826_Hela CycB Oe BubR1 kd_A01_s2` to `A01_s2` for an axis.
 
-    Iterates the mapping from `create_wellmap_dict` (or, better,
-    `wellmap_from_platemap`), calling `import_filter_data_for_wells` per group
-    and tagging each with a `code` built from the key.
-
-    Groups with no wells are skipped and a group that raises is reported and
-    stepped over, so one bad condition does not lose the rest of the plate.
+    Position stems on one plate share everything but the last two fields, and
+    the shared part is what makes the tick labels unreadable. Only whole
+    underscore-separated fields are dropped, and only when every label keeps
+    at least one; otherwise the labels come back untouched.
     """
-    frames = []
-    for key, wells in (wellmap_dict or {}).items():
-        try:
-            if not wells:
-                print(f"Skipping {key} - no wells")
-                continue
-            expt_name = "_".join(str(k) for k in key)
-            temp_df = import_filter_data_for_wells(
-                analysis_object, expt_name, expt_length, delta_t, wells)
-            if temp_df.empty:
-                print(f"{key} -> no data")
-                continue
-            frames.append(temp_df)
-            print(f"Loaded {key} -> {len(temp_df)} rows")
-        except Exception as exc:
-            print(f"Failed to load {key}: {type(exc).__name__} {exc}")
+    parts = [label.split("_") for label in labels]
+    if len(labels) < 2:
+        return {label: label for label in labels}
+    n = 0
+    while n < min(len(p) for p in parts) - 1 and len({p[n] for p in parts}) == 1:
+        n += 1
+    return {label: "_".join(p[n:]) for label, p in zip(labels, parts)}
 
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+
+def plot_baseline_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
+                          column: str | None = None, by=None,
+                          suffix: str = "_aligned", hue: str | None = None,
+                          order: str = "floor", palette: str = "colorblind",
+                          show_points: bool = True, ylim_quantile: float = 0.95,
+                          figsize=None):
+    """Before, after, and the floors themselves. **Step 2.**
+
+    Three panels down one shared unit axis:
+
+    1. the signal as it stands, one box per unit, with each unit's measured
+       floor as a marker and the reference as a dashed line. Units whose boxes
+       are at different heights may just be different; units whose FLOORS are
+       at different heights are misaligned, and this panel separates the two.
+    2. the same after `apply_baseline_offsets`. The floors should now sit on
+       the line. A unit that still spills below it is one no constant fixes.
+    3. floor +/- bootstrap SE against the reference, flagged units in red.
+       The size of the correction, against the noise in measuring it.
+
+    `order="floor"` sorts units by floor, which puts the misaligned ones at
+    the ends; `order="label"` keeps them in name order for reading off a plate.
+
+    The top two panels are cut off at `ylim_quantile` of the pooled signal,
+    always keeping every floor in view. Left at full range a handful of bright
+    cells set the scale and the few counts this figure is about are invisible;
+    the bright cells are not what is being judged here.
+    """
+    column = column or offsets.attrs.get("column")
+    by = by or offsets.attrs.get("by")
+    by = [by] if isinstance(by, str) else list(by)
+    aligned = f"{column}{suffix}"
+
+    data = df if aligned in df.columns else apply_baseline_offsets(
+        df, offsets, column=column, by=by, suffix=suffix)
+    data = data.copy()
+    data["label"] = data[by].astype(str).agg("_".join, axis=1)
+    table = offsets.copy()
+    if "label" not in table.columns:
+        table["label"] = table[by].astype(str).agg("_".join, axis=1)
+
+    labels = (table.sort_values("floor")["label"].tolist() if order == "floor"
+              else sorted(table["label"]))
+    floor = table.set_index("label")["floor"]
+    ref = table.set_index("label")["reference_floor"]
+    err = table.set_index("label")["floor_se"]
+    flagged = table.set_index("label")["flag"].astype(bool)
+
+    # One y-window for both signal panels, so the shift between them is a
+    # shift and not a rescale.
+    pooled = pd.concat([data[column], data[aligned]]).to_numpy(dtype=float)
+    pooled = pooled[np.isfinite(pooled)]
+    top = float(np.quantile(pooled, ylim_quantile))
+    bottom = float(min(floor.min(), ref.min()))
+    pad = 0.08 * max(top - bottom, 1.0)
+    window = (bottom - 2 * pad, top + pad)
+
+    short = _strip_common_prefix(labels)
+    fig, axes = plt.subplots(3, 1, sharex=True,
+                             figsize=figsize or (0.55 * len(labels) + 5, 11),
+                             gridspec_kw={"height_ratios": [3, 3, 2]})
+    for ax, value, title, marker in (
+            (axes[0], column, "as corrected per position", "measured floor"),
+            (axes[1], aligned, "after aligning the zero", "aligned floor")):
+        sns.boxplot(data=data, x="label", y=value, order=labels, ax=ax,
+                    hue=hue, palette=palette if hue else None,
+                    color=None if hue else "0.85", dodge=False,
+                    showfliers=False, width=0.7, linewidth=1)
+        if show_points:
+            sns.stripplot(data=data, x="label", y=value, order=labels, ax=ax,
+                          color="0.25", size=2, alpha=0.35, jitter=0.28)
+        # The floors, drawn where they are measured: on the raw column for the
+        # top panel, on the reference for the bottom one - after alignment
+        # every unit's floor IS the reference, which is the claim being made.
+        marks = ([floor[k] for k in labels] if value == column
+                 else [ref[k] for k in labels])
+        ax.plot(range(len(labels)), marks, "o", color="crimson", ms=6,
+                mfc="white", mew=1.6, label=marker, zorder=5)
+        for k, label in enumerate(labels):
+            ax.hlines(ref[label], k - 0.45, k + 0.45, color="crimson", lw=1.2,
+                      ls="--", zorder=4,
+                      label="reference zero" if k == 0 else None)
+        ax.set_title(f"{value} - {title}", fontsize=11)
+        ax.set_ylabel("signal (a.u.)")
+        ax.set_xlabel("")
+        ax.set_ylim(*window)
+        ax.legend(frameon=False, fontsize=8, loc="upper left", ncol=3)
+
+    ax = axes[2]
+    colors = ["crimson" if flagged[k] else "tab:blue" for k in labels]
+    ax.errorbar(range(len(labels)), [floor[k] for k in labels],
+                yerr=[err[k] if np.isfinite(err[k]) else 0 for k in labels],
+                fmt="none", ecolor="0.4", capsize=3, zorder=1)
+    ax.scatter(range(len(labels)), [floor[k] for k in labels], c=colors,
+               s=45, zorder=2)
+    ax.plot(range(len(labels)), [ref[k] for k in labels], color="crimson",
+            lw=1.2, ls="--", label="reference zero")
+    for k, label in enumerate(labels):
+        if flagged[label]:
+            ax.annotate(table.set_index("label")["flag"][label],
+                        (k, floor[label]), textcoords="offset points",
+                        xytext=(0, 9), ha="center", fontsize=7,
+                        color="crimson")
+    ax.set_ylabel("floor (a.u.)")
+    ax.set_xlabel("unit (" + ", ".join(by) + ")")
+    ax.legend(frameon=False, fontsize=8, loc="upper left")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels([short[k] for k in labels], rotation=90)
+    fig.tight_layout()
+    return fig
 
 
 # ---------------------------------------------------------------------------
@@ -642,8 +994,13 @@ def fit_model(xy_data: pd.DataFrame, plot: bool = True, quant_fraction=None,
     Bin range is determined by quantiles. Default is 0.025 and 0.85. The data
     typically contain outliers on the high side, but not the low side. Hence the
     default values are aysmmetric. For the model to be applicable, the fluorescence
-    signal must be background subtracted. A simple method is to subtract the smallest
-    signal value from all values.
+    signal must be background subtracted. Subtracting the smallest value in the
+    column is the crude version and it takes its zero from one cell, which on a
+    plate with a crowded position is the most over-corrected cell there is.
+    `baseline_offsets(df, column, reference="zero")` then
+    `apply_baseline_offsets` does the same job per position, from the dim
+    population rather than from one point - see "Aligning the zero across
+    positions".
 
     Inputs:
     xy_data        - dataframe w/ dose as the first column and response as

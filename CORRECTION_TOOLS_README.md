@@ -62,6 +62,37 @@ really want the whole movie at full size.
 
 The file is opened by Fiji directly — it is an ordinary float32 TIFF stack.
 
+### The whole plate at once
+
+`surface_diagnostics` reads only the TIFF headers, so it costs a fraction of a
+second for a plate and no image data is touched:
+
+```python
+from correction_tools import surface_diagnostics
+
+d = surface_diagnostics(root, channel='GFP')
+d[['well', 'position', 'usable_blocks', 'dilation_min', 'drift_percent']]
+```
+
+`usable_blocks` is the fraction of the grid that had enough cell-free pixels to
+measure; `dilation_min`/`dilation_max` are how far from the cells the estimator
+managed to stay over the sampled frames; `drift_percent` is how much the mean
+background moved over the movie. They are the three symptoms of a crowded
+field, and they move together: as the field fills, the exclusion ring backs
+off, more out-of-focus halo is counted as medium, the background rises through
+the movie — and the corrected signal comes out too low.
+
+This is the companion to `cellaap_aggregate.baseline_offsets`, which measures
+*that* a position's zero is off; this says *why*. On the 20260826 CycB plate,
+over the ten positions of the two wells with no GFP induced, the floor tracks
+all three: r = −0.83 against peak background, −0.80 against drift, +0.79
+against the narrowest dilation held.
+
+Read it only across positions expected to hold the same fluorophore. A well
+that is genuinely brighter has a genuinely higher floor, and this table cannot
+tell you which you are looking at — it tells you whether the estimator was in
+trouble.
+
 ---
 
 ## 2. Apply a correction to numbers already measured
@@ -195,6 +226,7 @@ convention is `_bkg.tif`.
 | | |
 | --- | --- |
 | `read_background_stack(path, shape=None)` | read a saved surface, optionally frame-sized → `(stack, meta)` |
+| `surface_diagnostics(root, channel=None)` | every position's estimator diagnostics, from the headers alone |
 | `upsample_stack(stack, shape)` | bilinear expand, frame by frame |
 | `save_background_stack(corr, path)` | write one, with metadata; refuses unsafe names |
 | `Surface.from_files(tif, npz)` | rebuild a corrector from what the pipeline saved |
