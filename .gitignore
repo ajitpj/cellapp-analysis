@@ -168,3 +168,9 @@ cython_debug/
 
 # Generated analysis figures, caches and compiled spreadsheets
 analysis_outputs/
+
+# Per-experiment analysis notebooks. They belong with the data, not with the
+# code: they carry one plate's outputs, they are megabytes of embedded PNG,
+# and nothing in the repo imports them. The dose_response/ explorer is kept
+# out the same way, through .git/info/exclude.
+/20250213_HT1080_pPS18_aggregate.ipynb
