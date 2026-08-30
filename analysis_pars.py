@@ -122,7 +122,31 @@ class analysis_pars:
         # trackpy parameters
         self.max_pixel_movement = 20
         self.tracking_memory    = 1
-        self.min_track_length   = 10 # min track length
+
+        # Shortest track trackpy keeps (filter_stubs, in track_centroids).
+        # This is a fragment filter, not a data filter. Since summarize_data
+        # gained the episode-length, entry-observed and observation-window
+        # rules it removes nothing from the summary: dropping it to 1 on two
+        # positions of the 20260826 plate left the summary identical at 102
+        # and 314 rows. What it does remove is the fragments every stage
+        # between tracking and the summary would otherwise carry - the tracked
+        # table goes 1043 -> 3200 and 2939 -> 7008 without it, which is +18-28%
+        # mitotic tracks for measure_signal to scan the table for, and the same
+        # again through the dead classifier, both workbooks and the particle
+        # browser. It is also the unconditional floor for when
+        # _filter_spurious_tracks switches itself off - too few reference
+        # tracks to calibrate against, or exclude_short_window_tracks cleared.
+        #
+        # In FRAMES, and deliberately not scaled by the frame interval, like
+        # semantic_gap_closing: a tracking fragment is a fragment whether
+        # frames are 4 or 10 minutes apart. It sits below what the window test
+        # already demands on the datasets checked - the shortest summarized
+        # track is 11 frames at 4 min/frame and 15 at 10 - but it becomes the
+        # binding constraint wherever min_window falls under it, which needs a
+        # short mitosis AND a long interval (an unperturbed control at 10
+        # min/frame). Compare it against the shortest track_length in the
+        # summary before trusting it on such a dataset.
+        self.min_track_length   = 10 # frames
 
         self.track_mode = "vanilla"
 
