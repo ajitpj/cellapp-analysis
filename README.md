@@ -526,6 +526,15 @@ position that no single constant can repair. `plot_baseline_offsets` draws the
 signal before and after with the floors marked, plus the floors themselves with
 their error bars.
 
+`low tail` needs two things to fire: `tail_drop` over its threshold, and
+`tail_z` putting the unit outside the other units of the same channel.
+`tail_drop` is a ratio to each unit's own interquartile range, so a channel
+whose bulk is tight reads high on every unit with nothing wrong — on the
+20260826 plate the threshold alone flagged 10 of 15 Cy5 positions against
+exactly one GFP position. Requiring both leaves the broken GFP position (17
+robust SDs out) flagged and the worst Cy5 one (1.7) alone. With two or three
+units there is nothing to be an outlier against, so nothing is flagged.
+
 | argument | |
 | --- | --- |
 | `by` | what a unit is. `"stem"` (default) is one imaging position, the level the background was estimated at; `"well"` pools a well's sites; `["experiment", "code"]` pools a condition per plate |

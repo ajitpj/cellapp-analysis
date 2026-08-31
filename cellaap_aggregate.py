@@ -654,7 +654,11 @@ def baseline_offsets(df: pd.DataFrame, column: str, by="stem",
         Flag a unit `"outlier floor"` when its floor is this many robust SDs
         (MAD-scaled, over the units in its `within` group) from the reference.
     max_tail_drop : float
-        Flag a unit `"low tail"` when `tail_drop` exceeds this. See that column.
+        Flag a unit `"low tail"` when `tail_drop` exceeds this **and**
+        `tail_z` puts it more than `flag_z` robust SDs above the other units.
+        Both are needed: the ratio alone reads high on every unit of a channel
+        whose bulk is tight, however healthy they are. With only two or three
+        units there is nothing to be an outlier against, so nothing is flagged.
 
     Returns
     -------
@@ -673,8 +677,11 @@ def baseline_offsets(df: pd.DataFrame, column: str, by="stem",
     tail_drop      how far the unit's 1st percentile falls below its own
                    floor, in interquartile ranges. This is the column that
                    catches a position no constant can fix: on the 20260826
-                   plate every healthy position sits under 0.6 and the one
+                   plate every healthy GFP position sits under 0.6 and the one
                    broken one at 3.4
+    tail_z         `tail_drop` in robust SDs of the other units' `tail_drop`.
+                   What makes the flag work across channels - see
+                   `max_tail_drop`
     flag           `""`, or the reasons this row deserves a look, comma-joined
     ============== ==========================================================
 
@@ -747,18 +754,39 @@ def baseline_offsets(df: pd.DataFrame, column: str, by="stem",
         iqr = float(q3 - q1)
         tail_drop.append((floor - bottom) / iqr if iqr > 0 else float("nan"))
     out["tail_drop"] = tail_drop
+
+    # `tail_drop` is a ratio to the unit's own interquartile range, so a
+    # channel whose bulk is tight reads high on every unit with nothing wrong:
+    # a near-saturated stain has a narrow IQR and a few dim cells under it, and
+    # on the 20260826 plate that put 10 of 15 Cy5 positions over an absolute
+    # threshold that caught exactly one GFP position. What marks a position no
+    # offset can repair is a tail unlike the OTHER units of the same channel,
+    # so the flag needs both: over `max_tail_drop`, and an outlier among its
+    # peers. The broken GFP position sits 17 robust SDs out; the worst Cy5 one
+    # sits at 1.7 and is left alone. `tail_z` is that second number, reported
+    # so a large `tail_drop` with no flag explains itself.
+    finite = np.asarray([t for t in tail_drop if np.isfinite(t)], dtype=float)
+    tail_mid = float(np.median(finite)) if finite.size else np.nan
+    tail_mad = (float(np.median(np.abs(finite - tail_mid))) * 1.4826
+                if finite.size else 0.0)
+    out["tail_z"] = [((t - tail_mid) / tail_mad if tail_mad > 0 else 0.0)
+                     if np.isfinite(t) else np.nan for t in tail_drop]
+
     out["flag"] = [
         ", ".join(f for f in (
             FLAG_FEW_CELLS if n < min_cells else "",
             FLAG_OUTLIER if np.isfinite(z) and abs(z) > flag_z else "",
-            FLAG_LOW_TAIL if np.isfinite(t) and t > max_tail_drop else "",
+            FLAG_LOW_TAIL if (np.isfinite(t) and t > max_tail_drop
+                              and np.isfinite(tz) and tz > flag_z) else "",
         ) if f)
-        for n, z, t in zip(out["n_cells"], out["z"], out["tail_drop"])]
+        for n, z, t, tz in zip(out["n_cells"], out["z"], out["tail_drop"],
+                               out["tail_z"])]
 
     out = out.drop(columns="_values")
     order = (by + [c for c in within if c not in by] +
              ["label", "signal", "n_cells", "floor", "floor_se",
-              "reference_floor", "offset", "z", "tail_drop", "flag"])
+              "reference_floor", "offset", "z", "tail_drop", "tail_z",
+              "flag"])
     out = out[[c for c in order if c in out.columns]]
     out.attrs.update({"column": column, "by": by, "within": within,
                       "estimator": estimator, "q": q, "trim": tuple(trim),
