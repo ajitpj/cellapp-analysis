@@ -570,6 +570,48 @@ off — how many blocks the estimator could measure, how wide an exclusion ring
 it held, how much its background appeared to drift. Over the ten uninduced
 positions of that plate the floor tracks all three (r = −0.83, −0.80, +0.79).
 
+#### Back into the summary files: `align_wells`
+
+The three calls above work on a table in memory. The one case that comes up on
+every plate always answers their three questions the same way — the unit is an
+imaging position, the scope is the well it sits in, and the answer belongs in
+the position's own `*_summary.xlsx` — so it is one call:
+
+```python
+df, offsets = agg.align_wells(root)            # writes the files
+df, offsets = agg.align_wells(root, write=False)   # measures only
+```
+
+It compiles the plate, picks the best signal column of each channel present
+(`<ch>_corrected` where `signal_correction` ran), moves the positions of each
+well onto that well's median floor, and adds `<signal>_well_aligned` to every
+summary workbook beside the signal it corrects. Every other sheet is left
+untouched, and each file gains a `well_alignment` sheet naming what was
+subtracted from it and under what settings, so a summary says on its own what
+its aligned columns mean.
+
+The well is the scope on purpose. The sites of one well are the same cells in
+the same medium under the same treatment, imaged minutes apart — if their dim
+cells disagree, that is the background estimator having a harder time in one
+field, and nothing else. Across wells it may be a real induction, so the wells
+are never moved relative to one another. On the 20590 Dox series that shows
+directly: within-well floor spread goes to zero in every well and the
+position-to-position median spread of F02 falls from 53 to 29 counts, while
+each well's own median moves by under 1% and the dose series across the plate
+is untouched.
+
+| | |
+| --- | --- |
+| `columns` | which signals to align. Defaults to one column per channel — aligning `GFP` and `GFP_corrected` separately would put two differently-zeroed numbers in one file under names that look like variants |
+| `drop_flags` | e.g. `("low tail",)`. A position flagged this way is excluded from its well's reference, the rest are re-measured without it, and it comes back with no offset and `NaN` in the aligned column — never silently corrected, never silently deleted |
+| `write` | `False` computes and returns everything without touching disk, which is how to look at the offsets first |
+| `file_suffix` | which summary variant to read and write: `""`, or e.g. `"_dead"` |
+
+Re-running overwrites the columns and that sheet rather than stacking on them:
+the original signal columns are never touched, so the second run measures the
+same floors as the first. `_well_aligned` rather than `apply_baseline_offsets`'
+`_aligned`, because a table can carry both and they mean different scopes.
+
 ## Curating particles: `particle_browser.py`
 
 A napari browser over the particles a `*_summary.xlsx` lists, for reviewing the

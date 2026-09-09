@@ -45,6 +45,10 @@ disagreement, `plot_baseline_offsets` shows it, and `apply_baseline_offsets`
 removes it. Three steps rather than one, so the correction can be looked at
 before it is believed.
 
+    # or, for the case that comes up on every plate, one step that also
+    # writes `<signal>_well_aligned` back into each *_summary.xlsx
+    df, offsets = agg.align_wells(root)
+
 The well-list API that predated `platemap_positions` - `create_wellmap_dict`,
 `wellmap_from_platemap`, `compile_summaries`, `import_filter_data_for_wells`
 and `import_whole_expt_data` - has been removed. `load_experiment` replaces the
@@ -85,6 +89,10 @@ __all__ = [
     "baseline_offsets",
     "apply_baseline_offsets",
     "plot_baseline_offsets",
+    "channel_columns",
+    "well_offsets",
+    "apply_well_offsets",
+    "align_wells",
     "export_to_excel_by_col",
     "fit_model",
     "sigmoid_4par",
@@ -1009,6 +1017,395 @@ def plot_baseline_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
     ax.set_xticklabels([short[k] for k in labels], rotation=90)
     fig.tight_layout()
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Aligning the positions of one well, and writing it back to the summaries
+#
+# `baseline_offsets` measures and `apply_baseline_offsets` subtracts, both on a
+# table that is already in memory. What the section above does not do is decide
+# what a unit is, what it is aligned against, or where the answer goes, and for
+# the one case that comes up on every plate those three answers are always the
+# same: the unit is an imaging position, the scope is the well it sits in, and
+# the answer belongs in the position's own `*_summary.xlsx` next to the signal
+# it corrects.
+#
+# Why the well and not the plate. The sites of one well are the same cells in
+# the same medium under the same treatment, imaged minutes apart - if their dim
+# cells do not read the same number, the difference is the background estimator
+# having a harder time in one field than another, and nothing else. That is not
+# true across wells, where a treatment may genuinely induce the reporter, so
+# aligning across wells can flatten a real effect. Restricting the reference to
+# the well is what makes this safe enough to apply without looking first; it is
+# also why it corrects less than `dr_tools.align_channels` with `within=None`.
+#
+# Each well is moved onto its own median floor, so the well's overall level -
+# and any earlier analysis of it - is left exactly where it was. A well with
+# one position is therefore a no-op, correctly: there is nothing to disagree
+# with.
+#
+# The three limits on the section above apply here unchanged. In particular a
+# position over-subtracted by different amounts across its own field is not
+# repairable by any constant; `drop_flags=("low tail",)` is how such a position
+# is kept from setting the well's reference and left uncorrected rather than
+# corrected wrongly.
+# ---------------------------------------------------------------------------
+
+# Written into the summary workbook beside the column it corrects.
+WELL_ALIGN_SUFFIX = "_well_aligned"
+
+# The sheet each summary gets recording what was subtracted from it.
+WELL_ALIGN_SHEET = "well_alignment"
+
+# The channels `cellaap_analysis.summarize_data` knows how to measure.
+CHANNELS = ("GFP", "Texas Red", "Cy5")
+
+# Per-channel signal columns, best first. `<ch>_corrected` is
+# signal_correction's number; `<ch>` is raw. `_std` columns describe scatter
+# within a track and are not shifted by a baseline offset, so they never appear
+# here.
+SIGNAL_SUFFIXES = ("_corrected", "_bkg_corr", "")
+
+
+def channel_columns(df: pd.DataFrame, prefer: tuple[str, ...] = SIGNAL_SUFFIXES,
+                    ) -> list[str]:
+    """The best available signal column for each channel this table carries.
+
+    One column per channel, not all of them: aligning `GFP` and `GFP_corrected`
+    separately would put two differently-zeroed numbers in one file under names
+    that look like variants of each other. A column that is constant - all
+    zeros for `_bkg_corr` when no legacy correction map was found - carries no
+    signal and is skipped.
+    """
+    picked = []
+    for channel in CHANNELS:
+        for suffix in prefer:
+            column = f"{channel}{suffix}"
+            if column in df.columns and df[column].nunique(dropna=True) > 1:
+                picked.append(column)
+                break
+    return picked
+
+
+def well_offsets(df: pd.DataFrame, columns=None, estimator: str = "trimmed",
+                 reference="median", drop_flags=(), verbose: bool = True,
+                 **offset_kwargs) -> pd.DataFrame:
+    """Measure every channel's per-position offset, well by well. **Step 1.**
+
+    `baseline_offsets` with `by=["well", "position"]` and `within=["well"]`,
+    run once per signal column and concatenated - the same shape of call
+    `dr_tools.align_channels` makes, fixed to the well rather than the
+    condition. Nothing is changed and nothing is written.
+
+    Parameters
+    ----------
+    df : DataFrame
+        A compiled plate, from `compile_positions` or `load_experiment`. It
+        needs `well` and `position`, which `compile_positions` adds.
+    columns : sequence of str, optional
+        Signal columns to align. Defaults to `channel_columns(df)` - the best
+        column of each channel present.
+    estimator, reference, **offset_kwargs
+        Passed to `baseline_offsets`. `reference` defaults to `"median"`, the
+        median floor of the well's own positions.
+    drop_flags : sequence of str
+        Flags whose positions must not set their well's reference -
+        `("low tail",)` for a position over-subtracted by different amounts
+        across its own field, which no single offset repairs. Such a position
+        is measured, excluded, the remaining ones are re-measured against each
+        other, and it comes back with `applied` False and no offset. It is
+        never silently corrected and never silently deleted.
+    verbose : bool
+        Report each column's position count and offset range.
+
+    Returns
+    -------
+    DataFrame
+        `baseline_offsets`' columns for every signal, plus
+
+        ========= ===========================================================
+        signal    the column the row's offset belongs to
+        applied   False for a row `drop_flags` excluded; `align_wells` writes
+                  NaN for those positions rather than an uncorrected number
+        ========= ===========================================================
+
+        `.attrs` carries the settings, so `apply_baseline_offsets` can be
+        called with the table alone.
+    """
+    missing = [c for c in ("well", "position") if c not in df.columns]
+    if missing:
+        raise KeyError(f"this table has no {', '.join(missing)} column; "
+                       f"compile it with `compile_positions` or "
+                       f"`load_experiment`, which add them")
+    columns = list(columns) if columns is not None else channel_columns(df)
+    if not columns:
+        raise ValueError(
+            f"no usable signal column in this table; looked for "
+            f"{', '.join(f'<ch>{s}' for s in SIGNAL_SUFFIXES)} for "
+            f"{', '.join(CHANNELS)}")
+
+    by = ["well", "position"]
+
+    def measure(frame: pd.DataFrame) -> pd.DataFrame:
+        return pd.concat(
+            [baseline_offsets(frame, column, by=by, within=["well"],
+                              estimator=estimator, reference=reference,
+                              **offset_kwargs)
+             for column in columns], ignore_index=True)
+
+    offsets = measure(df)
+    offsets["applied"] = True
+
+    if drop_flags:
+        hit = offsets["flag"].apply(
+            lambda flag: any(name in str(flag) for name in drop_flags))
+        labels = sorted(set(offsets.loc[hit, "label"]))
+        if labels:
+            keep = ~df[by].astype(str).agg("_".join, axis=1).isin(labels)
+            if verbose:
+                print(f"excluded {len(labels)} position(s) flagged "
+                      f"{' / '.join(sorted(drop_flags))} from their well's "
+                      f"reference; they stay uncorrected: {', '.join(labels)}")
+            # The reference is re-measured without them, so a position no
+            # offset can fix cannot drag the ones that are fine.
+            remeasured = measure(df[keep])
+            remeasured["applied"] = True
+            excluded = offsets[hit].copy()
+            excluded["applied"] = False
+            excluded[["reference_floor", "offset", "z"]] = np.nan
+            offsets = pd.concat([remeasured, excluded], ignore_index=True)
+
+    single = [well for well, block in offsets.groupby("well", observed=True)
+              if block["position"].nunique() == 1]
+    if verbose:
+        for column in columns:
+            block = offsets[(offsets["signal"] == column) & offsets["applied"]]
+            if block.empty:
+                print(f"  ! {column}: nothing measurable")
+                continue
+            flagged = sorted(set(block.loc[block["flag"].astype(bool), "label"]))
+            note = f"; still flagged: {', '.join(flagged)}" if flagged else ""
+            print(f"{column}: {len(block)} position(s) in "
+                  f"{block['well'].nunique()} well(s), offsets "
+                  f"{block['offset'].min():+.2f} to "
+                  f"{block['offset'].max():+.2f} counts{note}")
+        if single:
+            print(f"  note: {', '.join(single)} have one position each, so "
+                  f"their offset is 0 by construction - there is nothing for "
+                  f"them to disagree with")
+
+    offsets.attrs.update({"by": by, "within": ["well"], "columns": columns,
+                          "estimator": estimator, "reference": reference})
+    return offsets
+
+
+def apply_well_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
+                       columns=None, suffix: str = WELL_ALIGN_SUFFIX,
+                       ) -> pd.DataFrame:
+    """Subtract `well_offsets`' table, one new column per signal. **Step 2.**
+
+    `apply_baseline_offsets` per signal. Adds `<column><suffix>` and leaves
+    every original column alone, which is what makes a re-run safe: the offsets
+    are always measured from the original, never from an already-aligned one.
+
+    A position `drop_flags` excluded gets NaN rather than its uncorrected
+    number - two different zeros in one column is the error this exists to
+    prevent.
+    """
+    columns = list(columns) if columns is not None else list(
+        offsets.attrs.get("columns") or offsets["signal"].unique())
+    by = list(offsets.attrs.get("by") or ["well", "position"])
+    usable = offsets[offsets["applied"]] if "applied" in offsets else offsets
+
+    out = df
+    for column in columns:
+        block = usable[usable["signal"] == column]
+        if block.empty:
+            warnings.warn(f"no offsets for {column!r}; not aligned")
+            continue
+        out = apply_baseline_offsets(out, block, column=column, by=by,
+                                     suffix=suffix)
+    return out
+
+
+def _write_summary_columns(path: Path, frame: pd.DataFrame, columns: list[str],
+                           record: pd.DataFrame) -> None:
+    """Add `columns` to a summary workbook's Summary sheet, in place.
+
+    Every other sheet - `file_data`, `parameters`, `quality`, and whatever a
+    later tool added - is left untouched, which is why this edits the workbook
+    through openpyxl instead of reading it into pandas and writing it back out:
+    a round trip through `read_excel`/`ExcelWriter` re-types every cell of
+    every sheet and turns each one's index into an `Unnamed: 0` column.
+
+    `frame` is this position's rows in file order, carrying `particle` and the
+    new columns. The particle column is checked against the sheet rather than
+    trusted, so a summary rewritten between compiling and writing fails loudly
+    instead of having another position's numbers pasted into it.
+    """
+    import openpyxl
+
+    book = openpyxl.load_workbook(path)
+    if SUMMARY_SHEET not in book.sheetnames:
+        raise KeyError(f"{path.name} has no {SUMMARY_SHEET!r} sheet")
+    sheet = book[SUMMARY_SHEET]
+    header = [cell.value for cell in sheet[1]]
+
+    if sheet.max_row - 1 != len(frame):
+        raise ValueError(f"{path.name}: {sheet.max_row - 1} rows in "
+                         f"{SUMMARY_SHEET}, {len(frame)} compiled - the file "
+                         f"changed since it was read")
+    if "particle" in header:
+        on_disk = [sheet.cell(row=r, column=header.index("particle") + 1).value
+                   for r in range(2, sheet.max_row + 1)]
+        if list(frame["particle"]) != list(on_disk):
+            raise ValueError(f"{path.name}: the particle column does not match "
+                             f"what was compiled; not written")
+
+    for column in columns:
+        index = (header.index(column) + 1 if column in header
+                 else sheet.max_column + 1)
+        if column not in header:
+            header.append(column)
+        sheet.cell(row=1, column=index, value=column)
+        for offset, value in enumerate(frame[column], start=2):
+            # `.value =`, not `cell(..., value=...)`: openpyxl reads a None
+            # there as "no value supplied" and leaves the cell alone, which on
+            # a re-run would keep a dropped position's stale number under a
+            # name that now promises a NaN.
+            sheet.cell(row=offset, column=index).value = (
+                None if pd.isna(value) else float(value))
+
+    # The provenance sheet is rebuilt rather than appended to: it describes the
+    # columns now in the file, and two runs' worth of it would not say which.
+    if WELL_ALIGN_SHEET in book.sheetnames:
+        del book[WELL_ALIGN_SHEET]
+    note = book.create_sheet(WELL_ALIGN_SHEET)
+    note.append(list(record.columns))
+    for row in record.itertuples(index=False):
+        note.append([None if pd.isna(v) else
+                     (v if isinstance(v, (int, float, str)) else str(v))
+                     for v in row])
+    book.save(path)
+
+
+def align_wells(source, columns=None, suffix: str = WELL_ALIGN_SUFFIX,
+                estimator: str = "trimmed", reference="median",
+                drop_flags=(), write: bool = True, file_suffix: str = "",
+                pattern: str = "*phs.tif", platemap: Path | str | None = None,
+                verbose: bool = True, **offset_kwargs,
+                ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Put a plate's positions on their well's zero, and write it into the summaries.
+
+    The whole correction in one call:
+
+        df, offsets = agg.align_wells(root)
+
+    which compiles the plate, measures each channel's floor for every imaging
+    position, moves the positions of each well onto that well's median floor,
+    and adds the result to every `*_summary.xlsx` as `<signal>_well_aligned`
+    beside the signal it came from. Wells are not moved relative to one
+    another, so a treatment that induces the reporter cannot be flattened.
+
+    The rows are the summaries as written - `filter_summary` is not applied -
+    so every particle in every file gets a value, and the floor is measured
+    from every particle that has one.
+
+    Parameters
+    ----------
+    source : Path | str | cellaap_analysis.analysis
+        The plate's root folder, as for `load_experiment`.
+    columns : sequence of str, optional
+        Signal columns to align. Defaults to the best column of each channel
+        present - `<ch>_corrected` where signal_correction ran.
+    suffix : str
+        Appended to each column's name for the aligned one. `_well_aligned`
+        rather than `dr_tools.align_channels`' `_aligned`, because a table can
+        carry both and they mean different scopes.
+    estimator, reference, drop_flags, **offset_kwargs
+        Passed to `well_offsets`.
+    write : bool
+        Add the columns to the summary workbooks. False computes and returns
+        everything without touching disk, which is how to look at the offsets
+        before believing them.
+    file_suffix : str
+        Which summary variant to read and write: `""` for `*_summary.xlsx`, or
+        e.g. `"_dead"` for the copies `augment_dead_label.py --suffix` writes.
+    pattern, platemap, verbose
+        As for `platemap_positions`.
+
+    Returns
+    -------
+    (df, offsets) : (DataFrame, DataFrame)
+        `df` is the compiled plate with the aligned columns added - the same
+        numbers that went into the files. `offsets` is `well_offsets`' table:
+        one row per position per signal, with the floor, what it was moved
+        onto, and any flag.
+
+    Notes
+    -----
+    Written in place. Each summary also gets a `well_alignment` sheet naming
+    what was subtracted from it and under what settings, so a file says on its
+    own what its `_well_aligned` columns mean. Re-running overwrites both the
+    columns and that sheet; the original signal columns are never touched, so
+    the second run measures the same floors as the first.
+    """
+    positions = platemap_positions(source, pattern=pattern, platemap=platemap,
+                                   verbose=verbose)
+    df = compile_positions(positions, suffix=file_suffix, verbose=verbose)
+    if df.empty:
+        raise ValueError(f"no *_summary{file_suffix}.xlsx found under "
+                         f"{_resolve_root(source)}")
+
+    columns = list(columns) if columns is not None else channel_columns(df)
+    if verbose:
+        print(f"\naligning {', '.join(columns)} across the positions of "
+              f"{df['well'].nunique()} well(s)")
+    offsets = well_offsets(df, columns=columns, estimator=estimator,
+                           reference=reference, drop_flags=drop_flags,
+                           verbose=verbose, **offset_kwargs)
+    aligned = apply_well_offsets(df, offsets, columns=columns, suffix=suffix)
+    new_columns = [f"{c}{suffix}" for c in columns
+                   if f"{c}{suffix}" in aligned.columns]
+
+    if not write:
+        if verbose:
+            print(f"\nnothing written (write=False); "
+                  f"{', '.join(new_columns)} are on the returned table only")
+        return aligned, offsets
+
+    settings = {"estimator": estimator, "reference": str(reference),
+                "unit": "well, position", "aligned_suffix": suffix}
+    keep = ["signal", "well", "position", "label", "n_cells", "floor",
+            "floor_se", "reference_floor", "offset", "z", "tail_drop",
+            "tail_z", "flag", "applied"]
+
+    written = 0
+    for pos in positions:
+        rows = aligned[aligned["stem"] == pos.stem]
+        if rows.empty:
+            continue
+        path = pos.summary_path(file_suffix)
+        if path is None:
+            if verbose:
+                print(f"  ! {pos.stub}: summary vanished, not written")
+            continue
+        mine = offsets[(offsets["well"] == pos.well)
+                       & (offsets["position"] == pos.position)]
+        record = mine[[c for c in keep if c in mine.columns]].copy()
+        for name, value in settings.items():
+            record[name] = value
+        _write_summary_columns(path, rows[["particle"] + new_columns],
+                               new_columns, record)
+        written += 1
+        if verbose:
+            print(f"{pos.stub}: {', '.join(new_columns)} written "
+                  f"({len(rows)} particles)")
+
+    if verbose:
+        print(f"\n{written} summary file(s) updated in place; each carries a "
+              f"{WELL_ALIGN_SHEET!r} sheet saying what was subtracted")
+    return aligned, offsets
 
 
 # ---------------------------------------------------------------------------
