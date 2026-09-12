@@ -411,7 +411,7 @@ this module. It lives in `cellaap_aggregate.py`, described in
 the plate layout from the same `platemap.csv` that `pipeline.py` ran the plate
 from rather than from a hand-written well list.
 
-**Step 6:** Use the **fit_model** function to fit a 4-parameter Hill model to binned data. The function expects input data as a dataframe with the first column containing the fluorescence signal and the second column containing the time in mitosis. For this model to work, the 0 dosage response must be defined as a positive value. This value must be obtained from a -rapamycin well or otherwise supplied. If it is unavailable, perform a rough background subtraction as shown below on a temporary basis — or, better, use `agg.baseline_offsets(df, column, reference="zero")` and `agg.apply_baseline_offsets`, which take the zero from each position's dim population rather than from its single lowest cell (see [Aligning the zero](#aligning-the-zero-across-positions)).
+**Step 6:** Use the **fit_model** function to fit a 4-parameter Hill model to binned data. The function expects input data as a dataframe with the first column containing the fluorescence signal and the second column containing the time in mitosis. For this model to work, the 0 dosage response must be defined as a positive value. This value must be obtained from a -rapamycin well or otherwise supplied. If it is unavailable, perform a rough background subtraction as shown below on a temporary basis — or, better, use `agg.correct_wells(root)` (or `agg.well_offsets` and `agg.apply_well_offsets` on a compiled table), which takes each well's zero from its most negative cells rather than from its single lowest cell (see [Putting each well's zero back](#putting-each-wells-zero-back-correct_wells)).
 
 quant_fraction must a list that specifies the quantiles to be evaluated for the dosage. The bin range is based on the quantile values of the dosage values. Remember that the eSAC dosage distribution is asymmetric (it should be possible to fit it with a log-normal distribution). Therefore, the default quantile values (used below) are asymmetric.
 
@@ -486,131 +486,112 @@ missing from the platemap is reported and falls back to HeLa, with
 If the raw `*phs.tif` stacks have been archived, positions are recovered from
 the `*_inference` folder names instead, so a results-only folder still compiles.
 
-### Aligning the zero across positions
+### Putting each well's zero back: `correct_wells`
 
 `signal_correction` measures each position's background from that position's
 own cell-free pixels, which is why `<ch>_corrected` beats the blank-well maps.
 It has one failure mode and it is systematic: there have to *be* cell-free
 pixels. As a field fills up the estimator backs its exclusion ring off the
-cells to keep enough blocks measurable, and the closer it measures to a cell
-the more of that cell's out-of-focus halo it counts as medium. The background
-comes out too high, the corrected signal too low, and the error grows with
-confluence — so it differs between positions in one well, between wells, and
-between days.
+cells, counts more of their out-of-focus halo as medium, and subtracts too
+much. Cells with no fluorophore then read **below zero**, and those cells, the
+non-expressing and barely expressing ones, are what define the low-dose end of
+a dose-response curve.
 
-The size of it on the 20260826 CycB plate: across the four A01 positions — one
-well, one treatment, no GFP induced — the **raw** floor spans 0.9 counts and
-the **corrected** floor spans 5.1, against a median signal of 23. One position
-(`C01_s6`, the densest on the plate) over-subtracts hard enough to put its
-dimmest cells at −300.
+The correction is read off those negative cells, one well at a time:
 
-A cell with no fluorophore reads the same number everywhere, because that
-number belongs to the microscope and not to the well. So the bottom of each
-position's distribution is a landmark that *should* line up, and how far it
-fails to is the residual background error, measured directly. Subtracting that
-per-position constant is the correction.
-
-Three calls, deliberately separate — nothing is applied until you have looked:
-
-```python
-offsets = agg.baseline_offsets(df, "GFP_corrected")      # measure. Changes nothing
-agg.plot_baseline_offsets(df, offsets)                   # look
-aligned = agg.apply_baseline_offsets(df, offsets)        # adds GFP_corrected_aligned
+```
+negatives = the well's values < 0, sorted
+tail      = the lowest ceil(fraction × len(negatives)) of them     (fraction = 0.25)
+offset    = median(tail)                                            (a negative number)
+zeroed    = value − offset
 ```
 
-`offsets` is an ordinary dataframe, one row per unit, that you can read, sort,
-edit or throw away. `floor` is where the unit's dim cells sit, `offset` is what
-will be subtracted, `floor_se` is the bootstrap error on the floor, and `flag`
-marks rows to look at — `few cells`, `outlier floor`, and `low tail` for a
-position that no single constant can repair. `plot_baseline_offsets` draws the
-signal before and after with the floors marked, plus the floors themselves with
-their error bars.
-
-`low tail` needs two things to fire: `tail_drop` over its threshold, and
-`tail_z` putting the unit outside the other units of the same channel.
-`tail_drop` is a ratio to each unit's own interquartile range, so a channel
-whose bulk is tight reads high on every unit with nothing wrong — on the
-20260826 plate the threshold alone flagged 10 of 15 Cy5 positions against
-exactly one GFP position. Requiring both leaves the broken GFP position (17
-robust SDs out) flagged and the worst Cy5 one (1.7) alone. With two or three
-units there is nothing to be an outlier against, so nothing is flagged.
-
-| argument | |
-| --- | --- |
-| `by` | what a unit is. `"stem"` (default) is one imaging position, the level the background was estimated at; `"well"` pools a well's sites; `["experiment", "code"]` pools a condition per plate |
-| `estimator` | `"trimmed"` (default, the mean between the 2nd and 15th percentile), `"quantile"`, or `"mode"` for a unit that is mostly non-expressing |
-| `reference` | `"median"` (default) moves the units onto each other without claiming to know the absolute zero; `"zero"` puts every floor at 0; `"min"`; or a unit label, e.g. an untreated control well |
-| `within` | compute a separate reference inside each of these groups, which is how you choose what the alignment may touch |
-
-`within` is the argument to think about. Left out, everything is put on one
-zero — the strongest correction, and the right one when every unit really
-should read the same at zero (repeats of a plate, or wells differing only in a
-drug that does not touch the reporter). `within="code"` aligns positions inside
-each condition and leaves the conditions where they are; reach for it whenever
-a treatment induces the reporter, since it cannot flatten the induction. On the
-20260826 plate it leaves the three condition medians within 0.2 counts while
-pulling the position-to-position spread of the two uninduced wells from 7.0 and
-5.0 counts down to 4.3 and 4.2. `within="experiment"` aligns each plate to its
-own median and leaves the plates' levels alone, for plates that are not
-expected to share a zero.
-
-Pooling several plates is the same call on the concatenated table.
-
-What it does **not** do. It removes an offset, so it cannot repair a position
-that is over-subtracted by different amounts in different parts of its own
-field — the `low tail` flag marks those, and they are to be dropped rather
-than aligned. It needs some genuinely dim cells in each unit: in a well where
-every cell expresses, the bottom of the distribution is a biological number and
-aligning on it flattens a real difference, which is the one way to do damage
-here. And it does not by itself make two experiments comparable, since a
-different exposure rescales the signal as well as shifting it.
-
-`correction_tools.surface_diagnostics(root)` says *why* a position's zero is
-off — how many blocks the estimator could measure, how wide an exclusion ring
-it held, how much its background appeared to drift. Over the ten uninduced
-positions of that plate the floor tracks all three (r = −0.83, −0.80, +0.79).
-
-#### Back into the summary files: `align_wells`
-
-The three calls above work on a table in memory. The one case that comes up on
-every plate always answers their three questions the same way — the unit is an
-imaging position, the scope is the well it sits in, and the answer belongs in
-the position's own `*_summary.xlsx` — so it is one call:
+A well is only shifted when **more than 10** of its cells are negative. Below
+that, the negatives are scatter around a zero that is already about right.
 
 ```python
-df, offsets = agg.align_wells(root)            # writes the files
-df, offsets = agg.align_wells(root, write=False)   # measures only
+import cellaap_aggregate as agg
+
+df, offsets = agg.correct_wells(root)                   # writes the files
+df, offsets = agg.correct_wells(root, write=False)      # measures only
+df, offsets = agg.correct_wells(root, fraction=0.5)     # a different tail
 ```
 
 It compiles the plate, picks the best signal column of each channel present
-(`<ch>_corrected` where `signal_correction` ran), moves the positions of each
-well onto that well's median floor, and adds `<signal>_well_aligned` to every
-summary workbook beside the signal it corrects. Every other sheet is left
-untouched, and each file gains a `well_alignment` sheet naming what was
-subtracted from it and under what settings, so a summary says on its own what
-its aligned columns mean.
+(`<ch>_corrected` where `signal_correction` ran), measures one offset per well,
+and adds `<signal>_zeroed` to every summary workbook beside the signal it
+corrects. Every other sheet is left untouched. Each file gains an
+`offset_correction` sheet naming what was subtracted from its well and with
+which settings, so a summary says on its own what its zeroed columns mean.
+Re-running overwrites the columns and that sheet. The original signal columns
+are never touched, so a second run measures the same offsets. The
+`*_well_aligned` columns and `well_alignment` sheet written by the per-position
+alignment this replaces are removed on the first run.
 
-The well is the scope on purpose. The sites of one well are the same cells in
-the same medium under the same treatment, imaged minutes apart — if their dim
-cells disagree, that is the background estimator having a harder time in one
-field, and nothing else. Across wells it may be a real induction, so the wells
-are never moved relative to one another. On the 20590 Dox series that shows
-directly: within-well floor spread goes to zero in every well and the
-position-to-position median spread of F02 falls from 53 to 29 counts, while
-each well's own median moves by under 1% and the dose series across the plate
-is untouched.
+The same steps on a table already in memory:
 
-| | |
+```python
+offsets = agg.well_offsets(df, columns=["Texas Red_corrected"])   # measure; changes nothing
+agg.plot_well_offsets(df, offsets)                                # look
+zeroed  = agg.apply_well_offsets(df, offsets)                     # adds Texas Red_corrected_zeroed
+```
+
+| argument | |
 | --- | --- |
-| `columns` | which signals to align. Defaults to one column per channel — aligning `GFP` and `GFP_corrected` separately would put two differently-zeroed numbers in one file under names that look like variants |
-| `drop_flags` | e.g. `("low tail",)`. A position flagged this way is excluded from its well's reference, the rest are re-measured without it, and it comes back with no offset and `NaN` in the aligned column — never silently corrected, never silently deleted |
-| `write` | `False` computes and returns everything without touching disk, which is how to look at the offsets first |
-| `file_suffix` | which summary variant to read and write: `""`, or e.g. `"_dead"` |
+| `fraction` | share of a well's negative cells, from the most negative end, whose median is the offset. Default `0.25`; `1.0` is the median of every negative cell |
+| `min_negative` | a well is shifted only when more than this many cells are negative. Default `10` |
+| `columns` | signals to correct. Defaults to one column per channel, since zeroing `GFP` and `GFP_corrected` separately would put two differently-zeroed numbers in one file |
+| `well_keys` | (`well_offsets`) what identifies a well, `("well",)` by default. Add the plate column, e.g. `("experiment", "well")`, when several plates are pooled in one table. `position`, `stem` and `site` are refused |
+| `write`, `file_suffix` | (`correct_wells`) `False` computes without touching disk; `file_suffix` picks the summary variant, e.g. `"_dead"` |
 
-Re-running overwrites the columns and that sheet rather than stacking on them:
-the original signal columns are never touched, so the second run measures the
-same floors as the first. `_well_aligned` rather than `apply_baseline_offsets`'
-`_aligned`, because a table can carry both and they mean different scopes.
+`offsets` has one row per well per signal: `n_negative`, `n_tail` (how many
+cells the median is taken over), `offset`, `applied`, and `negative_after`,
+the cells still below zero once it is subtracted.
+
+**Why the most negative cells.** The negatives are the left half of the
+non-expressing peak, so shifting by the median of all of them leaves much of
+that peak below zero, and a Hill curve is defined only for x ≥ 0. A fit whose
+non-expressing cells sit below zero takes its base from where the rise starts
+rather than from the basal duration. On the pPS18 20250402 plate
+(`Texas Red_corrected`, 4-parameter Hill fit on binned means):
+
+| cell line | wells | cells < 0 before → after | base (min) | EC50 (a.u.) |
+| --- | --- | --- | --- | --- |
+| HeLa | E02 | 34% → 4% | 82 → 59 | 12.5 → 25.2 |
+| RPE1 | A03–C03 | 14% → 2% | 65 → 43 | 9.3 → 12.4 |
+| U2OS | F02–H02 | 16% → 2% | 55 → 57 | 40.2 → 37.6 |
+
+The corrected bases match the basal duration of the dimmest cells. U2OS
+already had a long flat foot, so little changes there, and its top is poorly
+determined either way.
+
+**The zero is a convention.** The shift includes about one width of the
+non-expressing peak, and EC50 moves with it. A Hill fit with a free x-offset
+could not choose between zeros (its fit is flat below the non-expressing peak),
+so the data do not settle this. EC50s are comparable only between data zeroed
+the same way, with the same `fraction`. The HeLa offset (−15) is three to four
+times the RPE1 and U2OS ones (about −3 to −4), because HeLa has more dim cells
+and a wider negative tail. Keep that in mind before comparing EC50s across cell
+lines.
+
+**Why per well, never per position.** On the HeLa well, offsets measured per
+position were tested against the dose-response itself: one shared curve shape,
+a free shift per position, and the question of whether the correction brings
+those shifts together. Offsets from each position's non-expressing peak
+widened the scatter (SD 2.8 → 4.3 a.u.). Per-position negative-tail offsets
+left it unchanged (2.7). Neither tracked the shift each position's curve
+needed. A position has a few hundred cells and its most negative quarter a few
+dozen, so a per-position offset adds noise without removing any error. There
+is no per-position option.
+
+What it does **not** do. It removes an offset, so it cannot repair a position
+over-subtracted by different amounts across its own field; such a well keeps a
+high `negative_after`. And it does not make two experiments comparable, since a
+different exposure rescales the signal as well as shifting it.
+
+`correction_tools.surface_diagnostics(root)` says *why* a position's
+background was over-estimated: how many blocks the estimator could measure, how
+wide an exclusion ring it held, how much its background appeared to drift.
 
 ## Curating particles: `particle_browser.py`
 

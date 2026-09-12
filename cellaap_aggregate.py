@@ -38,16 +38,16 @@ Entry points, in decreasing order of how much you have to say:
     groups    = agg.group_positions(positions)
     raw       = agg.compile_positions(groups[("HeLa", "pEN2", "DMSO")])
 
-A compiled table still carries one plate-level defect: every position had its
-background estimated on its own, so the positions do not share a zero. See
-"Aligning the zero across positions" below - `baseline_offsets` measures the
-disagreement, `plot_baseline_offsets` shows it, and `apply_baseline_offsets`
-removes it. Three steps rather than one, so the correction can be looked at
-before it is believed.
+A compiled table still carries one defect: where a field is crowded,
+`signal_correction` subtracts too much background, and cells with no
+fluorophore read below zero. See "Putting each well's zero back where it
+belongs" below - `well_offsets` measures one offset per well from its most
+negative cells, `plot_well_offsets` shows it, and `apply_well_offsets`
+subtracts it. There is deliberately no per-position version.
 
-    # or, for the case that comes up on every plate, one step that also
-    # writes `<signal>_well_aligned` back into each *_summary.xlsx
-    df, offsets = agg.align_wells(root)
+    # or the whole thing, which also writes `<signal>_zeroed` back into each
+    # *_summary.xlsx
+    df, offsets = agg.correct_wells(root)
 
 The well-list API that predated `platemap_positions` - `create_wellmap_dict`,
 `wellmap_from_platemap`, `compile_summaries`, `import_filter_data_for_wells`
@@ -85,14 +85,12 @@ __all__ = [
     "filter_summary",
     "load_experiment",
     "read_platemap",
-    "baseline_floor",
-    "baseline_offsets",
-    "apply_baseline_offsets",
-    "plot_baseline_offsets",
+    "negative_tail_offset",
     "channel_columns",
     "well_offsets",
     "apply_well_offsets",
-    "align_wells",
+    "plot_well_offsets",
+    "correct_wells",
     "export_to_excel_by_col",
     "fit_model",
     "sigmoid_4par",
@@ -455,615 +453,92 @@ def read_platemap(source, platemap: Path | str | None = None) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Aligning the zero across positions
+# Putting each well's zero back where it belongs
 #
 # `signal_correction` measures each position's background from that position's
-# own cell-free pixels, which is the right thing to do and is why
-# `<ch>_corrected` beats the blank-well maps. It has one failure mode, and it
-# is systematic:
-# there have to BE cell-free pixels. As a field fills up, the estimator backs
-# its exclusion ring off the cells (`_dilation_ladder`) to keep enough blocks
-# measurable, and the closer it measures to a cell the more of that cell's
-# out-of-focus halo it counts as medium. The background comes out too high, the
-# corrected signal too low, and the error grows with confluence - so it differs
-# between positions in one well, between wells, and between days.
+# own cell-free pixels, and a crowded field does not have many. The estimator
+# backs its exclusion ring off the cells to keep enough blocks measurable,
+# counts more of their out-of-focus halo as medium, and subtracts too much. A
+# cell with no fluorophore then reads BELOW zero - and those cells, the
+# non-expressing and barely expressing ones, are the ones that define the
+# bottom of a dose-response curve.
 #
-# The size of it, on the 20260826 CycB plate. Across the four A01 positions -
-# one well, one treatment, no GFP induced, so their dim cells are the same
-# cells - the RAW floor spans 0.9 counts and the per-position-corrected floor
-# spans 5.1, against a median signal of 23. The correction added
-# between-position spread rather than removing it. Across the ten positions of
-# the two uninduced wells the floor tracks the estimator's difficulty
-# precisely: r = -0.83 against the position's peak background, -0.80 against
-# its apparent background drift, and +0.79 against how wide an exclusion ring
-# the estimator could hold (`correction_tools.surface_diagnostics` reports all
-# three). One position, C01_s6 - the densest on the plate, ring backed off from
-# 121 px to 30 - over-subtracts hard enough to put its dimmest cells at -300.
+# The correction reads the over-subtraction off the negative values
+# themselves. A well with more than `min_negative` cells below zero is shifted
+# right by the median of its most negative `fraction` of those cells:
 #
-# What is done about it here is deliberately not a better background estimate -
-# that would have to happen back at the images. It is the observation that a
-# cell with no fluorophore reads the same number everywhere, because that
-# number is a property of the microscope and not of the well. So the bottom of
-# each position's distribution is a landmark that SHOULD line up, and how far
-# it fails to line up is the residual background error, directly measured.
-# Subtracting that per-position constant is the correction.
+#     negatives = the well's values < 0, sorted
+#     tail      = the lowest ceil(fraction * len(negatives)) of them
+#     offset    = median(tail)              (a negative number)
+#     zeroed    = value - offset
 #
-# The estimate and the subtraction are separate calls on purpose. The offsets
-# come back as an ordinary DataFrame that can be read, plotted, edited or
-# thrown away before anything touches the data.
+# A well with `min_negative` negative cells or fewer is left where it is: that
+# is scatter around a zero that is already about right, and a median of a
+# handful of cells is not a number to move a well by.
 #
-# It removes an OFFSET and nothing else. Three things it therefore cannot do:
+# The tail, and not all the negatives, is a choice and not an estimate. The
+# negatives are the left half of the non-expressing peak, so shifting by their
+# median leaves much of that peak below zero, and a Hill curve is only defined
+# for x >= 0. A fit whose non-expressing cells sit below zero takes its base
+# from where the rise starts rather than from the basal duration. On the
+# pPS18 20250402 plate (Texas Red_corrected, these defaults) HeLa's fitted
+# base went from 82 min to 59 and RPE1's from 65 to 43 - both onto the basal
+# duration of their dimmest cells - with under 5% of cells left negative.
+# What that costs is that the zero is a convention: the shift includes about
+# one width of the non-expressing peak, and EC50 moves with it (HeLa
+# 12.5 -> 25.2, RPE1 9.3 -> 12.4; U2OS, which already had a long flat foot,
+# 40.2 -> 37.6 with its top poorly determined either way). A Hill fit
+# with a free x-offset could not choose the zero - its fit is flat anywhere
+# below the non-expressing peak - so EC50s compare only between data zeroed
+# the same way, with the same `fraction`.
 #
-#   * fix a within-position error. C01_s6 above is over-subtracted by a
-#     different amount in different parts of the field and at different times;
-#     one constant cannot straighten that, and `plot_baseline_offsets` will
-#     still show it with a long low tail after alignment. Such a position is
-#     to be dropped, not aligned.
-#   * survive a unit with no dim cells in it. The floor is only a landmark
-#     where some of the cells really are at zero. In a well where every cell
-#     expresses, the bottom of the distribution is a biological number, and
-#     aligning on it flattens a real difference into nothing. This is the one
-#     way to do actual damage with these functions, which is why nothing is
-#     applied until you have looked.
-#   * make two experiments comparable on its own. A different exposure or
-#     laser power rescales the signal as well as shifting it; aligning the zero
-#     is necessary for pooling repeats but is not by itself sufficient.
+# One offset per well, never per position. On the HeLa well, per-position
+# offsets were tested against the dose-response itself: one shared curve
+# shape, a free shift per position, and the question whether the correction
+# brings those shifts together. Offsets from each position's non-expressing
+# peak widened their scatter (SD 2.8 -> 4.3 a.u.); per-position negative-tail
+# offsets left it where it was (2.7). Neither tracked the shift a position's
+# curve needed. A position holds a few hundred cells and its most negative
+# quarter a few dozen, so a per-position offset adds noise to every cell and
+# removes nothing. The sites of a well are pooled and moved together.
+#
+# Two things it cannot do:
+#
+#   * repair a position over-subtracted by different amounts across its own
+#     field. A constant moves a distribution; a tail from one corner of the
+#     field stays a tail.
+#   * make two acquisitions comparable. A different exposure rescales the
+#     signal as well as shifting it.
 # ---------------------------------------------------------------------------
 
-# Between the 2nd and 15th percentile: high enough to clear the over-corrected
-# tail a crowded position leaves at the very bottom, low enough to stay inside
-# the non-expressing population. Averaging that band rather than reading one
-# order statistic is what makes it steady at the ~100 tracks a position has -
-# bootstrap SE 1.2 counts against 1.5 for a bare 5th percentile on the
-# 20260826 plate, and a smaller within-well spread on every well of it.
-BASELINE_TRIM = (0.02, 0.15)
+# The share of a well's negative cells the offset is read from - the most
+# negative quarter, by default.
+NEGATIVE_TAIL_FRACTION = 0.25
 
-# Reasons a unit's offset should be looked at before it is used.
-FLAG_FEW_CELLS = "few cells"
-FLAG_OUTLIER = "outlier floor"
-FLAG_LOW_TAIL = "low tail"
+# A well is shifted only when MORE than this many of its cells are negative.
+MIN_NEGATIVE_CELLS = 10
 
-
-def _half_sample_mode(values: np.ndarray, min_n: int = 8) -> float:
-    """Densest point of a distribution, by recursive half-sample shrinking.
-
-    Bickel & Fruehwirth's estimator: repeatedly keep the half of the sorted
-    sample that spans the smallest range. Unlike a histogram mode it needs no
-    bin width, and unlike a quantile it ignores the shape of the tails
-    entirely - which is what makes it the estimator to use when a unit holds a
-    large non-expressing population and a long bright one.
-    """
-    x = np.sort(values)
-    while len(x) > min_n:
-        n = len(x)
-        half = n // 2
-        i = int(np.argmin(x[half:] - x[:n - half]))
-        x = x[i:i + half + 1]
-    return float(np.median(x))
-
-
-def baseline_floor(values, estimator: str = "trimmed", q: float = 0.05,
-                   trim: tuple[float, float] = BASELINE_TRIM) -> float:
-    """Where the dim cells of one unit sit: the landmark that should line up.
-
-    Parameters
-    ----------
-    values : array-like
-        One unit's per-cell signal. NaNs are dropped.
-    estimator : {"trimmed", "quantile", "mode"}
-        ``trimmed``
-            mean of the values between the two `trim` quantiles. The default,
-            for the reasons on `BASELINE_TRIM`.
-        ``quantile``
-            the `q`-th percentile. One order statistic, so noisier, but it is
-            the number people already read off a boxplot and it makes the
-            offsets easy to check by eye.
-        ``mode``
-            `_half_sample_mode`. Use it when most cells in a unit are
-            non-expressing, so the peak of the distribution IS the zero;
-            it ignores both tails, including an over-corrected one.
-
-    Returns
-    -------
-    float, or NaN for an empty unit.
-    """
-    v = np.asarray(values, dtype=float)
-    v = v[np.isfinite(v)]
-    if v.size == 0:
-        return float("nan")
-    if estimator == "quantile":
-        return float(np.quantile(v, q))
-    if estimator == "trimmed":
-        lo, hi = np.quantile(v, trim)
-        band = v[(v >= lo) & (v <= hi)]
-        return float(band.mean()) if band.size else float(hi)
-    if estimator == "mode":
-        return _half_sample_mode(v)
-    raise ValueError(f"unknown estimator {estimator!r}; expected 'trimmed', "
-                     f"'quantile' or 'mode'")
-
-
-def baseline_offsets(df: pd.DataFrame, column: str, by="stem",
-                     estimator: str = "trimmed", q: float = 0.05,
-                     trim: tuple[float, float] = BASELINE_TRIM,
-                     reference="median", within=None,
-                     min_cells: int = 20, n_boot: int = 200,
-                     seed: int = 0, flag_z: float = 3.0,
-                     max_tail_drop: float = 1.0) -> pd.DataFrame:
-    """Measure how far each unit's zero sits from the common one. **Step 1.**
-
-    Nothing is changed here. The result is a table you look at - and, when a
-    unit turns out to have no dim cells to measure, edit - before
-    `apply_baseline_offsets` uses it.
-
-    Parameters
-    ----------
-    df : DataFrame
-        A compiled summary, from `load_experiment` or `compile_positions`.
-    column : str
-        The signal to align, e.g. `"GFP_corrected"`. One channel per call; the
-        tables from two calls concatenate, since each carries a `signal` column.
-    by : str or sequence of str
-        What a unit is. `"stem"` (the default) is one imaging position, which
-        is the level the background was estimated at and therefore the level
-        the error lives at. `"well"` pools the sites of a well; `["experiment",
-        "code"]` pools a whole condition of a whole plate. Coarser units give a
-        steadier floor and leave more residual error behind.
-    estimator, q, trim
-        Passed to `baseline_floor`.
-    reference : {"median", "min", "zero"}, a unit label, or a number
-        The zero everything is moved onto.
-
-        ``median``  the median floor over units that clear `min_cells`. The
-                    default: it corrects the disagreement between units without
-                    claiming to know the absolute zero, so the plate's overall
-                    level - and any comparison against an earlier analysis of
-                    it - is left where it was.
-        ``min``     the lowest floor. Assumes the least-corrected unit is the
-                    most trustworthy, which is true when the errors are all
-                    over-subtraction of background.
-        ``zero``    put every floor at 0. Only when a genuinely non-expressing
-                    population is present in every unit; then the corrected
-                    number really is fluorophore, and dose-response fits that
-                    need a positive zero-dose value (see `fit_model`) can use
-                    it directly.
-        a label     align on one named unit, e.g. an untreated control well.
-                    Matched against the unit label - the `by` columns joined
-                    with `_` when there is more than one.
-        a number    that value, whatever the data say.
-    within : str or sequence of str, optional
-        Compute a separate reference inside each of these groups instead of one
-        for the whole table. This is how you choose what the alignment is
-        allowed to touch, and it is the argument to think about:
-
-        ``None``        one zero for everything. The strongest correction, and
-                        the right one when every unit really should read the
-                        same at zero - repeats of a plate, or wells that differ
-                        only in a drug that does not touch the reporter.
-        ``"code"``      align positions within each condition and leave the
-                        conditions where they are. The conservative choice, and
-                        the one to reach for when a treatment induces the
-                        reporter, because it cannot flatten the induction. On
-                        the 20260826 plate it leaves the three condition
-                        medians within 0.2 counts and pulls the
-                        position-to-position spread of the uninduced wells from
-                        7.0 and 5.0 counts down to 4.3 and 4.2.
-        ``"experiment"`` align each plate to its own median and leave the
-                        plates' levels alone - for plates that are NOT expected
-                        to share a zero, e.g. a changed exposure.
-    min_cells : int
-        Below this a unit is flagged `"few cells"`, and it is left out of a
-        `"median"` or `"min"` reference. Its offset is still computed.
-    n_boot : int
-        Bootstrap resamples behind `floor_se`. 0 skips it and returns NaN.
-    seed : int
-        Bootstrap seed, so the same table gives the same standard errors.
-    flag_z : float
-        Flag a unit `"outlier floor"` when its floor is this many robust SDs
-        (MAD-scaled, over the units in its `within` group) from the reference.
-    max_tail_drop : float
-        Flag a unit `"low tail"` when `tail_drop` exceeds this **and**
-        `tail_z` puts it more than `flag_z` robust SDs above the other units.
-        Both are needed: the ratio alone reads high on every unit of a channel
-        whose bulk is tight, however healthy they are. With only two or three
-        units there is nothing to be an outlier against, so nothing is flagged.
-
-    Returns
-    -------
-    DataFrame, one row per unit, with
-
-    ============== ==========================================================
-    `by` columns   the unit's identity, plus any `within` columns
-    signal         `column`, so tables for several channels concatenate
-    n_cells        rows behind the floor
-    floor          `baseline_floor` of this unit
-    floor_se       bootstrap standard error of `floor`
-    reference_floor the zero this unit is being moved onto
-    offset         `floor - reference_floor`: the excess baseline this unit
-                   carries. `apply_baseline_offsets` subtracts it.
-    z              `(floor - reference_floor)` in robust SDs of the floors
-    tail_drop      how far the unit's 1st percentile falls below its own
-                   floor, in interquartile ranges. This is the column that
-                   catches a position no constant can fix: on the 20260826
-                   plate every healthy GFP position sits under 0.6 and the one
-                   broken one at 3.4
-    tail_z         `tail_drop` in robust SDs of the other units' `tail_drop`.
-                   What makes the flag work across channels - see
-                   `max_tail_drop`
-    flag           `""`, or the reasons this row deserves a look, comma-joined
-    ============== ==========================================================
-
-    The call's settings are on `.attrs`, which is what lets
-    `apply_baseline_offsets` and `plot_baseline_offsets` be called with just
-    the table.
-    """
-    by = [by] if isinstance(by, str) else list(by)
-    within = ([] if within is None else
-              [within] if isinstance(within, str) else list(within))
-    missing = [c for c in by + within + [column] if c not in df.columns]
-    if missing:
-        raise KeyError(f"{df.__class__.__name__} has no column(s) "
-                       f"{', '.join(missing)}")
-
-    rng = np.random.default_rng(seed)
-    keys = by + [c for c in within if c not in by]
-
-    rows = []
-    for key, group in df.groupby(keys, sort=False, observed=True):
-        key = key if isinstance(key, tuple) else (key,)
-        v = group[column].to_numpy(dtype=float)
-        v = v[np.isfinite(v)]
-        floor = baseline_floor(v, estimator, q, trim)
-        se = float("nan")
-        if n_boot and v.size >= 5:
-            draws = [baseline_floor(rng.choice(v, v.size, replace=True),
-                                    estimator, q, trim)
-                     for _ in range(n_boot)]
-            se = float(np.std(draws))
-        rows.append(dict(zip(keys, key)) |
-                    {"signal": column, "n_cells": int(v.size),
-                     "floor": floor, "floor_se": se, "_values": v})
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        raise ValueError(f"no rows to measure a floor from in {column!r}")
-    out["label"] = out[by].astype(str).agg("_".join, axis=1)
-
-    # The reference, once per `within` group.
-    group_keys = [c for c in within if c in out.columns]
-    grouped = ([("", out)] if not group_keys
-               else list(out.groupby(group_keys, sort=False, observed=True)))
-    pieces = []
-    for _, block in grouped:
-        block = block.copy()
-        block["reference_floor"] = _baseline_reference(block, reference,
-                                                       min_cells)
-        block["offset"] = block["floor"] - block["reference_floor"]
-        # MAD over the floors of this block, as the yardstick for "far".
-        spread = float(np.median(np.abs(block["floor"]
-                                        - np.median(block["floor"])))) * 1.4826
-        block["z"] = (block["offset"] / spread if spread > 0
-                      else np.where(block["offset"] == 0, 0.0, np.inf))
-        pieces.append(block)
-    out = pd.concat(pieces, ignore_index=True)
-
-    # How far the very bottom of a unit falls below its own floor, in units of
-    # that unit's interquartile range. The one thing a constant offset cannot
-    # repair is a unit over-subtracted by different amounts in different parts
-    # of the field, and that shows up here and nowhere else: the floor moves a
-    # little, the tail underneath it collapses. On the 20260826 plate the
-    # healthy positions sit at 0.25-0.60 and the one broken position at 3.4.
-    tail_drop = []
-    for floor, v in zip(out["floor"], out["_values"]):
-        if v.size < 5:
-            tail_drop.append(float("nan"))
-            continue
-        bottom, q1, q3 = np.quantile(v, [0.01, 0.25, 0.75])
-        iqr = float(q3 - q1)
-        tail_drop.append((floor - bottom) / iqr if iqr > 0 else float("nan"))
-    out["tail_drop"] = tail_drop
-
-    # `tail_drop` is a ratio to the unit's own interquartile range, so a
-    # channel whose bulk is tight reads high on every unit with nothing wrong:
-    # a near-saturated stain has a narrow IQR and a few dim cells under it, and
-    # on the 20260826 plate that put 10 of 15 Cy5 positions over an absolute
-    # threshold that caught exactly one GFP position. What marks a position no
-    # offset can repair is a tail unlike the OTHER units of the same channel,
-    # so the flag needs both: over `max_tail_drop`, and an outlier among its
-    # peers. The broken GFP position sits 17 robust SDs out; the worst Cy5 one
-    # sits at 1.7 and is left alone. `tail_z` is that second number, reported
-    # so a large `tail_drop` with no flag explains itself.
-    finite = np.asarray([t for t in tail_drop if np.isfinite(t)], dtype=float)
-    tail_mid = float(np.median(finite)) if finite.size else np.nan
-    tail_mad = (float(np.median(np.abs(finite - tail_mid))) * 1.4826
-                if finite.size else 0.0)
-    out["tail_z"] = [((t - tail_mid) / tail_mad if tail_mad > 0 else 0.0)
-                     if np.isfinite(t) else np.nan for t in tail_drop]
-
-    out["flag"] = [
-        ", ".join(f for f in (
-            FLAG_FEW_CELLS if n < min_cells else "",
-            FLAG_OUTLIER if np.isfinite(z) and abs(z) > flag_z else "",
-            FLAG_LOW_TAIL if (np.isfinite(t) and t > max_tail_drop
-                              and np.isfinite(tz) and tz > flag_z) else "",
-        ) if f)
-        for n, z, t, tz in zip(out["n_cells"], out["z"], out["tail_drop"],
-                               out["tail_z"])]
-
-    out = out.drop(columns="_values")
-    order = (by + [c for c in within if c not in by] +
-             ["label", "signal", "n_cells", "floor", "floor_se",
-              "reference_floor", "offset", "z", "tail_drop", "tail_z",
-              "flag"])
-    out = out[[c for c in order if c in out.columns]]
-    out.attrs.update({"column": column, "by": by, "within": within,
-                      "estimator": estimator, "q": q, "trim": tuple(trim),
-                      "reference": reference, "min_cells": min_cells,
-                      "flag_z": flag_z, "max_tail_drop": max_tail_drop})
-    return out
-
-
-def _baseline_reference(block: pd.DataFrame, reference, min_cells: int) -> float:
-    """The zero for one `within` group. See `baseline_offsets`'s `reference`."""
-    if isinstance(reference, (int, float)) and not isinstance(reference, bool):
-        return float(reference)
-    usable = block[block["n_cells"] >= min_cells]
-    if usable.empty:
-        usable = block
-    if reference == "median":
-        return float(np.median(usable["floor"]))
-    if reference == "min":
-        return float(np.min(usable["floor"]))
-    if reference == "zero":
-        return 0.0
-    hit = block[block["label"] == str(reference)]
-    if hit.empty:
-        raise ValueError(
-            f"reference {reference!r} is neither 'median', 'min', 'zero', a "
-            f"number, nor one of the units {sorted(block['label'])}")
-    return float(hit["floor"].iloc[0])
-
-
-def apply_baseline_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
-                           column: str | None = None, by=None,
-                           suffix: str = "_aligned",
-                           columns=None,
-                           skip_flagged: bool = False) -> pd.DataFrame:
-    """Subtract the measured offsets. **Step 3** (step 2 is looking at them).
-
-    Adds `<column><suffix>`; the original column is never touched, so the two
-    can be plotted against each other and the alignment undone by dropping a
-    column.
-
-    Parameters
-    ----------
-    df, offsets
-        The compiled summary, and `baseline_offsets`' table for it. `column`
-        and `by` default to what that call used.
-    columns : sequence of str, optional
-        Extra columns to shift by the same offsets. The obvious use is a
-        per-cell standard deviation or a second summary of the same channel;
-        a column of a DIFFERENT channel has its own baseline error and needs
-        its own `baseline_offsets` call.
-    skip_flagged : bool
-        Treat a flagged unit's offset as 0 rather than applying it. The unit
-        stays in the table, uncorrected. Off by default: a flag is an
-        instruction to look, and if the look says the offset is wrong the row
-        should be edited or dropped rather than silently neutralized.
-
-    Returns
-    -------
-    A copy of `df`. A row whose unit has no offset gets NaN in the new column
-    and is reported - leaving it at its unaligned value would put two different
-    zeros in one column, which is the thing this exists to prevent.
-    """
-    column = column or offsets.attrs.get("column")
-    by = by or offsets.attrs.get("by")
-    if column is None or by is None:
-        raise ValueError("pass `column` and `by`; this offsets table carries "
-                         "no .attrs (a round trip through a spreadsheet drops "
-                         "them)")
-    by = [by] if isinstance(by, str) else list(by)
-    targets = [column] + [c for c in (columns or []) if c != column]
-
-    table = offsets[by + ["offset"]].copy()
-    if skip_flagged and "flag" in offsets.columns:
-        table.loc[offsets["flag"].astype(bool).to_numpy(), "offset"] = 0.0
-    if table.duplicated(by).any():
-        raise ValueError(f"the offsets table has more than one row per "
-                         f"{by}; is it two channels concatenated? Filter it "
-                         f"to one `signal` first")
-
-    out = df.merge(table, on=by, how="left", validate="many_to_one")
-    unmatched = out["offset"].isna()
-    if unmatched.any():
-        labels = sorted(out.loc[unmatched, by].astype(str)
-                        .agg("_".join, axis=1).unique())
-        warnings.warn(
-            f"{int(unmatched.sum())} row(s) in {len(labels)} unit(s) have no "
-            f"offset and are NaN in {column}{suffix}: "
-            f"{', '.join(labels[:5])}{' ...' if len(labels) > 5 else ''}")
-    for target in targets:
-        if target not in out.columns:
-            warnings.warn(f"{target!r} is not a column of this table; skipped")
-            continue
-        out[f"{target}{suffix}"] = out[target] - out["offset"]
-    return out.drop(columns="offset")
-
-
-def _strip_common_prefix(labels: list[str]) -> dict[str, str]:
-    """Shorten `20260826_Hela CycB Oe BubR1 kd_A01_s2` to `A01_s2` for an axis.
-
-    Position stems on one plate share everything but the last two fields, and
-    the shared part is what makes the tick labels unreadable. Only whole
-    underscore-separated fields are dropped, and only when every label keeps
-    at least one; otherwise the labels come back untouched.
-    """
-    parts = [label.split("_") for label in labels]
-    if len(labels) < 2:
-        return {label: label for label in labels}
-    n = 0
-    while n < min(len(p) for p in parts) - 1 and len({p[n] for p in parts}) == 1:
-        n += 1
-    return {label: "_".join(p[n:]) for label, p in zip(labels, parts)}
-
-
-def plot_baseline_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
-                          column: str | None = None, by=None,
-                          suffix: str = "_aligned", hue: str | None = None,
-                          order: str = "floor", palette: str = "colorblind",
-                          show_points: bool = True, ylim_quantile: float = 0.95,
-                          figsize=None):
-    """Before, after, and the floors themselves. **Step 2.**
-
-    Three panels down one shared unit axis:
-
-    1. the signal as it stands, one box per unit, with each unit's measured
-       floor as a marker and the reference as a dashed line. Units whose boxes
-       are at different heights may just be different; units whose FLOORS are
-       at different heights are misaligned, and this panel separates the two.
-    2. the same after `apply_baseline_offsets`. The floors should now sit on
-       the line. A unit that still spills below it is one no constant fixes.
-    3. floor +/- bootstrap SE against the reference, flagged units in red.
-       The size of the correction, against the noise in measuring it.
-
-    `order="floor"` sorts units by floor, which puts the misaligned ones at
-    the ends; `order="label"` keeps them in name order for reading off a plate.
-
-    The top two panels are cut off at `ylim_quantile` of the pooled signal,
-    always keeping every floor in view. Left at full range a handful of bright
-    cells set the scale and the few counts this figure is about are invisible;
-    the bright cells are not what is being judged here.
-    """
-    column = column or offsets.attrs.get("column")
-    by = by or offsets.attrs.get("by")
-    by = [by] if isinstance(by, str) else list(by)
-    aligned = f"{column}{suffix}"
-
-    data = df if aligned in df.columns else apply_baseline_offsets(
-        df, offsets, column=column, by=by, suffix=suffix)
-    data = data.copy()
-    data["label"] = data[by].astype(str).agg("_".join, axis=1)
-    table = offsets.copy()
-    if "label" not in table.columns:
-        table["label"] = table[by].astype(str).agg("_".join, axis=1)
-
-    labels = (table.sort_values("floor")["label"].tolist() if order == "floor"
-              else sorted(table["label"]))
-    floor = table.set_index("label")["floor"]
-    ref = table.set_index("label")["reference_floor"]
-    err = table.set_index("label")["floor_se"]
-    flagged = table.set_index("label")["flag"].astype(bool)
-
-    # One y-window for both signal panels, so the shift between them is a
-    # shift and not a rescale.
-    pooled = pd.concat([data[column], data[aligned]]).to_numpy(dtype=float)
-    pooled = pooled[np.isfinite(pooled)]
-    top = float(np.quantile(pooled, ylim_quantile))
-    bottom = float(min(floor.min(), ref.min()))
-    pad = 0.08 * max(top - bottom, 1.0)
-    window = (bottom - 2 * pad, top + pad)
-
-    short = _strip_common_prefix(labels)
-    fig, axes = plt.subplots(3, 1, sharex=True,
-                             figsize=figsize or (0.55 * len(labels) + 5, 11),
-                             gridspec_kw={"height_ratios": [3, 3, 2]})
-    for ax, value, title, marker in (
-            (axes[0], column, "as corrected per position", "measured floor"),
-            (axes[1], aligned, "after aligning the zero", "aligned floor")):
-        sns.boxplot(data=data, x="label", y=value, order=labels, ax=ax,
-                    hue=hue, palette=palette if hue else None,
-                    color=None if hue else "0.85", dodge=False,
-                    showfliers=False, width=0.7, linewidth=1)
-        if show_points:
-            sns.stripplot(data=data, x="label", y=value, order=labels, ax=ax,
-                          color="0.25", size=2, alpha=0.35, jitter=0.28)
-        # The floors, drawn where they are measured: on the raw column for the
-        # top panel, on the reference for the bottom one - after alignment
-        # every unit's floor IS the reference, which is the claim being made.
-        marks = ([floor[k] for k in labels] if value == column
-                 else [ref[k] for k in labels])
-        ax.plot(range(len(labels)), marks, "o", color="crimson", ms=6,
-                mfc="white", mew=1.6, label=marker, zorder=5)
-        for k, label in enumerate(labels):
-            ax.hlines(ref[label], k - 0.45, k + 0.45, color="crimson", lw=1.2,
-                      ls="--", zorder=4,
-                      label="reference zero" if k == 0 else None)
-        ax.set_title(f"{value} - {title}", fontsize=11)
-        ax.set_ylabel("signal (a.u.)")
-        ax.set_xlabel("")
-        ax.set_ylim(*window)
-        ax.legend(frameon=False, fontsize=8, loc="upper left", ncol=3)
-
-    ax = axes[2]
-    colors = ["crimson" if flagged[k] else "tab:blue" for k in labels]
-    ax.errorbar(range(len(labels)), [floor[k] for k in labels],
-                yerr=[err[k] if np.isfinite(err[k]) else 0 for k in labels],
-                fmt="none", ecolor="0.4", capsize=3, zorder=1)
-    ax.scatter(range(len(labels)), [floor[k] for k in labels], c=colors,
-               s=45, zorder=2)
-    ax.plot(range(len(labels)), [ref[k] for k in labels], color="crimson",
-            lw=1.2, ls="--", label="reference zero")
-    for k, label in enumerate(labels):
-        if flagged[label]:
-            ax.annotate(table.set_index("label")["flag"][label],
-                        (k, floor[label]), textcoords="offset points",
-                        xytext=(0, 9), ha="center", fontsize=7,
-                        color="crimson")
-    ax.set_ylabel("floor (a.u.)")
-    ax.set_xlabel("unit (" + ", ".join(by) + ")")
-    ax.legend(frameon=False, fontsize=8, loc="upper left")
-    ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels([short[k] for k in labels], rotation=90)
-    fig.tight_layout()
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Aligning the positions of one well, and writing it back to the summaries
-#
-# `baseline_offsets` measures and `apply_baseline_offsets` subtracts, both on a
-# table that is already in memory. What the section above does not do is decide
-# what a unit is, what it is aligned against, or where the answer goes, and for
-# the one case that comes up on every plate those three answers are always the
-# same: the unit is an imaging position, the scope is the well it sits in, and
-# the answer belongs in the position's own `*_summary.xlsx` next to the signal
-# it corrects.
-#
-# Why the well and not the plate. The sites of one well are the same cells in
-# the same medium under the same treatment, imaged minutes apart - if their dim
-# cells do not read the same number, the difference is the background estimator
-# having a harder time in one field than another, and nothing else. That is not
-# true across wells, where a treatment may genuinely induce the reporter, so
-# aligning across wells can flatten a real effect. Restricting the reference to
-# the well is what makes this safe enough to apply without looking first; it is
-# also why it corrects less than `dr_tools.align_channels` with `within=None`.
-#
-# Each well is moved onto its own median floor, so the well's overall level -
-# and any earlier analysis of it - is left exactly where it was. A well with
-# one position is therefore a no-op, correctly: there is nothing to disagree
-# with.
-#
-# The three limits on the section above apply here unchanged. In particular a
-# position over-subtracted by different amounts across its own field is not
-# repairable by any constant; `drop_flags=("low tail",)` is how such a position
-# is kept from setting the well's reference and left uncorrected rather than
-# corrected wrongly.
-# ---------------------------------------------------------------------------
-
-# Written into the summary workbook beside the column it corrects.
-WELL_ALIGN_SUFFIX = "_well_aligned"
+# Appended to a signal's name for the zeroed column.
+ZEROED_SUFFIX = "_zeroed"
 
 # The sheet each summary gets recording what was subtracted from it.
-WELL_ALIGN_SHEET = "well_alignment"
+OFFSET_SHEET = "offset_correction"
+
+# What the per-position alignment this replaced wrote into the summaries. A
+# re-run removes them, so a file never carries two differently-zeroed columns.
+LEGACY_SUFFIX = "_well_aligned"
+LEGACY_SHEET = "well_alignment"
+
+# Columns that name a position rather than a well. They are refused as keys:
+# a per-position offset is the thing this section exists not to apply.
+_POSITION_COLUMNS = ("position", "stem", "site")
 
 # The channels `cellaap_analysis.summarize_data` knows how to measure.
 CHANNELS = ("GFP", "Texas Red", "Cy5")
 
 # Per-channel signal columns, best first. `<ch>_corrected` is
 # signal_correction's number; `<ch>` is raw. `_std` columns describe scatter
-# within a track and are not shifted by a baseline offset, so they never appear
-# here.
+# within a track and are not shifted by an offset, so they never appear here.
 SIGNAL_SUFFIXES = ("_corrected", "_bkg_corr", "")
 
 
@@ -1071,7 +546,7 @@ def channel_columns(df: pd.DataFrame, prefer: tuple[str, ...] = SIGNAL_SUFFIXES,
                     ) -> list[str]:
     """The best available signal column for each channel this table carries.
 
-    One column per channel, not all of them: aligning `GFP` and `GFP_corrected`
+    One column per channel, not all of them: zeroing `GFP` and `GFP_corrected`
     separately would put two differently-zeroed numbers in one file under names
     that look like variants of each other. A column that is constant - all
     zeros for `_bkg_corr` when no legacy correction map was found - carries no
@@ -1087,145 +562,260 @@ def channel_columns(df: pd.DataFrame, prefer: tuple[str, ...] = SIGNAL_SUFFIXES,
     return picked
 
 
-def well_offsets(df: pd.DataFrame, columns=None, estimator: str = "trimmed",
-                 reference="median", drop_flags=(), verbose: bool = True,
-                 **offset_kwargs) -> pd.DataFrame:
-    """Measure every channel's per-position offset, well by well. **Step 1.**
+def _check_fraction(fraction: float) -> float:
+    fraction = float(fraction)
+    if not 0 < fraction <= 1:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+    return fraction
 
-    `baseline_offsets` with `by=["well", "position"]` and `within=["well"]`,
-    run once per signal column and concatenated - the same shape of call
-    `dr_tools.align_channels` makes, fixed to the well rather than the
-    condition. Nothing is changed and nothing is written.
+
+def negative_tail_offset(values, fraction: float = NEGATIVE_TAIL_FRACTION,
+                         min_negative: int = MIN_NEGATIVE_CELLS) -> float:
+    """The offset one well's cells are shifted by. See the section notes above.
+
+    Parameters
+    ----------
+    values : array-like
+        One well's per-cell signal. NaNs are dropped.
+    fraction : float
+        Share of the negative values, taken from the most negative end, whose
+        median is the offset. 1.0 is the median of every negative value.
+    min_negative : int
+        The offset is 0 unless more than this many values are negative.
+
+    Returns
+    -------
+    float
+        The median of the lowest `ceil(fraction * n_negative)` negative values
+        - a negative number, to be subtracted - or 0.0 when the well has
+        `min_negative` negative values or fewer.
+    """
+    fraction = _check_fraction(fraction)
+    v = np.asarray(values, dtype=float)
+    negatives = np.sort(v[np.isfinite(v) & (v < 0)])
+    if negatives.size <= min_negative:
+        return 0.0
+    tail = negatives[:max(1, int(np.ceil(fraction * negatives.size)))]
+    return float(np.median(tail))
+
+
+def _well_keys(df: pd.DataFrame, well_keys) -> list[str]:
+    keys = [well_keys] if isinstance(well_keys, str) else list(well_keys)
+    if "well" not in keys:
+        raise ValueError(f"well_keys must include 'well', got {keys}")
+    refused = [k for k in keys if k in _POSITION_COLUMNS]
+    if refused:
+        raise ValueError(f"{', '.join(refused)} would give one offset per "
+                         f"position; offsets are measured per well only")
+    missing = [k for k in keys if k not in df.columns]
+    if missing:
+        raise KeyError(f"this table has no {', '.join(missing)} column; "
+                       f"compile it with `compile_positions` or "
+                       f"`load_experiment`, which add `well`")
+    return keys
+
+
+def well_offsets(df: pd.DataFrame, columns=None,
+                 fraction: float = NEGATIVE_TAIL_FRACTION,
+                 min_negative: int = MIN_NEGATIVE_CELLS,
+                 well_keys=("well",), verbose: bool = True) -> pd.DataFrame:
+    """Measure every channel's offset, one per well. **Step 1.**
+
+    Nothing is changed and nothing is written.
 
     Parameters
     ----------
     df : DataFrame
-        A compiled plate, from `compile_positions` or `load_experiment`. It
-        needs `well` and `position`, which `compile_positions` adds.
+        A compiled plate, from `compile_positions` or `load_experiment`.
     columns : sequence of str, optional
-        Signal columns to align. Defaults to `channel_columns(df)` - the best
+        Signal columns to measure. Defaults to `channel_columns(df)` - the best
         column of each channel present.
-    estimator, reference, **offset_kwargs
-        Passed to `baseline_offsets`. `reference` defaults to `"median"`, the
-        median floor of the well's own positions.
-    drop_flags : sequence of str
-        Flags whose positions must not set their well's reference -
-        `("low tail",)` for a position over-subtracted by different amounts
-        across its own field, which no single offset repairs. Such a position
-        is measured, excluded, the remaining ones are re-measured against each
-        other, and it comes back with `applied` False and no offset. It is
-        never silently corrected and never silently deleted.
+    fraction, min_negative
+        Passed to `negative_tail_offset`.
+    well_keys : sequence of str
+        What identifies a well. `("well",)` for one plate; add the plate's own
+        column, e.g. `("experiment", "well")`, when several plates are pooled
+        in one table so that their A01s are not measured together. `position`,
+        `stem` and `site` are refused.
     verbose : bool
-        Report each column's position count and offset range.
+        Report each column's offset range and the wells left unshifted.
 
     Returns
     -------
-    DataFrame
-        `baseline_offsets`' columns for every signal, plus
+    DataFrame, one row per well per signal, with
 
-        ========= ===========================================================
-        signal    the column the row's offset belongs to
-        applied   False for a row `drop_flags` excluded; `align_wells` writes
-                  NaN for those positions rather than an uncorrected number
-        ========= ===========================================================
+    ============== ==========================================================
+    `well_keys`    the well's identity
+    signal         the column the row's offset belongs to
+    positions      imaging positions pooled into the well, where known
+    n_cells        cells with a finite value
+    n_negative     of those, how many are below zero
+    n_tail         how many of the most negative values the offset is the
+                   median of; 0 when the well was not shifted
+    offset         what `apply_well_offsets` subtracts (<= 0)
+    applied        True when the well had more than `min_negative` negatives
+    negative_after cells still below zero once the offset is subtracted
+    ============== ==========================================================
 
-        `.attrs` carries the settings, so `apply_baseline_offsets` can be
-        called with the table alone.
+    `.attrs` carries the settings, so `apply_well_offsets` and
+    `plot_well_offsets` can be called with the table alone.
     """
-    missing = [c for c in ("well", "position") if c not in df.columns]
-    if missing:
-        raise KeyError(f"this table has no {', '.join(missing)} column; "
-                       f"compile it with `compile_positions` or "
-                       f"`load_experiment`, which add them")
+    fraction = _check_fraction(fraction)
+    keys = _well_keys(df, well_keys)
     columns = list(columns) if columns is not None else channel_columns(df)
     if not columns:
         raise ValueError(
             f"no usable signal column in this table; looked for "
             f"{', '.join(f'<ch>{s}' for s in SIGNAL_SUFFIXES)} for "
             f"{', '.join(CHANNELS)}")
+    absent = [c for c in columns if c not in df.columns]
+    if absent:
+        raise KeyError(f"no column(s) {', '.join(absent)} in this table")
 
-    by = ["well", "position"]
+    rows = []
+    for column in columns:
+        for key, block in df.groupby(keys, sort=True, observed=True):
+            key = key if isinstance(key, tuple) else (key,)
+            v = block[column].to_numpy(dtype=float)
+            v = v[np.isfinite(v)]
+            n_negative = int((v < 0).sum())
+            applied = n_negative > min_negative
+            offset = negative_tail_offset(v, fraction, min_negative)
+            rows.append(dict(zip(keys, key)) | {
+                "signal": column,
+                "positions": (int(block["position"].nunique())
+                              if "position" in block.columns else np.nan),
+                "n_cells": int(v.size),
+                "n_negative": n_negative,
+                "n_tail": (int(max(1, np.ceil(fraction * n_negative)))
+                           if applied else 0),
+                "offset": offset,
+                "applied": applied,
+                "negative_after": int((v - offset < 0).sum()),
+            })
+    offsets = pd.DataFrame(rows)
 
-    def measure(frame: pd.DataFrame) -> pd.DataFrame:
-        return pd.concat(
-            [baseline_offsets(frame, column, by=by, within=["well"],
-                              estimator=estimator, reference=reference,
-                              **offset_kwargs)
-             for column in columns], ignore_index=True)
-
-    offsets = measure(df)
-    offsets["applied"] = True
-
-    if drop_flags:
-        hit = offsets["flag"].apply(
-            lambda flag: any(name in str(flag) for name in drop_flags))
-        labels = sorted(set(offsets.loc[hit, "label"]))
-        if labels:
-            keep = ~df[by].astype(str).agg("_".join, axis=1).isin(labels)
-            if verbose:
-                print(f"excluded {len(labels)} position(s) flagged "
-                      f"{' / '.join(sorted(drop_flags))} from their well's "
-                      f"reference; they stay uncorrected: {', '.join(labels)}")
-            # The reference is re-measured without them, so a position no
-            # offset can fix cannot drag the ones that are fine.
-            remeasured = measure(df[keep])
-            remeasured["applied"] = True
-            excluded = offsets[hit].copy()
-            excluded["applied"] = False
-            excluded[["reference_floor", "offset", "z"]] = np.nan
-            offsets = pd.concat([remeasured, excluded], ignore_index=True)
-
-    single = [well for well, block in offsets.groupby("well", observed=True)
-              if block["position"].nunique() == 1]
     if verbose:
         for column in columns:
-            block = offsets[(offsets["signal"] == column) & offsets["applied"]]
-            if block.empty:
-                print(f"  ! {column}: nothing measurable")
-                continue
-            flagged = sorted(set(block.loc[block["flag"].astype(bool), "label"]))
-            note = f"; still flagged: {', '.join(flagged)}" if flagged else ""
-            print(f"{column}: {len(block)} position(s) in "
-                  f"{block['well'].nunique()} well(s), offsets "
+            block = offsets[offsets["signal"] == column]
+            label = block[keys].astype(str).agg("_".join, axis=1)
+            idle = sorted(label[~block["applied"]])
+            note = (f"; not shifted (<= {min_negative} negative cells): "
+                    f"{', '.join(idle)}" if idle else "")
+            print(f"{column}: {len(block)} well(s), offsets "
                   f"{block['offset'].min():+.2f} to "
-                  f"{block['offset'].max():+.2f} counts{note}")
-        if single:
-            print(f"  note: {', '.join(single)} have one position each, so "
-                  f"their offset is 0 by construction - there is nothing for "
-                  f"them to disagree with")
+                  f"{block['offset'].max():+.2f}{note}")
 
-    offsets.attrs.update({"by": by, "within": ["well"], "columns": columns,
-                          "estimator": estimator, "reference": reference})
+    offsets.attrs.update({"columns": columns, "well_keys": keys,
+                          "fraction": fraction, "min_negative": min_negative})
     return offsets
 
 
-def apply_well_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
-                       columns=None, suffix: str = WELL_ALIGN_SUFFIX,
-                       ) -> pd.DataFrame:
+def apply_well_offsets(df: pd.DataFrame, offsets: pd.DataFrame, columns=None,
+                       suffix: str = ZEROED_SUFFIX) -> pd.DataFrame:
     """Subtract `well_offsets`' table, one new column per signal. **Step 2.**
 
-    `apply_baseline_offsets` per signal. Adds `<column><suffix>` and leaves
-    every original column alone, which is what makes a re-run safe: the offsets
-    are always measured from the original, never from an already-aligned one.
+    Adds `<column><suffix>` and leaves every original column alone, which is
+    what makes a re-run safe: the offsets are always measured from the
+    original, never from an already-zeroed one.
 
-    A position `drop_flags` excluded gets NaN rather than its uncorrected
-    number - two different zeros in one column is the error this exists to
-    prevent.
+    A row whose well has no offset gets NaN in the new column and is reported
+    - leaving it at its unshifted value would put two different zeros in one
+    column.
     """
+    keys = list(offsets.attrs.get("well_keys") or ["well"])
     columns = list(columns) if columns is not None else list(
         offsets.attrs.get("columns") or offsets["signal"].unique())
-    by = list(offsets.attrs.get("by") or ["well", "position"])
-    usable = offsets[offsets["applied"]] if "applied" in offsets else offsets
 
-    out = df
+    out = df.copy()
     for column in columns:
-        block = usable[usable["signal"] == column]
-        if block.empty:
-            warnings.warn(f"no offsets for {column!r}; not aligned")
+        table = offsets.loc[offsets["signal"] == column, keys + ["offset"]]
+        if table.empty or column not in out.columns:
+            warnings.warn(f"no offsets for {column!r}, or no such column; "
+                          f"not zeroed")
             continue
-        out = apply_baseline_offsets(out, block, column=column, by=by,
-                                     suffix=suffix)
+        if table.duplicated(keys).any():
+            raise ValueError(f"the offsets table has more than one {column!r} "
+                             f"row per {keys}")
+        # A left merge keeps the rows of `out` in order, so the offsets line up
+        # by position and not by index - a compiled table's index is not
+        # guaranteed unique.
+        offset = out[keys].merge(table, on=keys, how="left",
+                                 validate="many_to_one")["offset"].to_numpy()
+        missing = np.isnan(offset)
+        if missing.any():
+            labels = sorted(out.loc[missing, keys].astype(str)
+                            .agg("_".join, axis=1).unique())
+            warnings.warn(
+                f"{int(missing.sum())} row(s) in {len(labels)} well(s) have no "
+                f"offset and are NaN in {column}{suffix}: "
+                f"{', '.join(labels[:5])}{' ...' if len(labels) > 5 else ''}")
+        out[f"{column}{suffix}"] = out[column].to_numpy(dtype=float) - offset
     return out
+
+
+def plot_well_offsets(df: pd.DataFrame, offsets: pd.DataFrame,
+                      column: str | None = None, suffix: str = ZEROED_SUFFIX,
+                      show_points: bool = True,
+                      ylim_quantiles: tuple[float, float] = (0.005, 0.95),
+                      figsize=None):
+    """One signal, well by well, before and after the offset.
+
+    Two panels down one well axis. The top one is the signal as compiled, with
+    each well's offset marked; the bottom one is the zeroed signal. Each well's
+    x label carries how many of its cells were negative before and after.
+
+    The y-window is cut at `ylim_quantiles` of the pooled signal and shared by
+    both panels, so the change between them is a shift and not a rescale.
+    """
+    column = column or (offsets.attrs.get("columns") or [None])[0]
+    if column is None:
+        raise ValueError("pass `column`")
+    keys = list(offsets.attrs.get("well_keys") or ["well"])
+    zeroed = f"{column}{suffix}"
+    data = df if zeroed in df.columns else apply_well_offsets(
+        df, offsets, columns=[column], suffix=suffix)
+    data = data.copy()
+    data["_well"] = data[keys].astype(str).agg("_".join, axis=1)
+
+    table = offsets[offsets["signal"] == column].copy()
+    table["_well"] = table[keys].astype(str).agg("_".join, axis=1)
+    table = table.set_index("_well")
+    labels = sorted(table.index)
+    ticks = [f"{w}\n{table.loc[w, 'n_negative']}->{table.loc[w, 'negative_after']}"
+             for w in labels]
+
+    pooled = pd.concat([data[column], data[zeroed]]).to_numpy(dtype=float)
+    pooled = pooled[np.isfinite(pooled)]
+    low, high = np.quantile(pooled, ylim_quantiles)
+    low = min(low, float(table["offset"].min()))
+    pad = 0.06 * max(high - low, 1.0)
+
+    fig, axes = plt.subplots(2, 1, sharex=True, sharey=True,
+                             figsize=figsize or (0.7 * len(labels) + 5, 8))
+    for ax, value, title in ((axes[0], column, "as compiled"),
+                             (axes[1], zeroed, "after the well offset")):
+        sns.boxplot(data=data, x="_well", y=value, order=labels, ax=ax,
+                    color="0.85", showfliers=False, width=0.7, linewidth=1)
+        if show_points:
+            sns.stripplot(data=data, x="_well", y=value, order=labels, ax=ax,
+                          color="0.25", size=2, alpha=0.35, jitter=0.28)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.set_title(f"{value} - {title}", fontsize=11)
+        ax.set_ylabel("signal (a.u.)")
+        ax.set_xlabel("")
+    axes[0].plot(range(len(labels)), [table.loc[w, "offset"] for w in labels],
+                 "o", color="crimson", mfc="white", mew=1.6, ms=7, zorder=5,
+                 label=f"offset: median of the most negative "
+                       f"{offsets.attrs.get('fraction', NEGATIVE_TAIL_FRACTION):.0%} "
+                       f"of negative cells")
+    axes[0].legend(frameon=False, fontsize=8, loc="upper left")
+    axes[0].set_ylim(low - pad, high + pad)
+    axes[1].set_xticks(range(len(labels)))
+    axes[1].set_xticklabels(ticks, fontsize=8)
+    axes[1].set_xlabel(f"well ({', '.join(keys)}); negative cells before->after")
+    fig.tight_layout()
+    return fig
 
 
 def _write_summary_columns(path: Path, frame: pd.DataFrame, columns: list[str],
@@ -1238,6 +828,10 @@ def _write_summary_columns(path: Path, frame: pd.DataFrame, columns: list[str],
     a round trip through `read_excel`/`ExcelWriter` re-types every cell of
     every sheet and turns each one's index into an `Unnamed: 0` column.
 
+    The two things the per-position alignment wrote, the `*_well_aligned`
+    columns and the `well_alignment` sheet, are removed, so a file never
+    carries a column zeroed the old way beside one zeroed this way.
+
     `frame` is this position's rows in file order, carrying `particle` and the
     new columns. The particle column is checked against the sheet rather than
     trusted, so a summary rewritten between compiling and writing fails loudly
@@ -1249,18 +843,27 @@ def _write_summary_columns(path: Path, frame: pd.DataFrame, columns: list[str],
     if SUMMARY_SHEET not in book.sheetnames:
         raise KeyError(f"{path.name} has no {SUMMARY_SHEET!r} sheet")
     sheet = book[SUMMARY_SHEET]
-    header = [cell.value for cell in sheet[1]]
 
     if sheet.max_row - 1 != len(frame):
         raise ValueError(f"{path.name}: {sheet.max_row - 1} rows in "
                          f"{SUMMARY_SHEET}, {len(frame)} compiled - the file "
                          f"changed since it was read")
+    header = [cell.value for cell in sheet[1]]
     if "particle" in header:
         on_disk = [sheet.cell(row=r, column=header.index("particle") + 1).value
                    for r in range(2, sheet.max_row + 1)]
         if list(frame["particle"]) != list(on_disk):
             raise ValueError(f"{path.name}: the particle column does not match "
                              f"what was compiled; not written")
+
+    # Right to left, so deleting one does not move the next one's index.
+    for index in sorted((i + 1 for i, name in enumerate(header)
+                         if isinstance(name, str)
+                         and name.endswith(LEGACY_SUFFIX)), reverse=True):
+        sheet.delete_cols(index)
+    if LEGACY_SHEET in book.sheetnames:
+        del book[LEGACY_SHEET]
+    header = [cell.value for cell in sheet[1]]
 
     for column in columns:
         index = (header.index(column) + 1 if column in header
@@ -1271,16 +874,16 @@ def _write_summary_columns(path: Path, frame: pd.DataFrame, columns: list[str],
         for offset, value in enumerate(frame[column], start=2):
             # `.value =`, not `cell(..., value=...)`: openpyxl reads a None
             # there as "no value supplied" and leaves the cell alone, which on
-            # a re-run would keep a dropped position's stale number under a
-            # name that now promises a NaN.
+            # a re-run would keep a stale number under a name that now
+            # promises a NaN.
             sheet.cell(row=offset, column=index).value = (
                 None if pd.isna(value) else float(value))
 
     # The provenance sheet is rebuilt rather than appended to: it describes the
     # columns now in the file, and two runs' worth of it would not say which.
-    if WELL_ALIGN_SHEET in book.sheetnames:
-        del book[WELL_ALIGN_SHEET]
-    note = book.create_sheet(WELL_ALIGN_SHEET)
+    if OFFSET_SHEET in book.sheetnames:
+        del book[OFFSET_SHEET]
+    note = book.create_sheet(OFFSET_SHEET)
     note.append(list(record.columns))
     for row in record.itertuples(index=False):
         note.append([None if pd.isna(v) else
@@ -1289,41 +892,38 @@ def _write_summary_columns(path: Path, frame: pd.DataFrame, columns: list[str],
     book.save(path)
 
 
-def align_wells(source, columns=None, suffix: str = WELL_ALIGN_SUFFIX,
-                estimator: str = "trimmed", reference="median",
-                drop_flags=(), write: bool = True, file_suffix: str = "",
-                pattern: str = "*phs.tif", platemap: Path | str | None = None,
-                verbose: bool = True, **offset_kwargs,
-                ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Put a plate's positions on their well's zero, and write it into the summaries.
+def correct_wells(source, columns=None,
+                  fraction: float = NEGATIVE_TAIL_FRACTION,
+                  min_negative: int = MIN_NEGATIVE_CELLS,
+                  suffix: str = ZEROED_SUFFIX, write: bool = True,
+                  file_suffix: str = "", pattern: str = "*phs.tif",
+                  platemap: Path | str | None = None, verbose: bool = True,
+                  ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Shift every well of a plate onto its zero, and write it into the summaries.
 
     The whole correction in one call:
 
-        df, offsets = agg.align_wells(root)
+        df, offsets = agg.correct_wells(root)
 
-    which compiles the plate, measures each channel's floor for every imaging
-    position, moves the positions of each well onto that well's median floor,
-    and adds the result to every `*_summary.xlsx` as `<signal>_well_aligned`
-    beside the signal it came from. Wells are not moved relative to one
-    another, so a treatment that induces the reporter cannot be flattened.
+    which compiles the plate, measures one negative-tail offset per well per
+    channel, and adds the shifted signal to every `*_summary.xlsx` as
+    `<signal>_zeroed` beside the signal it came from.
 
     The rows are the summaries as written - `filter_summary` is not applied -
-    so every particle in every file gets a value, and the floor is measured
-    from every particle that has one.
+    so every particle in every file gets a value, and the offset is measured
+    from every particle the well has.
 
     Parameters
     ----------
     source : Path | str | cellaap_analysis.analysis
         The plate's root folder, as for `load_experiment`.
     columns : sequence of str, optional
-        Signal columns to align. Defaults to the best column of each channel
+        Signal columns to correct. Defaults to the best column of each channel
         present - `<ch>_corrected` where signal_correction ran.
+    fraction, min_negative
+        Passed to `well_offsets`; see `negative_tail_offset`.
     suffix : str
-        Appended to each column's name for the aligned one. `_well_aligned`
-        rather than `dr_tools.align_channels`' `_aligned`, because a table can
-        carry both and they mean different scopes.
-    estimator, reference, drop_flags, **offset_kwargs
-        Passed to `well_offsets`.
+        Appended to each column's name for the zeroed one.
     write : bool
         Add the columns to the summary workbooks. False computes and returns
         everything without touching disk, which is how to look at the offsets
@@ -1337,18 +937,17 @@ def align_wells(source, columns=None, suffix: str = WELL_ALIGN_SUFFIX,
     Returns
     -------
     (df, offsets) : (DataFrame, DataFrame)
-        `df` is the compiled plate with the aligned columns added - the same
-        numbers that went into the files. `offsets` is `well_offsets`' table:
-        one row per position per signal, with the floor, what it was moved
-        onto, and any flag.
+        `df` is the compiled plate with the zeroed columns added - the same
+        numbers that went into the files. `offsets` is `well_offsets`' table.
 
     Notes
     -----
-    Written in place. Each summary also gets a `well_alignment` sheet naming
-    what was subtracted from it and under what settings, so a file says on its
-    own what its `_well_aligned` columns mean. Re-running overwrites both the
-    columns and that sheet; the original signal columns are never touched, so
-    the second run measures the same floors as the first.
+    Written in place. Each summary gets an `offset_correction` sheet naming
+    what was subtracted from its well and under what settings, so a file says
+    on its own what its `_zeroed` columns mean. Re-running overwrites both; the
+    original signal columns are never touched, so a second run measures the
+    same offsets as the first. `*_well_aligned` columns and the
+    `well_alignment` sheet left by the per-position alignment are removed.
     """
     positions = platemap_positions(source, pattern=pattern, platemap=platemap,
                                    verbose=verbose)
@@ -1359,30 +958,27 @@ def align_wells(source, columns=None, suffix: str = WELL_ALIGN_SUFFIX,
 
     columns = list(columns) if columns is not None else channel_columns(df)
     if verbose:
-        print(f"\naligning {', '.join(columns)} across the positions of "
-              f"{df['well'].nunique()} well(s)")
-    offsets = well_offsets(df, columns=columns, estimator=estimator,
-                           reference=reference, drop_flags=drop_flags,
-                           verbose=verbose, **offset_kwargs)
-    aligned = apply_well_offsets(df, offsets, columns=columns, suffix=suffix)
+        print(f"\nzeroing {', '.join(columns)} in {df['well'].nunique()} "
+              f"well(s), one offset per well")
+    offsets = well_offsets(df, columns=columns, fraction=fraction,
+                           min_negative=min_negative, verbose=verbose)
+    zeroed = apply_well_offsets(df, offsets, columns=columns, suffix=suffix)
     new_columns = [f"{c}{suffix}" for c in columns
-                   if f"{c}{suffix}" in aligned.columns]
+                   if f"{c}{suffix}" in zeroed.columns]
 
     if not write:
         if verbose:
             print(f"\nnothing written (write=False); "
                   f"{', '.join(new_columns)} are on the returned table only")
-        return aligned, offsets
+        return zeroed, offsets
 
-    settings = {"estimator": estimator, "reference": str(reference),
-                "unit": "well, position", "aligned_suffix": suffix}
-    keep = ["signal", "well", "position", "label", "n_cells", "floor",
-            "floor_se", "reference_floor", "offset", "z", "tail_drop",
-            "tail_z", "flag", "applied"]
-
+    settings = {"method": "median of the most negative fraction of negative "
+                          "cells, per well",
+                "fraction": fraction, "min_negative": min_negative,
+                "zeroed_suffix": suffix}
     written = 0
     for pos in positions:
-        rows = aligned[aligned["stem"] == pos.stem]
+        rows = zeroed[zeroed["stem"] == pos.stem]
         if rows.empty:
             continue
         path = pos.summary_path(file_suffix)
@@ -1390,9 +986,7 @@ def align_wells(source, columns=None, suffix: str = WELL_ALIGN_SUFFIX,
             if verbose:
                 print(f"  ! {pos.stub}: summary vanished, not written")
             continue
-        mine = offsets[(offsets["well"] == pos.well)
-                       & (offsets["position"] == pos.position)]
-        record = mine[[c for c in keep if c in mine.columns]].copy()
+        record = offsets[offsets["well"] == pos.well].copy()
         for name, value in settings.items():
             record[name] = value
         _write_summary_columns(path, rows[["particle"] + new_columns],
@@ -1403,9 +997,9 @@ def align_wells(source, columns=None, suffix: str = WELL_ALIGN_SUFFIX,
                   f"({len(rows)} particles)")
 
     if verbose:
-        print(f"\n{written} summary file(s) updated in place; each carries a "
-              f"{WELL_ALIGN_SHEET!r} sheet saying what was subtracted")
-    return aligned, offsets
+        print(f"\n{written} summary file(s) updated in place; each carries an "
+              f"{OFFSET_SHEET!r} sheet saying what was subtracted")
+    return zeroed, offsets
 
 
 # ---------------------------------------------------------------------------
@@ -1422,10 +1016,9 @@ def fit_model(xy_data: pd.DataFrame, plot: bool = True, quant_fraction=None,
     signal must be background subtracted. Subtracting the smallest value in the
     column is the crude version and it takes its zero from one cell, which on a
     plate with a crowded position is the most over-corrected cell there is.
-    `baseline_offsets(df, column, reference="zero")` then
-    `apply_baseline_offsets` does the same job per position, from the dim
-    population rather than from one point - see "Aligning the zero across
-    positions".
+    `well_offsets` then `apply_well_offsets` (or `correct_wells`) does the job
+    per well, from the tail of its negative cells rather than from one point -
+    see "Putting each well's zero back where it belongs".
 
     Inputs:
     xy_data        - dataframe w/ dose as the first column and response as
