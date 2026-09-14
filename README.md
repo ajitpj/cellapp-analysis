@@ -617,9 +617,12 @@ a fallback, so pointing at a parent works.
   top. `x`/`y` are doubled (half-res segmentation grid -> raw stacks) and
   `frame` indexes the stacks directly. Border ROIs are zero-padded so the cell
   stays centred.
-- **Traces.** `semantic`, fluorescence and `dead_proba` overlaid on a shared
-  0-1 axis, with each one's true range in the legend; fluorescence is scaled on
-  its 1st-99th percentiles so one bright frame cannot flatten it.
+- **Traces.** `semantic_smoothed`, fluorescence and `dead_proba` overlaid on a
+  shared 0-1 axis, with each one's true range in the legend. The smoothed state
+  is a 0/1 mitotic flag and is plotted on that fixed scale (clipped, so the odd
+  stray value cannot squash it); tables without it fall back to raw
+  `semantic`. Fluorescence is scaled on its 1st-99th percentiles so one bright
+  frame cannot flatten it.
   `mitotic_start_frame` and `death_frame` are marked. The cursor follows the napari
   frame slider, and clicking the plot jumps the viewer to that frame.
   - **Pick one fluorescence column or tick `plot all`** to overlay every one
