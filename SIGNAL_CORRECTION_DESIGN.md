@@ -7,7 +7,9 @@ alternatives were tried and rejected. For how to use it, see
 Every number here was measured on the 20250213 HT1080 pPS18 plate
 (`.../20250213/HT1080 pPS18/2025-02-13/20353`): 13 sample positions, two blank
 wells, 137 frames at 10 min, GFP and Texas Red, and the 431k per-cell
-measurements already sitting in the `*_analysis.xlsx` files.
+measurements already sitting in the `*_analysis.xlsx` files. The exception is
+§11, the downstream well offset, measured on the pPS18 20250402 plate named
+there.
 
 ---
 
@@ -488,6 +490,9 @@ against the summary's own raw column first: r = 0.995 / 0.996, median difference
   background, previously hidden behind the stock correction's under-subtraction.
   No estimator gets under this floor; a brighter reporter or longer exposure
   would.
+* **Crowded fields still over-subtract.** Non-expressing cells read below zero
+  by a well-dependent amount. That is corrected downstream, one offset per well
+  (§11).
 * **Haze is handled bluntly.** Excluding a wide annulus around every cell is a
   crude way to deal with out-of-focus light. Modelling it — a density-dependent
   term convolved with the out-of-focus PSF — would recover the blocks currently
@@ -521,3 +526,114 @@ removed is at commit `85165af` and its findings are recorded above:
 | `flatfield_from_blank`, `flatfield_from_surfaces` | §4 (need a real dark frame) |
 | `darkfield_from_ptc`, `darkfield_from_shape_consistency`, `darkfield_from_flatfield`, `level_regression` | §4, §7.3 |
 | `temporal_background` | §7.4 |
+
+---
+
+## 11. Downstream: the well offset (`cellaap_aggregate.correct_wells`)
+
+This module's estimator over-subtracts in crowded fields (§6.2, §9). What
+reaches the compiled tables is a corrected signal whose non-expressing cells
+read below zero, by an amount that differs from well to well. It is corrected
+after compilation, not here, because the fix needs a whole well's cells and this
+module sees one position at a time.
+
+### 11.1 The method
+
+For each well and each signal column:
+
+```
+negatives = values < 0, sorted
+if len(negatives) <= min_negative (10):  offset = 0
+else:  offset = median(lowest ceil(fraction × len(negatives)) negatives)   (fraction = 0.25)
+zeroed = value − offset
+```
+
+`fraction` is a parameter; `0.25` is the default. There is no per-position
+variant, and `well_offsets` refuses `position`, `stem` or `site` as keys.
+
+### 11.2 What was tried, on the pPS18 20250402 plate
+
+HeLa (E02, 7 positions, 2,206 mitoses), RPE1 (A03–C03) and U2OS (F02–H02);
+`Texas Red_corrected` against corrected time in mitosis, 4-parameter Hill fit on
+2.5-unit bin means.
+
+**Where the non-expressing peak is.** HeLa GFP is clearly bimodal (raw ≈ 125
+non-expressing, ≈ 190 expressing). After correction the non-expressing peak sits
+at −9 to −23, depending on position. Texas Red's non-expressing peak sits at
+−3 to +3. In every HeLa position, 20–43% of cells are negative.
+
+| candidate | result | verdict |
+| --- | --- | --- |
+| trimmed 2–15% floor per position, aligned to the well median (the previous `align_wells`) | aligns positions to each other but never sets an absolute zero, so the non-expressing cells stay below zero | replaced |
+| median of all negatives, per position | precise (bootstrap SE ≈ 1 count), but it reads the left half of the non-expressing peak. It depends on where the data start: shift a position by +20 and it ends at +24 rather than 0 | rejected |
+| two-Gaussian mixture, lower component moved to 0, per position | independent of the starting point; SE 1–2 counts for well-separated peaks, 6–8 for small broad ones | rejected, see 11.3 |
+| median of the lowest 50% of negatives, per well | HeLa base 82 → 59 min, EC50 12.5 → 21.0, R² 0.87 → 0.94 | viable |
+| **median of the lowest 25% of negatives, per well** | HeLa base 82 → 59 min, EC50 12.5 → 25.2, R² 0.95; see the table below | **adopted** |
+
+With the adopted defaults:
+
+| cell line | cells < 0 before → after | base (min) | Hill n | EC50 (a.u.) | R² (bins) |
+| --- | --- | --- | --- | --- | --- |
+| HeLa | 34% → 4% | 82 → 59 | 2.19 → 3.98 | 12.5 → 25.2 | 0.87 → 0.95 |
+| RPE1 | 14% → 2% | 65 → 43 | 2.81 → 3.55 | 9.3 → 12.4 | 0.91 → 0.94 |
+| U2OS | 16% → 2% | 55 → 57 | 2.92 → 4.14 | 40.2 → 37.6 | 0.95 → 0.97 |
+
+Texas Red offsets per well: HeLa −15.0; RPE1, HT1080 and U2OS −2.6 to −4.4.
+
+### 11.3 Why the zero is a convention
+
+A Hill curve is defined only for x ≥ 0 and takes its base from x = 0. When the
+zero is placed at the centre of the non-expressing peak, as the mixture method
+does, about half of the truly non-expressing cells read negative. The fit then
+takes its base from where the rise starts (HeLa 87 min, against a basal
+duration of about 60). The negative-tail offset shifts the peak by about one
+width further, puts those cells at x ≥ 0, and the base lands on the basal
+duration.
+
+A 5-parameter fit with a free x-offset (y = Hill(max(x − x₀, 0))) was used to
+let the data choose. Its best x₀ sat about 10 units below the non-expressing
+peak centre in both frames, consistent with the tail offset. But the 95% interval
+ran to the lower bound: the fit worsens sharply only for x₀ above the peak
+centre and is flat below it, because a lower x₀ can be offset by a steeper,
+later-rising curve. The half-max point was well determined (±3), but it moves
+one-for-one with the chosen zero. **EC50 is therefore comparable only between
+data zeroed with the same `fraction`.** The HeLa shift is three to four times
+the RPE1 and U2OS shifts, because HeLa has a larger and wider dim population.
+
+### 11.4 Why per well
+
+Tested on HeLa E02: one curve shape fitted to the pooled well, a free x-shift
+fitted per position, and the spread of those shifts after each correction.
+Independent 5-parameter fits per position (~300 cells each) did not converge to
+usable half-max values (±35 to ±100).
+
+| per-position offset | SD of curve position | χ²/dof |
+| --- | --- | --- |
+| none | 2.8 | 5.4 |
+| mixture null peak → 0 | 4.3 | 10.6 |
+| lowest 50% of negatives | 2.7 | 4.2 |
+
+Neither per-position offset tracked the shift each position's curve needed
+(r = −0.44 and +0.25 over 7 positions). A position's most negative quarter is a
+few dozen cells, so a per-position offset adds noise to every cell without
+removing error. The remaining position-to-position differences (about ±5 a.u.,
+χ²/dof ≈ 4) are not predicted by anything these cells show.
+
+### 11.5 Limits
+
+* A position over-subtracted by different amounts across its own field is not
+  repaired. Its well keeps a high `negative_after`.
+* A well with few non-expressing cells (e.g. a high dose) has few negatives and
+  is left alone below `min_negative`. Above it, the tail is taken from whatever
+  negatives there are.
+* Tested on one plate and one reporter channel. `fraction` is the knob to
+  revisit on a plate whose dim population looks different.
+
+### 11.6 Where the removed code went
+
+The per-position alignment (`baseline_floor`, `baseline_offsets`,
+`apply_baseline_offsets`, `plot_baseline_offsets`, the trimmed / quantile /
+half-sample-mode estimators, the `few cells` / `outlier floor` / `low tail`
+flags, and `align_wells` with its `_well_aligned` columns) is at commit
+`00d911b`. `correct_wells` removes the `_well_aligned` columns and the
+`well_alignment` sheet from any summary it rewrites.

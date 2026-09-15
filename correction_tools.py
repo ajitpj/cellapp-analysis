@@ -146,8 +146,9 @@ def surface_diagnostics(root: str | Path, channel: str | None = None,
     Reads only the TIFF headers of the saved surfaces, so a whole plate costs
     a fraction of a second and no image data is touched.
 
-    This is the companion to `cellaap_aggregate.baseline_offsets`: that measures
-    that a position's zero is off, this says why. The columns to read first are
+    This is the companion to `cellaap_aggregate.correct_wells`: that shifts
+    each well by the over-subtraction read off its negative cells, this says
+    why a field was over-subtracted. The columns to read first are
 
     ``usable_blocks``   fraction of the grid that had enough cell-free pixels
                         to measure. It falls as the field fills up.
@@ -166,9 +167,9 @@ def surface_diagnostics(root: str | Path, channel: str | None = None,
     On the 20260826 CycB plate, over the ten positions of the two wells with no
     GFP induced, the three sort together exactly as that story predicts. The
     D01 positions hold 121 px and drift 5-6%; the A01 positions fall to 60 or
-    30 px and drift 23-34%, and their floors are the low ones. Against
-    `cellaap_aggregate.baseline_offsets`' floor: r = -0.83 for the peak
-    background, -0.80 for the drift, +0.79 for the narrowest dilation held.
+    30 px and drift 23-34%, and their floors - the bottom of each position's
+    distribution - are the low ones: r = -0.83 for the peak background, -0.80
+    for the drift, +0.79 for the narrowest dilation held.
 
     Read it only over positions expected to hold the same fluorophore. A well
     that is genuinely brighter has a genuinely higher floor, and this table

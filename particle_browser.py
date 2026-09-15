@@ -9,7 +9,7 @@ Stacks and inference folders are paired on the well_site key (`A12_s2`) rather
 than the file stem, because the two can carry different dates.
 
 Selecting a particle pulls a 100x100 ROI that follows its tracked centroid
-through every channel, and plots `semantic`, one or all of the fluorescence
+through every channel, and plots `semantic_smoothed`, one or all of the fluorescence
 columns, and `dead_proba` on a shared 0-1 axis. Columns a legacy workbook does
 not carry are left off the plot rather than drawn as zeros. Particles can be
 excluded and annotated, and the surviving ones written back out as a new
@@ -992,7 +992,12 @@ def build(root: Path):
         frames = track["frame"].to_numpy()
         drawn = []
 
-        specs = [("semantic", SEMANTIC_COLOR, False)]
+        # The smoothed state is what the summary's mitotic timing is built
+        # from, so it is the trace to judge a call against; raw `semantic` is
+        # the fallback for tables that lack it.
+        state_col = ("semantic_smoothed" if "semantic_smoothed" in track.columns
+                     else "semantic")
+        specs = [(state_col, SEMANTIC_COLOR, False)]
         specs += [(col, FLUOR_COLORS[i % len(FLUOR_COLORS)], True)
                   for i, col in enumerate(fluor_cols)]
         specs += [("dead_proba", DEAD_COLOR, False)]
@@ -1002,7 +1007,14 @@ def build(root: Path):
             values = track[col].to_numpy(dtype=float)
             if not np.isfinite(values).any():
                 continue
-            scaled, (lo, hi) = rescale(values, robust=robust)
+            if col == "semantic_smoothed":
+                # A 0/1 mitotic flag, so it keeps its own scale: min-max would
+                # park a never-mitotic track at 0.5, and the stray 2s and 661s
+                # some tables carry would squash the real 0/1 flat.
+                scaled = np.clip(values, 0, 1)
+                lo, hi = np.nanmin(values), np.nanmax(values)
+            else:
+                scaled, (lo, hi) = rescale(values, robust=robust)
             label = f"{col} [{lo:.3g}, {hi:.3g}]"
             # A correction factor that varies by <1% of its own magnitude is
             # noise once stretched over the full axis; say so rather than

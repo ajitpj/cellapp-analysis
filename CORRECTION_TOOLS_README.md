@@ -82,11 +82,15 @@ field, and they move together: as the field fills, the exclusion ring backs
 off, more out-of-focus halo is counted as medium, the background rises through
 the movie — and the corrected signal comes out too low.
 
-This is the companion to `cellaap_aggregate.baseline_offsets`, which measures
-*that* a position's zero is off; this says *why*. On the 20260826 CycB plate,
-over the ten positions of the two wells with no GFP induced, the floor tracks
-all three: r = −0.83 against peak background, −0.80 against drift, +0.79
-against the narrowest dilation held.
+This is the companion to `cellaap_aggregate.correct_wells`, which shifts each
+well by the over-subtraction read off its negative cells; this says *why* a
+field was over-subtracted. On the 20260826 CycB plate, over the ten positions
+of the two wells with no GFP induced, the bottom of each position's
+distribution tracked all three: r = −0.83 against peak background, −0.80
+against drift, +0.79 against the narrowest dilation held. That is also why
+`correct_wells` works per well and not per position: the error is real at the
+position level, but a few hundred cells per position do not measure it well
+enough to subtract.
 
 Read it only across positions expected to hold the same fluorophore. A well
 that is genuinely brighter has a genuinely higher floor, and this table cannot
