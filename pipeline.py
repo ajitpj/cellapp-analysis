@@ -722,16 +722,38 @@ def quarantine_stale_maps(root: Path, pair: MapPair) -> list[Path]:
     channel - the wrong one from the earlier run and the right one from this
     one - and _load_maps picks between them by directory order. Moved, not
     deleted: they are somebody's data, and the move is recorded in the log.
+
+    Renamed as well as moved. _load_maps walks the whole root, pipeline/
+    included, and loads any file whose path says background or intensity, so
+    a map moved under its own name would still be applied - with the one it
+    was moved aside for, in directory order. Files an earlier run moved there
+    under their own names are renamed here too.
     """
+    superseded = pipeline_dir(root) / "superseded"
+    if superseded.is_dir():
+        for path in superseded.iterdir():
+            if path.name != superseded_name(path.name):
+                path.rename(path.with_name(superseded_name(path.name)))
+
     moved = []
     for path in find_map_files(root, pair.channel, pair.role):
         if path.name == pair.output.name:
             continue
-        destination = pipeline_dir(root) / "superseded" / path.name
+        destination = superseded / superseded_name(path.name)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(path), str(destination))
         moved.append(destination)
     return moved
+
+
+def superseded_name(name: str) -> str:
+    """A map's file name with the words _load_maps looks for taken out.
+
+    `..._GFP_background_map.tif` -> `..._GFP_bkg-superseded_map.tif`. Still
+    says what it was, and a rename back restores it.
+    """
+    return (name.replace("background", "bkg-superseded")
+                .replace("intensity", "int-superseded"))
 
 
 def correction_params(args) -> dict:
@@ -741,10 +763,16 @@ def correction_params(args) -> dict:
     this returns the same dict everywhere and a finished position only reports
     stale when the operator actually changed one.
     """
-    return {"dilation": getattr(args, "correction_dilation", 121),
-            "n_frames": getattr(args, "correction_frames", 24),
-            "block": getattr(args, "correction_block", 64),
-            "model": getattr(args, "correction_model", "auto")}
+    params = {"dilation": getattr(args, "correction_dilation", 121),
+              "n_frames": getattr(args, "correction_frames", 24),
+              "block": getattr(args, "correction_block", 64),
+              "model": getattr(args, "correction_model", "auto")}
+    # Only present when asked for, so turning it on marks finished positions
+    # stale - they were measured without the maps - while a plate that never
+    # uses it keeps the fingerprint it was analyzed under.
+    if getattr(args, "legacy_maps", False):
+        params["legacy_maps"] = True
+    return params
 
 
 def build_tasks(root: Path, positions: list[Position], rows: list[PlateRow],
@@ -1023,8 +1051,10 @@ def stage_status(root: Path, task: Task, stage: str) -> str:
 # cancels the camera offset, which neither blank alone can be separated from;
 # see SIGNAL_CORRECTION_DESIGN.md section 4.
 #
-# The old `*_map.tif` correction maps are no longer built. `pipeline.py maps`
-# still exists for reproducing an old run by hand, but nothing submits it.
+# The old `*_map.tif` correction maps are built only on request: `submit
+# --legacy-maps` queues `pipeline.py maps` ahead of the analysis, which then
+# records their per-cell terms in `<ch>_bkg_corr`/`<ch>_int_corr` alongside
+# `<ch>_corrected`. `pipeline.py maps` also runs by hand.
 # ---------------------------------------------------------------------------
 
 def surface_dir(root: Path) -> Path:
@@ -1282,6 +1312,126 @@ def map_status(pair: MapPair) -> str:
             else "pending")
 
 
+def stack_frames(path: Path) -> int | None:
+    """Frames in a stack, from its header alone. None if it cannot be read."""
+    try:
+        import tifffile
+        with tifffile.TiffFile(path) as fh:
+            shape = fh.series[0].shape
+        return int(shape[0]) if len(shape) >= 3 else 1
+    except Exception:
+        return None
+
+
+def mem_gb(spec: str) -> float | None:
+    """A SLURM memory request ("25g", "20000m", "20000") in GB."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([kmgt]?)b?\s*", str(spec).lower())
+    if not m:
+        return None
+    scale = {"k": 2**-20, "m": 2**-10, "": 2**-10, "g": 1, "t": 2**10}
+    return float(m.group(1)) * scale[m.group(2)]
+
+
+@dataclass
+class LegacyPlan:
+    """What `--legacy-maps` would build, and what would stop it working."""
+    pairs: list[MapPair]
+    checks: list[RoleCheck]
+    todo: list[MapPair]          # maps still to build (pending, or swapped)
+    warnings: list[str]
+    problems: list[str]          # refuse to submit on any of these
+    analysis_gb: float           # what every analysis task loads on top
+    build_gb: float              # peak of the maps job
+
+
+def legacy_map_plan(root: Path, map_wells: list[MapWell],
+                    tasks: list[Task]) -> LegacyPlan:
+    """Plan the legacy `*_map.tif` correction maps for `--legacy-maps`.
+
+    Reads only headers and a few frames, so `check` and `submit` can afford
+    it. Three things are worked out ahead of the jobs, because each of them
+    otherwise fails far from here:
+
+    * which measured channels have no blank well for a role. Those channels
+      keep `_bkg_corr` 0 / `_int_corr` 1; run_analysis_one sees to it that the
+      missing map does not crash the channel that has one.
+    * whether each background blank has at least as many frames as the
+      positions. The background map is one frame per blank frame and
+      measure_signal indexes it by the position's frame number, so a shorter
+      blank would crash every analysis partway through.
+    * what the maps cost in memory - see analysis_gb / build_gb.
+    """
+    pairs, warnings = resolve_correction_maps(root, map_wells)
+    pairs, checks = verify_map_roles(pairs)
+    swapped = {c.channel for c in checks if c.verdict == "swapped"}
+    todo = [p for p in pairs if p.channel in swapped or map_status(p) == "pending"]
+    problems: list[str] = []
+
+    have = {(p.channel, p.role) for p in pairs}
+    measured = sorted({c for t in tasks for c in t.channels})
+    for channel in measured:
+        for role, column in (("background", "_bkg_corr"), ("intensity", "_int_corr")):
+            if (channel, role) not in have:
+                warnings.append(f"--legacy-maps: no {role} well provides "
+                                f"{channel}, so {channel}{column} stays at its "
+                                f"default for every cell")
+
+    backgrounds = [p for p in pairs if p.role == "background"]
+    if backgrounds and tasks:
+        frames = {t.stem: stack_frames(t.pos.phs) for t in tasks}
+        longest = max((n for n in frames.values() if n), default=0)
+        for pair in backgrounds:
+            n = stack_frames(pair.source)
+            if n is None:
+                problems.append(f"cannot read {pair.source.name} to count its "
+                                f"frames")
+            elif n < longest:
+                short = sum(1 for m in frames.values() if m and m > n)
+                problems.append(
+                    f"the {pair.channel} background blank {pair.source.name} "
+                    f"has {n} frames but {short} position(s) have more (up to "
+                    f"{longest}). The legacy background map is applied frame "
+                    f"by frame, so it cannot cover them")
+
+    # Every analysis task loads every background map whole (int16, the size
+    # of the blank on disk) when the session opens. The maps job holds each
+    # map as int64 - four times that - until the batch is done, plus the
+    # blank it is reading.
+    bg_bytes = [p.source.stat().st_size for p in backgrounds]
+    analysis_gb = sum(bg_bytes) / 2**30
+    todo_bg = [p.source.stat().st_size for p in todo if p.role == "background"]
+    build_gb = (4 * sum(todo_bg) + max(todo_bg, default=0)) / 2**30
+    return LegacyPlan(pairs, checks, todo, warnings, problems,
+                      analysis_gb, build_gb)
+
+
+def log_legacy_plan(plan: LegacyPlan, args) -> None:
+    """The legacy-map lines of `check` and `submit`. The memory figures are
+    set against the requests submit would make (`check` has no such flags, so
+    it compares against the defaults)."""
+    for pair in sorted(plan.pairs, key=lambda p: (p.channel, p.role)):
+        state = "to build" if pair in plan.todo else "built"
+        log(f"  legacy map   {pair.channel:<10} {pair.role:<10} {state:<8} "
+            f"from {pair.source.name}")
+    if not plan.pairs:
+        log("  legacy map   nothing to build")
+        return
+
+    analysis_mem = getattr(args, "analysis_mem", SLURM_DEFAULTS["analysis_mem"])
+    maps_mem = getattr(args, "maps_mem", SLURM_DEFAULTS["maps_mem"])
+    log(f"  legacy maps add ~{plan.analysis_gb:.1f} GB to every analysis task "
+        f"(the background maps, loaded whole)")
+    budget = mem_gb(analysis_mem)
+    if budget and plan.analysis_gb > budget / 2:
+        log(f"  ! that is more than half of --analysis-mem {analysis_mem}; "
+            f"raise it, or the analysis tasks may run out of memory")
+    budget = mem_gb(maps_mem)
+    if plan.todo and budget and plan.build_gb > budget:
+        log(f"  ! building them needs ~{plan.build_gb:.1f} GB (the background "
+            f"maps are held as int64), more than --maps-mem {maps_mem}; "
+            f"raise it")
+
+
 # ---------------------------------------------------------------------------
 # Logging that works the same whether launched by SLURM or by hand
 # ---------------------------------------------------------------------------
@@ -1414,8 +1564,8 @@ def cmd_infer(args) -> int:
 # Stage 2: analysis (img-env, CPU)
 # ---------------------------------------------------------------------------
 
-def write_corrections_sheet(session, task: Task, root: Path,
-                            corrections: list[dict] | None = None) -> None:
+def write_corrections_sheet(task: Task, corrections: list[dict] | None = None,
+                            legacy: dict | None = None) -> None:
     """Append a `corrections` sheet to this position's summary workbook.
 
     The summary is the file that outlives the run, so the provenance of the
@@ -1426,11 +1576,14 @@ def write_corrections_sheet(session, task: Task, root: Path,
       measured, how far it drifted, how close to cells it had to work, and
       which blank pair the flat field came from. This is the correction behind
       the `<ch>_corrected` columns, and the one to read.
-    * whether the legacy `*_map.tif` files were also on disk and loaded by
-      cellaap_analysis, which is what the `<ch>_bkg_corr` / `<ch>_int_corr`
-      columns carry. The pipeline no longer builds those, but a folder from an
-      earlier run still has them, and a reader months later needs to know that
-      the two sets of numbers are not the same correction.
+    * which legacy `*_map.tif` files were applied to each channel - the
+      `<ch>_bkg_corr` / `<ch>_int_corr` columns. They are built only on
+      request (`submit --legacy-maps`, or `pipeline.py maps`), but a folder
+      from an earlier run can still hold them, and a reader months later needs
+      to know that the two sets of numbers are not the same correction.
+
+    `legacy` is {channel: {role: map file name, or ""}} from
+    select_legacy_maps.
     """
     import pandas as pd
 
@@ -1462,25 +1615,28 @@ def write_corrections_sheet(session, task: Task, root: Path,
                      "frames_sampled": "", "background_model": "",
                      "model_switch_reason": "", "surface_file": ""})
 
-    legacy = {"background": session.background_map_present,
-              "intensity": session.intensity_map_present}
-    for role, present in legacy.items():
-        rows.append({
-            "correction": f"legacy {role} map (not built by this pipeline)",
-            "channel": "", "applied": "yes" if present else "no",
-            "flatfield_from": "", "flatfield_centre_edge": "",
-            "background_counts": "", "background_drift_percent": "",
-            "dilation_used_px": "", "unusable_block_fraction": "",
-            "frames_sampled": "", "background_model": "",
-            "model_switch_reason": "", "surface_file": "",
-        })
-    frame = pd.DataFrame(rows)
+    for channel, used in sorted((legacy or {"": {}}).items()):
+        for role in MAP_ROLES:
+            map_file = used.get(role, "")
+            rows.append({
+                "correction": f"legacy {role} map",
+                "channel": channel, "applied": "yes" if map_file else "no",
+                "flatfield_from": "", "flatfield_centre_edge": "",
+                "background_counts": "", "background_drift_percent": "",
+                "dilation_used_px": "", "unusable_block_fraction": "",
+                "frames_sampled": "", "background_model": "",
+                "model_switch_reason": "", "surface_file": "",
+                "map_file": map_file,
+            })
+    frame = pd.DataFrame(rows).fillna("")
 
     note = ("`<ch>_corrected` is signal_correction's number: background measured "
             "from this position's own frames, illumination from the difference "
             "of the two blank wells. `<ch>` is raw. `<ch>_bkg_corr` and "
-            "`<ch>_int_corr` come from the legacy *_map.tif files if any were "
-            "still in the folder, and are a DIFFERENT correction - do not mix "
+            "`<ch>_int_corr` come from the legacy *_map.tif files named in "
+            "`map_file` (per cell and frame: the mean of the background map, "
+            "and of the intensity map, under the cell's mask; 0 and 1 where no "
+            "map was applied), and are a DIFFERENT correction - do not mix "
             "them with `<ch>_corrected`. See SIGNAL_CORRECTION_README.md. "
             "`surface_file` is the background this position actually "
             "subtracted, saved at grid resolution; read it with "
@@ -1601,6 +1757,42 @@ def apply_signal_correction(session, task: Task, args) -> list[dict]:
     return records
 
 
+def select_legacy_maps(session, channel: str) -> dict:
+    """Point measure_signal at this channel's legacy maps, and only those.
+
+    measure_signal reads one background_map_present / intensity_map_present
+    pair of flags for every channel, set when the session found ANY map. So a
+    plate with a GFP background map and none for Texas Red would look up
+    `Texas Red_background_map` and die. The flags are set per channel here,
+    from the maps the session actually holds for it.
+
+    A map that cannot cover this position is left out rather than allowed to
+    crash it: a background map with fewer frames than the movie (check and
+    submit refuse those, but a map made by hand is not checked), or a map of
+    the wrong dimensionality.
+
+    Returns {role: map file name or ""} for the corrections sheet.
+    """
+    used = {}
+    for role, ndim in (("background", 3), ("intensity", 2)):
+        key = f"{channel}_{role}_map"
+        stack = session.stacks.get(key)
+        if stack is not None and stack.ndim != ndim:
+            log(f"  ! {session.paths[key].name} is {stack.ndim}-D, not {ndim}-D; "
+                f"no legacy {role} correction for {channel}")
+            stack = None
+        if (stack is not None and role == "background"
+                and len(stack) < session.max_timepoints):
+            log(f"  ! {session.paths[key].name} has {len(stack)} frames and this "
+                f"position {session.max_timepoints}; no legacy background "
+                f"correction for {channel}")
+            stack = None
+        used[role] = session.paths[key].name if stack is not None else ""
+    session.background_map_present = bool(used["background"])
+    session.intensity_map_present = bool(used["intensity"])
+    return used
+
+
 def run_analysis_one(session, task: Task, semantic_gap: int | None,
                      args=None) -> None:
     """Track, measure, correct and summarize one inference folder."""
@@ -1627,10 +1819,12 @@ def run_analysis_one(session, task: Task, semantic_gap: int | None,
             delattr(session, attr)
 
     session.track_centroids(session.defaults.track_mode, save_flag=True)
+    legacy = {}
     for channel in task.channels:
         if channel not in session.paths:
             log(f"  ! no {channel} stack for this position; not measured")
             continue
+        legacy[channel] = select_legacy_maps(session, channel)
         log(f"  measuring {channel} ...")
         session.measure_signal(channel, True, -1)
 
@@ -1642,7 +1836,7 @@ def run_analysis_one(session, task: Task, semantic_gap: int | None,
     corrections = apply_signal_correction(session, task, args) if args else []
 
     session.summarize_data(True)
-    write_corrections_sheet(session, task, task.root, corrections)
+    write_corrections_sheet(task, corrections, legacy)
 
 
 def cmd_analyze(args) -> int:
@@ -1663,11 +1857,15 @@ def cmd_analyze(args) -> int:
              if flatfield_status(root, c) == "built"]
     log(f"signal_correction: background measured per position; flat field "
         f"{'for ' + ', '.join(built) if built else 'NOT built - background only'}")
-    if session.background_map_present or session.intensity_map_present:
-        log(f"  legacy *_map.tif files are also on disk and loaded "
-            f"(background {'yes' if session.background_map_present else 'no'}, "
-            f"intensity {'yes' if session.intensity_map_present else 'no'}); "
-            f"they fill <ch>_bkg_corr/<ch>_int_corr, NOT <ch>_corrected")
+    loaded = sorted(k.removesuffix("_map") for k in session.stacks
+                    if k.endswith(("_background_map", "_intensity_map")))
+    if loaded:
+        log(f"  legacy *_map.tif files loaded ({', '.join(loaded)}); they fill "
+            f"<ch>_bkg_corr/<ch>_int_corr, NOT <ch>_corrected")
+    elif getattr(args, "legacy_maps", False):
+        log("  ! --legacy-maps, but no *_map.tif files are in the folder; "
+            "<ch>_bkg_corr/<ch>_int_corr will stay 0/1. Build them with "
+            "`pipeline.py maps` first")
     failures = 0
     for i, task in enumerate(tasks, start=1):
         tee = tee_to(root, "analysis", task.stem)
@@ -1814,17 +2012,25 @@ def cmd_check(args) -> int:
     pairs, role_checks = verify_map_roles(pairs)
     ff_sources, ff_notes = flatfield_sources(root, map_wells)
     warnings.extend(ff_notes)
-    # Legacy *_map.tif files are no longer built, but cellaap_analysis still
+    legacy = None
+    if args.legacy_maps:
+        if not map_wells:
+            problems.append("--legacy-maps, but the platemap declares no "
+                            "background/intensity wells to build them from")
+        legacy = legacy_map_plan(root, map_wells, tasks)
+        warnings.extend(legacy.warnings)
+        problems.extend(legacy.problems)
+    # Without the flag the maps are not built, but cellaap_analysis still
     # loads any it finds, so a folder from an earlier run needs saying so.
     stale_maps = [p.name for role in MAP_ROLES for channel in
                   {q.channel for q in pairs}
                   for p in find_map_files(root, channel, role)]
-    if stale_maps:
+    if stale_maps and not args.legacy_maps:
         warnings.append(
             f"{len(stale_maps)} legacy *_map.tif file(s) are still in the "
             f"folder and will be loaded into <ch>_bkg_corr/<ch>_int_corr. "
-            f"They are a different correction from <ch>_corrected; the "
-            f"pipeline no longer builds them")
+            f"They are a different correction from <ch>_corrected, built "
+            f"only with --legacy-maps")
 
     log(f"Root:      {root}")
     log(f"Platemap:  {platemap_path(root)}")
@@ -1873,6 +2079,8 @@ def cmd_check(args) -> int:
     else:
         log("  flat field   no blank wells in the platemap; positions get the "
             "background correction only")
+    if legacy:
+        log_legacy_plan(legacy, args)
 
     pending_inf = counts["inference"].get("pending", 0) + counts["inference"].get("stale", 0)
     pending_ana = counts["analysis"].get("pending", 0) + counts["analysis"].get("stale", 0)
@@ -1946,6 +2154,15 @@ def cmd_status(args) -> int:
             f"({', '.join(sorted(ff_sources))})")
     else:
         log(f"  flat field: no blank pair declared; background correction only")
+    if args.legacy_maps:
+        # map_status only - no role check, which reads the blanks; `check`
+        # does that.
+        pairs, _ = resolve_correction_maps(root, map_wells)
+        map_counts = {}
+        for pair in pairs:
+            s = map_status(pair)
+            map_counts[s] = map_counts.get(s, 0) + 1
+        log(f"  legacy maps: {fmt_counts(map_counts) if pairs else 'none declared'}")
 
     failed = [(r, s) for r in records for s in ("inference", "analysis")
               if r[s] == "failed"]
@@ -3109,6 +3326,23 @@ def cmd_submit(args) -> int:
                            if stage_status(root, t, "inference") != "done"]
         ready = [t for t in selected if t not in needs_inference]
 
+    # Planned before the job directory exists, because a plate the legacy
+    # maps cannot cover is refused outright rather than half-submitted.
+    legacy = None
+    if args.legacy_maps:
+        if not map_wells:
+            die("--legacy-maps, but the platemap declares no background/"
+                "intensity wells to build the maps from")
+        legacy = legacy_map_plan(root, map_wells, selected)
+        for w in dict.fromkeys(legacy.warnings):
+            log(f"  ! {w}")
+        for line in report_role_checks(legacy.checks):
+            log(line)
+        if legacy.problems:
+            for problem in legacy.problems:
+                log(f"  x {problem}")
+            die("--legacy-maps cannot cover these positions; nothing submitted")
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     jobdir = pipeline_dir(root) / "jobs" / stamp
     logdir = jobdir / "slurm"
@@ -3128,6 +3362,9 @@ def cmd_submit(args) -> int:
         analysis_args += f" \\\n    --frame-interval {args.frame_interval}"
     if args.force_analysis:
         analysis_args += " \\\n    --force"
+    if args.legacy_maps:
+        # Part of the analysis fingerprint, so the array has to carry it too.
+        analysis_args += " \\\n    --legacy-maps"
 
     def write_tasks(filename: str, group: list[Task]) -> str:
         (jobdir / filename).write_text("".join(f"{t.stem}\n" for t in group))
@@ -3196,6 +3433,20 @@ def cmd_submit(args) -> int:
             env=args.analysis_env, stage="flatfield",
             stage_args=pattern_arg, **common))
 
+    # The legacy maps are plate-wide for the same reason, and ahead of the
+    # analysis for the same reason: _load_maps reads them when an analysis
+    # task opens its session, so a task that starts first never sees them.
+    legacy_sbatch = None
+    if legacy and legacy.todo:
+        legacy_sbatch = jobdir / "legacy_maps.sbatch"
+        legacy_sbatch.write_text(SBATCH_TEMPLATE.format(
+            job_name=f"{name}_maps", partition=args.cpu_partition,
+            extra_directives=f"#SBATCH --mem={args.maps_mem}\n",
+            cpus=1, walltime=args.maps_time, array_directive="",
+            output_pattern="%x_%j.out",
+            env=args.analysis_env, stage="maps",
+            stage_args=pattern_arg, **common))
+
     log("")
     log(f"{len(selected)} position(s) to run")
     log(f"  job directory : {jobdir}")
@@ -3226,20 +3477,29 @@ def cmd_submit(args) -> int:
     log(f"  background    : measured per position inside each analysis task "
         f"(dilation {args.correction_dilation} px, "
         f"{args.correction_frames} frames)")
+    if legacy:
+        log(f"  legacy maps   : {len(legacy.todo)} to build"
+            f"{f' ({len(legacy.pairs) - len(legacy.todo)} already built)' if len(legacy.pairs) > len(legacy.todo) else ''}; "
+            f"per-cell terms go to <ch>_bkg_corr/<ch>_int_corr")
+        log_legacy_plan(legacy, args)
 
     if not args.sbatch:
         log("")
         log("Nothing submitted (add --sbatch to submit). To submit by hand:")
-        maps_dep = ""
+        before = []
         if maps_sbatch:
             log(f"  mapid=$(sbatch --parsable {sh(maps_sbatch)})")
-            maps_dep = ",afterok:$mapid"
+            before.append("$mapid")
+        if legacy_sbatch:
+            log(f"  legacyid=$(sbatch --parsable {sh(legacy_sbatch)})")
+            before.append("$legacyid")
+        maps_dep = f"afterok:{':'.join(before)}" if before else ""
         if infer_sbatch:
             log(f"  jobid=$(sbatch --parsable {sh(infer_sbatch)})")
-            log(f"  sbatch --dependency=aftercorr:$jobid{maps_dep} "
-                f"{sh(analyze_sbatch)}")
+            log(f"  sbatch --dependency=aftercorr:$jobid"
+                f"{',' + maps_dep if maps_dep else ''} {sh(analyze_sbatch)}")
         if ready_sbatch:
-            dep = f" --dependency=afterok:$mapid" if maps_sbatch else ""
+            dep = f" --dependency={maps_dep}" if maps_dep else ""
             log(f"  sbatch{dep} {sh(ready_sbatch)}")
         return 0
 
@@ -3256,9 +3516,18 @@ def cmd_submit(args) -> int:
             die(f"sbatch failed for the flat-field job ({err}); "
                 f"nothing else was submitted")
         log(f"submitted flat-field job {maps_job}")
-    maps_dep = f"afterok:{maps_job}" if maps_job else ""
+    legacy_job = ""
+    if legacy_sbatch:
+        legacy_job, err = submit_one(legacy_sbatch)
+        if err:
+            die(f"sbatch failed for the legacy-maps job ({err}); nothing else "
+                f"was submitted{f' but flat-field job {maps_job}' if maps_job else ''}")
+        log(f"submitted legacy-maps job {legacy_job}")
+    before = [j for j in (maps_job, legacy_job) if j]
+    maps_dep = f"afterok:{':'.join(before)}" if before else ""
 
-    jobids = {"flatfield": maps_job, "submitted": now()}
+    jobids = {"flatfield": maps_job, "legacy_maps": legacy_job,
+              "submitted": now()}
     failed = False
 
     if ready_sbatch:
@@ -3359,6 +3628,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "and falls back to a two-parameter fit against "
                              "the flat field when a position is too crowded "
                              "to measure a grid (default: %(default)s)")
+
+        # Here with the correction flags, for the same reason: it is part of
+        # the analysis fingerprint, and check/status report the maps with it.
+        sp.add_argument("--legacy-maps", action="store_true",
+                        help="also build the legacy background/intensity "
+                             "*_map.tif maps from the blank wells (submit "
+                             "queues the maps job ahead of the analysis) and "
+                             "record their per-cell terms in <ch>_bkg_corr "
+                             "and <ch>_int_corr, alongside <ch>_corrected")
         return sp
 
     sp = common(sub.add_parser("init", help="write a platemap template for this folder"))

@@ -237,7 +237,8 @@ Common overrides (full list under `submit --help`):
 | --- | --- | --- |
 | `--infer-time` / `--analysis-time` | `0-00:40:00` / `0-01:00:00` | walltime per position |
 | `--infer-mem` / `--analysis-mem` | `12g` per GPU / `25g` | |
-| `--maps-mem` / `--maps-time` | `20g` / `0-00:30:00` | the flat-field job; it reads a dozen frames of each blank |
+| `--maps-mem` / `--maps-time` | `20g` / `0-00:30:00` | the flat-field job (it reads a dozen frames of each blank), and the legacy-maps job with `--legacy-maps` |
+| `--legacy-maps` | off | also build the legacy `*_map.tif` maps and record their per-cell terms; see [The old `*_map.tif` maps](#the-old-_maptif-maps). Pass it to `check` and `status` too |
 | `--correction-dilation` | `121` | how far from a cell the background is measured, in fluorescence pixels |
 | `--correction-frames` | `24` | frames sampled per position for the background |
 | `--infer-concurrent` / `--analysis-concurrent` | 4 / 12 | array tasks running at once |
@@ -313,8 +314,8 @@ python pipeline.py status --root <folder> --csv        # also writes pipeline/st
 
 Each position's `*_summary.xlsx` also gains a **`corrections` sheet**: the
 background level this position measured and how far it drifted, how close to
-cells it could work, which blank pair the flat field came from, and whether any
-legacy `*_map.tif` files were also on disk. A position measured without a flat
+cells it could work, which blank pair the flat field came from, and which
+legacy `*_map.tif` files, if any, were applied to each channel. A position measured without a flat
 field says so. The summary is the file that outlives the run, so the provenance
 of its numbers travels with it.
 
@@ -459,7 +460,8 @@ except the optional CSV.
     ├── state/{inference,analysis}/<position>.json    <- what finished, with which parameters
     ├── state/flatfield/{GFP,Texas_Red}.npz           <- the plate's flat fields
     ├── state/surfaces/<stem>_<channel>_bkg.tif       <- background actually subtracted
-    ├── superseded/                                   <- maps built from a well later swapped away
+    ├── superseded/                                   <- maps built from a well later swapped away,
+    │                                                    renamed *_bkg-superseded_map.tif / *_int-superseded_map.tif
     ├── logs/{inference,analysis,flatfield}/*.log     <- one log per position
     ├── status.csv                                    <- written by `status --csv`
     ├── report.csv                                    <- written by `report --csv`
@@ -552,7 +554,7 @@ gives 1.220 and Texas Red 1.229.
 | --- | --- |
 | `<ch>` | raw mean inside the cell mask |
 | `<ch>_corrected` | **the corrected signal** — `(raw − background) / flat field` |
-| `<ch>_bkg_corr`, `<ch>_int_corr` | legacy `*_map.tif` corrections, only if such files are still in the folder |
+| `<ch>_bkg_corr`, `<ch>_int_corr` | legacy `*_map.tif` terms: the mean of the background map and of the intensity map under the cell's mask, per frame. 0 and 1 when no map was applied to that channel |
 
 The background each position subtracted is also kept, at grid resolution, in
 `pipeline/state/surfaces/` — ~490 kB per position-channel, ~12 MB for a plate.
@@ -575,17 +577,47 @@ uncorrected.
 
 ### The old `*_map.tif` maps
 
-The pipeline no longer builds them. `pipeline.py maps` still exists for
-reproducing an old run by hand, but nothing submits it, and the aggregate
-notebook's finding stands: applying those maps made the field *less* flat, not
-more, because the intensity map keeps the camera offset in it. See
-[SIGNAL_CORRECTION_DESIGN.md](SIGNAL_CORRECTION_DESIGN.md) §1.
+They are built only when asked for:
 
-`cellaap_analysis` still loads any such file it finds anywhere under the root,
-so a folder from an earlier run will keep populating `<ch>_bkg_corr` and
-`<ch>_int_corr`. That is harmless — they are extra columns — but they are a
-**different correction** and must not be mixed with `<ch>_corrected`. `check`
-warns when it finds them.
+```
+python pipeline.py check  --root <folder> --legacy-maps
+python pipeline.py submit --root <folder> --legacy-maps --sbatch
+```
+
+`submit --legacy-maps` queues `pipeline.py maps` as its own job, next to the
+flat-field job, and both analysis arrays wait for it. The maps come from the
+same fluorobrite (background) and DMEM (intensity) wells as the flat field,
+with the same role check. The analysis then records each cell's legacy terms in
+`<ch>_bkg_corr` and `<ch>_int_corr` **in addition to** `<ch>_corrected`. The
+terms are stored raw: the pipeline never combines them into a corrected
+signal. The aggregate notebook found that applying these maps made the field
+*less* flat, not more, because the intensity map keeps the camera offset in it.
+See [SIGNAL_CORRECTION_DESIGN.md](SIGNAL_CORRECTION_DESIGN.md) §1.
+
+What the flag checks and handles:
+
+* **A channel with no blank well** is warned about and keeps 0 / 1 in its
+  columns. The analysis selects each channel's maps separately, so a GFP map
+  does not make the Texas Red measurement look for one that is not there.
+* **A background blank with fewer frames than the positions** stops `check`
+  and `submit`. The background map is one frame per blank frame, applied frame
+  by frame, so it cannot cover a longer movie. A short map made by hand is left
+  out of that channel at analysis time, with a line in the log.
+* **Memory.** Every analysis task loads every background map whole, about the
+  size of the blank stack. `check` and `submit` print the figure and warn when
+  it is more than half of `--analysis-mem`, and warn when building needs more
+  than `--maps-mem` (see below).
+* **Positions analyzed without the maps** turn `stale` under `--legacy-maps`
+  and re-run. Plates that never use the flag keep their fingerprints.
+
+The analysis log's first lines, and the summary's `corrections` sheet, name the
+map file applied to each channel.
+
+Without the flag nothing is built, but `cellaap_analysis` still loads any such
+file it finds under the root, so a folder from an earlier run keeps populating
+`<ch>_bkg_corr` and `<ch>_int_corr`. `check` warns when it finds them. Either
+way they are a **different correction** and must not be mixed with
+`<ch>_corrected`.
 
 A correction applies to every analysis started *after* the flat field exists.
 Positions already analyzed keep their numbers until re-run with
@@ -670,9 +702,9 @@ you submitted with.
 **A well ran as HeLa that should not have.** It was missing from the platemap.
 Add it; the affected positions turn `stale` and re-run.
 
-**The corrections were not applied.** The analysis log's first line says
-`corrections: background map yes/no, intensity map yes/no`, and `check` lists
-the maps it expects. The usual causes are a blank well left unmarked in the
+**The legacy corrections were not applied.** The analysis log names the
+`*_map.tif` files it loaded, and `check --legacy-maps` lists the maps it
+expects. The usual causes are a blank well left unmarked in the
 platemap, a `channels` entry on the blank row that does not match the channel
 being measured, or positions analyzed before the maps job ran — those keep
 their uncorrected numbers until re-run with `--force`.
