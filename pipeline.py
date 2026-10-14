@@ -74,7 +74,8 @@ DEFAULT_CELLTYPE = "HeLa"
 
 # celltype -> (inference model, analysis_pars cell_type). The focal models are
 # the current generation and are what the recent runs used; override per well
-# with the `model` column if a plain model is wanted.
+# with the `model` column if a plain model is wanted, or for the whole plate
+# with `init --model` (e.g. general, the large all-celltype model).
 CELLTYPES = {
     "hela": ("HeLa_focal", "hela"),
     "u2os": ("U2OS_focal", "u2os"),
@@ -88,6 +89,19 @@ VALID_MODELS = [
     "HeLa", "HeLa_focal", "HT1080_focal", "HT1080", "RPE1_focal", "RPE1",
     "U2OS_focal", "U2OS", "general",
 ]
+
+# Other names people use for a model. inference.get_model() registers the
+# focal-loss general model (zenodo 15707118, the same files as 16738589) as
+# plain `general`, so that is the name that has to reach it.
+MODEL_ALIASES = {"general_focal": "general"}
+
+
+def canonical_model(name: str) -> str | None:
+    """The VALID_MODELS spelling of `name`, ignoring case; None if unknown.
+    Typing General_Focal in a spreadsheet should not cost a failed job."""
+    key = name.strip().lower()
+    key = MODEL_ALIASES.get(key, key)
+    return {m.lower(): m for m in VALID_MODELS}.get(key)
 
 # Channel names as they appear in file names, per cellaap_analysis.files().
 VALID_CHANNELS = ["GFP", "Texas Red", "Cy5"]
@@ -152,8 +166,11 @@ PLATEMAP_HEADER = """\
 #                next to the phase file. Valid: {channels}. On a
 #                background/intensity row this is which channels that blank
 #                well provides a map for.
-# model          optional. Overrides the model implied by celltype.
-#                One of: {models}.
+# model          optional. Overrides the model implied by celltype; the
+#                celltype still picks the analysis parameters. Use
+#                general (or general_focal) for the large focal-loss model
+#                trained on all cell types. One of: {models}.
+#                `init --model NAME` fills this in for every well.
 # confluency_est optional, (0, 2000]. Default {confluency}.
 # conf_threshold optional, (0, 1). Default {threshold}.
 # skip           put y/yes/true here to leave the well out of the run.
@@ -404,7 +421,8 @@ def platemap_path(root: Path) -> Path:
     return root / PLATEMAP_NAME
 
 
-def write_template(root: Path, positions: list[Position], force: bool) -> Path:
+def write_template(root: Path, positions: list[Position], force: bool,
+                   model: str = "") -> Path:
     path = platemap_path(root)
     if path.exists() and not force:
         die(f"{path} already exists. Edit it, or pass --force to overwrite.")
@@ -427,7 +445,7 @@ def write_template(root: Path, positions: list[Position], force: bool) -> Path:
                 "transfection": "",
                 "drug": "",
                 "channels": "",
-                "model": "",
+                "model": model,
                 "confluency_est": "",
                 "conf_threshold": "",
                 "skip": "",
@@ -839,9 +857,9 @@ def build_tasks(root: Path, positions: list[Position], rows: list[PlateRow],
                 f"{', '.join(sorted(CELLTYPES))}")
         default_model, analysis_cell_type = CELLTYPES[key]
 
-        model = row.model or default_model
-        if model not in VALID_MODELS:
-            die(f"platemap line {row.lineno}: model {model!r} is not one of "
+        model = canonical_model(row.model) if row.model else default_model
+        if model is None:
+            die(f"platemap line {row.lineno}: model {row.model!r} is not one of "
                 f"{', '.join(VALID_MODELS)}")
 
         channels = list(row.channels)
@@ -1965,11 +1983,19 @@ def cmd_init(args) -> int:
     if not positions:
         die(f"no files matching {args.pattern} in {root}")
 
-    path = write_template(root, positions, args.force)
+    model = ""
+    if args.model:
+        model = canonical_model(args.model)
+        if model is None:
+            die(f"--model {args.model!r} is not one of {', '.join(VALID_MODELS)}")
+
+    path = write_template(root, positions, args.force, model)
     wells = sorted({p.well for p in positions})
     log(f"{len(positions)} position(s) in {len(wells)} well(s): {', '.join(wells)}")
     log(f"Wrote {path}")
     log("")
+    if model:
+        log(f"Every well segments with {model}; celltype still sets the analysis parameters.")
     log(f"Fill in celltype/transfection/drug (celltype defaults to {DEFAULT_CELLTYPE}),")
     log(f"then run:  python pipeline.py check --root {root}")
     return 0
@@ -3641,6 +3667,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = common(sub.add_parser("init", help="write a platemap template for this folder"))
     sp.add_argument("--force", action="store_true", help="overwrite an existing platemap")
+    sp.add_argument("--model", default="",
+                    help="fill the model column of every well with this model "
+                         "instead of leaving it to the celltype, e.g. "
+                         "general (alias general_focal). One of: "
+                         + ", ".join(VALID_MODELS))
     sp.set_defaults(func=cmd_init)
 
     sp = common(sub.add_parser("check", help="validate the platemap and show the plan"))
