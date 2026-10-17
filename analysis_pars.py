@@ -119,6 +119,15 @@ class analysis_pars:
         self.border_margin = 24
         self.exclude_border_tracks = True
 
+        # Masks touching the frame edge are dropped before linking
+        # (track_centroids). A cell crossing the edge is only partly in view:
+        # its mask grows or shrinks and its centroid slides as it crosses, and
+        # trackpy links those half-cells into jumps and swaps that are not the
+        # cell's motion. Of the linking errors track_qc found on a U2OS
+        # position, ~30% were such edge crossings. Unlike border_margin this is
+        # about the mask, not the centroid, and it applies to every cell.
+        self.exclude_border_masks = True
+
         # trackpy parameters
         self.max_pixel_movement = 20
         self.tracking_memory    = 1

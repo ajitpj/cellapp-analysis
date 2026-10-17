@@ -413,8 +413,17 @@ class analysis:
         # trackpy requirements for the dataframe it will use to link tracks
         track_table.rename(columns={"centroid-0":"x", "centroid-1":"y"}, inplace=True)
         # remove large and small cells
-        track_table = track_table[(track_table.area < self.defaults.max_cell_size) & 
+        track_table = track_table[(track_table.area < self.defaults.max_cell_size) &
                                   (track_table.area > self.defaults.min_cell_size)]
+        # remove cells cut by the frame edge (see analysis_pars). regionprops
+        # bboxes are half-open, so a mask on the last row has bbox-2 == rows.
+        if self.defaults.exclude_border_masks:
+            rows, cols = self.stacks["instance"].shape[-2:]
+            on_edge = ((track_table["bbox-0"] == 0) | (track_table["bbox-1"] == 0) |
+                       (track_table["bbox-2"] == rows) | (track_table["bbox-3"] == cols))
+            print(f"dropped {int(on_edge.sum())} of {len(track_table)} detections "
+                  f"touching the frame edge before linking")
+            track_table = track_table[~on_edge]
 
         # Check if default values have been changed
         if memory is None:
